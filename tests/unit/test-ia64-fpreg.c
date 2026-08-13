@@ -36,7 +36,7 @@ static void reset_env(CPUIA64State *env)
     set_float_2nan_prop_rule(float_2nan_prop_ab, &env->fp.fp_status);
     set_float_3nan_prop_rule(float_3nan_prop_abc, &env->fp.fp_status);
     set_float_infzeronan_rule(float_infzeronan_dnan_never, &env->fp.fp_status);
-    set_float_default_nan_pattern(0b01000000, &env->fp.fp_status);
+    set_float_default_nan_pattern(0b11000000, &env->fp.fp_status);
 }
 
 static const char *fail_u64(const char *label, uint64_t actual,

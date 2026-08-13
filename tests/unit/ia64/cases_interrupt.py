@@ -6,6 +6,7 @@ from .case import (CaseMetadata, CaseObservation, bind_cases)
 from .encoding import (
     DTR_PTE_UC,
     DTR_PTE_WB,
+    ExpectedFP,
     HIGH_TR_BASE,
     IA32_TEST_CSD,
     IA32_TEST_DSD,
@@ -20,23 +21,31 @@ from .encoding import (
     IA64_CR_SAPIC_IVR,
     IA64_CR_SAPIC_TPR,
     IA64_DATA_NESTED_TLB_VECTOR,
+    IA64_DEBUG_VECTOR,
     IA64_DCR_BE,
     IA64_DCR_LC,
     IA64_DCR_PP,
     IA64_DISABLED_FP_VECTOR,
     IA64_EXCP_BREAK,
+    IA64_EXCP_DEBUG,
     IA64_EXCP_DISABLED_ISA_TRANSITION,
     IA64_EXCP_ILLEGAL,
+    IA64_EXCP_LOWER_PRIVILEGE,
     IA64_EXCP_NONE,
     IA64_EXCP_PRIVILEGED_REG,
     IA64_EXCP_RESERVED_TEMPLATE,
+    IA64_EXCP_SINGLE_STEP,
+    IA64_EXCP_TAKEN_BRANCH,
     IA64_EXCP_UNALIGNED,
+    IA64_EXCP_UNIMPL_DATA_ADDR,
+    IA64_EXCP_UNIMPL_INST_ADDR,
     IA64_GENERAL_VECTOR,
-    IA64_GENEX_UNIMPL_INST_ADDR,
+    IA64_GENEX_UNIMPL_DATA_ADDR,
     IA64_IMPL_PA_BITS,
     IA64_IA32_EXCEPTION_VECTOR,
     IA64_IA32_INTERCEPT_VECTOR,
     IA64_ISR_EI_SHIFT,
+    IA64_ISR_CODE_LP,
     IA64_ISR_CODE_SS,
     IA64_ISR_CODE_TB,
     IA64_ISR_CODE_UI,
@@ -44,6 +53,8 @@ from .encoding import (
     IA64_ISR_NI,
     IA64_ISR_R,
     IA64_ISR_RS,
+    IA64_ISR_SP,
+    IA64_ISR_W,
     IA64_ISR_X,
     IA64_ITC_TICKS_PER_MILLISECOND,
     IA64_LOWER_PRIV_TRANSFER_VECTOR,
@@ -52,14 +63,17 @@ from .encoding import (
     IA64_PSR_BN,
     IA64_PSR_CPL3,
     IA64_PSR_DB,
+    IA64_PSR_LP,
     IA64_PSR_DFH,
     IA64_PSR_DFL,
     IA64_PSR_DI,
     IA64_PSR_DT,
+    IA64_PSR_DD,
     IA64_PSR_I,
     IA64_PSR_IC,
     IA64_PSR_IS,
     IA64_PSR_IT,
+    IA64_PSR_ID,
     IA64_PSR_MC,
     IA64_PSR_MFH,
     IA64_PSR_MFL,
@@ -92,6 +106,7 @@ from .encoding import (
     bsw0,
     bsw1,
     chk_s_m,
+    cmp8xchg16_acq,
     cmp4_eq_imm,
     cmp4_eq_unc_imm,
     cmp_eq_imm,
@@ -101,6 +116,7 @@ from .encoding import (
     depz_reg,
     dtr_setup_bundles,
     extr_u,
+    flushrs_enc,
     getf_sig,
     illegal_m,
     ia32_bundle,
@@ -110,10 +126,14 @@ from .encoding import (
     ld2,
     ld2_bias,
     ld2_c_clr,
+    ld2_s,
     ld2_sa,
     ld8,
+    ld8_a,
     ld8_fill_postinc,
     ld8_s,
+    ldfe,
+    ldfe_s,
     loadrs_enc,
     mov_ar,
     mov_ar_lc,
@@ -151,6 +171,7 @@ from .encoding import (
     st2,
     st8,
     st8_postinc,
+    stfe,
     sub_reg,
 )
 
@@ -159,6 +180,20 @@ FOUR_K_ITIR = 12 << 2
 # that range for the default 400 MHz ITC while leaving enough setup margin for
 # tests that need to reach a steady translated loop before the interrupt.
 IA64_ITC_ADDL_DELAY_TICKS = 5 * IA64_ITC_TICKS_PER_MILLISECOND
+
+
+def _native_completion_trap_handler(vector):
+    """Capture IIP/IIPA/ISR and target RI/CPL from a native trap."""
+    return [
+        (vector, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (vector + 0x10, 0x00, mov_m_cr_gr(9, 22), nop_i(), nop_i()),
+        (vector + 0x20, 0x00, mov_m_cr_gr(10, 17), nop_i(), nop_i()),
+        (vector + 0x30, 0x00, mov_m_cr_gr(11, 16), nop_i(), nop_i()),
+        (vector + 0x40, 0x02, nop_m(), extr_u(12, 11, 41, 2),
+         extr_u(13, 11, 32, 2)),
+        (vector + 0x50, 0x10, nop_m(), nop_i(),
+         br_cond(vector + 0x50, vector + 0x50)),
+    ]
 
 test_rfi_target_rse_fill_fault_uses_restored_psr = require_registers(
     "rfi_target_rse_fill_fault_uses_restored_psr", [
@@ -245,8 +280,8 @@ test_unimplemented_physical_instruction_traps = require_registers(
     ], {
         "ip": IA64_LOWER_PRIV_TRANSFER_VECTOR + 0x20,
         "exception": IA64_EXCP_NONE,
-        "r8": 0,
-        "r9": IA64_GENEX_UNIMPL_INST_ADDR | IA64_ISR_X,
+        "r8": 1 << IA64_IMPL_PA_BITS,
+        "r9": IA64_ISR_CODE_UI | (2 << IA64_ISR_EI_SHIFT),
     }, entry=0x10)
 
 def test_ar_itc_advances_in_guest_loop(qemu):
@@ -418,6 +453,180 @@ test_async_timer_interrupt_records_boundary_ri = require_registers(
         "r31": (1 << 13) | (1 << 14),
     }, entry=0x10)
 
+
+# flushrs exposes an interrupt window after each mandatory store.  Enabling
+# PSR.i in slot 0 and starting flushrs in slot 1 of the same bundle prevents
+# the ordinary execution loop from accepting the already-pended timer first.
+test_mandatory_rse_flushrs_accepts_pending_external_interrupt = \
+    require_registers(
+        "mandatory_rse_flushrs_accepts_pending_external_interrupt", [
+            (0x10, *movl_mlx(3, 0x100000)),
+            (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+            (0x30, 0x10, nop_m(), nop_i(), cover_b()),
+            (0x40, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
+            (0x50, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
+            (0x60, 0x00, mov_m_gr_ar(0, 44), nop_i(), nop_i()),
+            (0x70, 0x00, mov_m_gr_cr(0, IA64_CR_ITM), nop_i(), nop_i()),
+            # Serialize PSR.ic before relying on collected interruption state.
+            # Only PSR.i is changed immediately before flushrs, so ISR.ni is
+            # clear even though interrupt unmasking remains deliberately
+            # adjacent to the mandatory sequence.
+            (0x80, *movl_mlx(2, IA64_PSR_IC)),
+            (0x90, 0x0a, mov_gr_psr_full(2), srlz_d(), nop_i()),
+            (0xa0, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_I)),
+            # MMI with a stop after slot 0 makes flushrs start its group.
+            (0xb0, 0x0a, mov_gr_psr_full(2), flushrs_enc(), nop_i()),
+            (0xc0, 0x00, mov_m_ar_gr(13, 18), nop_i(), nop_i()),
+            (0xd0, 0x00, mov_m_ar_gr(14, 17), nop_i(), nop_i()),
+            (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xe0)),
+
+            (0x3000, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+            (0x3010, 0x00, mov_m_cr_gr(9, 16), nop_i(), nop_i()),
+            (0x3020, 0x00, mov_m_cr_gr(10, 17), nop_i(), nop_i()),
+            (0x3030, 0x00, mov_m_ar_gr(11, 18), nop_i(), nop_i()),
+            (0x3040, 0x00, mov_m_cr_gr(12, IA64_CR_SAPIC_IVR),
+             nop_i(), nop_i()),
+            (0x3050, 0x10,
+             mov_m_gr_cr(0, IA64_CR_SAPIC_EOI), nop_i(), rfi_b()),
+        ], {
+            "ip": 0xe0,
+            "exception": IA64_EXCP_NONE,
+            "r8": 0xb0,
+            "r9": IA64_PSR_IC | IA64_PSR_I | (1 << 41),
+            "r10": 1 << IA64_ISR_EI_SHIFT,
+            # Exactly one register store completed before the interrupt.
+            "r11": 0x100008,
+            "r12": 0xef,
+            "r13": 0x100308,
+            "r14": 0x100308,
+            "cfm_sof": 0,
+        }, entry=0x10)
+
+
+# A br.ret completion trap remains pending while target processing is
+# interrupted before its first mandatory fill.  The external interrupt
+# observes CFLE through ISR.ir without consuming BSPSTORE; its rfi resumes the
+# fill, and only then may the original Taken Branch trap fire.
+test_mandatory_rse_br_ret_fill_external_interrupt_sets_isr_ir = \
+    require_registers(
+        "mandatory_rse_br_ret_fill_external_interrupt_sets_isr_ir", [
+            (0x10, *movl_mlx(3, 0x100008)),
+            (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+            # PFS.sof=1, PFS.sol=1: returning preserves one register that is
+            # absent from the physical file and therefore requires one fill.
+            (0x30, *movl_mlx(4, 0x81)),
+            (0x40, *movl_mlx(5, 0x200)),
+            (0x50, 0x01, nop_m(), mov_m_gr_ar(4, 64),
+             mov_br_gr(7, 5)),
+            # rfi serializes the full PSR.  Interrupts remain masked while the
+            # timer is made pending.
+            (0x60, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_TB)),
+            (0x70, *movl_mlx(6, 0xa0)),
+            *rfi_to_gr(0x80, 2, 6),
+            (0xa0, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
+            (0xb0, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
+            (0xc0, 0x00, mov_m_gr_ar(0, 44), nop_i(), nop_i()),
+            (0xd0, 0x00, mov_m_gr_cr(0, IA64_CR_ITM), nop_i(), nop_i()),
+            (0xe0, *movl_mlx(
+                2, IA64_PSR_IC | IA64_PSR_I | IA64_PSR_TB)),
+            # Keeping the interrupt-unmasking mov in the branch bundle
+            # prevents the ordinary execution loop from accepting the pending
+            # timer before target processing begins.
+            (0xf0, 0x12, mov_gr_psr_full(2), nop_b(), br_ret(7)),
+            (0x200, 0x10, nop_m(), nop_i(), br_cond(0x200, 0x200)),
+            raw_bundle(0x100000, 0x123456789abcdef0, 0),
+
+            (0x3000, 0x00, mov_m_cr_gr(20, 19), nop_i(), nop_i()),
+            (0x3010, 0x00, mov_m_cr_gr(21, 22), nop_i(), nop_i()),
+            (0x3020, 0x00, mov_m_cr_gr(22, 17), nop_i(), nop_i()),
+            (0x3030, 0x00, mov_m_ar_gr(23, 18), nop_i(), nop_i()),
+            (0x3040, 0x00, mov_m_cr_gr(24, IA64_CR_SAPIC_IVR),
+             nop_i(), nop_i()),
+            (0x3050, 0x00, mov_m_cr_gr(25, 16), nop_i(), nop_i()),
+            (0x3060, 0x10,
+             mov_m_gr_cr(0, IA64_CR_SAPIC_EOI), nop_i(), rfi_b()),
+
+            (IA64_TAKEN_BRANCH_VECTOR, 0x00,
+             mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+            (IA64_TAKEN_BRANCH_VECTOR + 0x10, 0x00,
+             mov_m_cr_gr(9, 22), nop_i(), nop_i()),
+            (IA64_TAKEN_BRANCH_VECTOR + 0x20, 0x00,
+             mov_m_cr_gr(10, 17), nop_i(), nop_i()),
+            (IA64_TAKEN_BRANCH_VECTOR + 0x30, 0x00,
+             nop_m(), adds(11, 0, 32), nop_i()),
+            (IA64_TAKEN_BRANCH_VECTOR + 0x40, 0x10,
+             nop_m(), nop_i(),
+             br_cond(IA64_TAKEN_BRANCH_VECTOR + 0x40,
+                     IA64_TAKEN_BRANCH_VECTOR + 0x40)),
+        ], {
+            "ip": IA64_TAKEN_BRANCH_VECTOR + 0x40,
+            "exception": IA64_EXCP_NONE,
+            "fault_code": IA64_EXCP_TAKEN_BRANCH,
+            "r8": 0x200,
+            "r9": 0xf0,
+            "r10": IA64_ISR_CODE_TB | (2 << IA64_ISR_EI_SHIFT),
+            "r11": 0x123456789abcdef0,
+            "r20": 0x200,
+            "r21": 0xf0,
+            "r22": IA64_ISR_IR,
+            # The external interrupt precedes the first fill.
+            "r23": 0x100008,
+            "r24": 0xef,
+            "r25": IA64_PSR_IC | IA64_PSR_I | IA64_PSR_TB,
+            "cfm_sof": 1,
+        }, entry=0x10)
+
+
+# An rfi executed with PSR.ic clear does not become the last successfully
+# executed instruction even when it restores IPSR.ic.  If an external
+# interrupt wins the target's pre-fill window, IIPA must retain the value that
+# low-level software established while collection was disabled.
+test_mandatory_rse_rfi_prefill_interrupt_preserves_seeded_iipa = \
+    require_registers(
+        "mandatory_rse_rfi_prefill_interrupt_preserves_seeded_iipa", [
+            (0x10, *movl_mlx(3, 0x100008)),
+            (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+            (0x30, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
+            (0x40, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
+            (0x50, 0x00, mov_m_gr_ar(0, 44), nop_i(), nop_i()),
+            (0x60, 0x00, mov_m_gr_cr(0, IA64_CR_ITM), nop_i(), nop_i()),
+            (0x70, *movl_mlx(3, 0x1230)),
+            (0x80, 0x00, mov_m_gr_cr(3, 22), nop_i(), nop_i()),
+            (0x90, *movl_mlx(3, 0x200)),
+            (0xa0, 0x00, mov_m_gr_cr(3, 19), nop_i(), nop_i()),
+            (0xb0, *movl_mlx(
+                3, IA64_PSR_IC | IA64_PSR_I | IA64_PSR_DD)),
+            (0xc0, 0x00, mov_m_gr_cr(3, 16), nop_i(), nop_i()),
+            (0xd0, *movl_mlx(3, (1 << 63) | 1)),
+            (0xe0, 0x00, mov_m_gr_cr(3, 23), nop_i(), nop_i()),
+            (0xf0, 0x10, nop_m(), nop_i(), rfi_b()),
+
+            (0x200, 0x00, nop_m(), adds(12, 0, 32), nop_i()),
+            (0x210, 0x10, nop_m(), nop_i(), br_cond(0x210, 0x210)),
+            raw_bundle(0x100000, 0xfedcba9876543210, 0),
+
+            (0x3000, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+            (0x3010, 0x00, mov_m_cr_gr(9, 22), nop_i(), nop_i()),
+            (0x3020, 0x00, mov_m_cr_gr(10, 17), nop_i(), nop_i()),
+            (0x3030, 0x00, mov_m_ar_gr(11, 18), nop_i(), nop_i()),
+            (0x3040, 0x00, mov_m_cr_gr(13, 16), nop_i(), nop_i()),
+            (0x3050, 0x00, mov_m_cr_gr(14, IA64_CR_SAPIC_IVR),
+             nop_i(), nop_i()),
+            (0x3060, 0x10,
+             mov_m_gr_cr(0, IA64_CR_SAPIC_EOI), nop_i(), rfi_b()),
+        ], {
+            "ip": 0x210,
+            "exception": IA64_EXCP_NONE,
+            "r8": 0x200,
+            "r9": 0x1230,
+            "r10": IA64_ISR_IR,
+            "r11": 0x100008,
+            "r12": 0xfedcba9876543210,
+            "r13": IA64_PSR_IC | IA64_PSR_I | IA64_PSR_DD,
+            "r14": 0xef,
+            "cfm_sof": 1,
+        }, entry=0x10)
+
 def test_async_timer_interrupt_never_resumes_mlx_slot2(qemu):
     program = [
         (0x10, 0x02, mov_m_ar_gr(3, 44), nop_i(), nop_i()),
@@ -488,7 +697,7 @@ def test_repeated_timer_rfi_preserves_word_rmw(qemu):
         (0x90, 0x00, mov_m_gr_cr(4, IA64_CR_ITV), nop_i(), nop_i()),
         (0xa0, *movl_mlx(8, iterations - 1)),
         (0xb0, 0x02, nop_m(), mov_lc_gr(8), nop_i()),
-        (0xc0, *movl_mlx(19, (1 << 13) | (1 << 14) | (1 << 44))),
+        (0xc0, *movl_mlx(19, (1 << 13) | (1 << 14))),
         (0xd0, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
         (0xe0, 0x00, ld2(4, 2), nop_i(), nop_i()),
         (0xf0, 0x00, nop_m(), adds(4, 1, 4), nop_i()),
@@ -539,7 +748,7 @@ def test_timer_interrupt_preserves_banked_word_rmw(qemu):
         (0xa0, 0x00, mov_m_gr_cr(4, IA64_CR_ITV), nop_i(), nop_i()),
         (0xb0, *movl_mlx(8, iterations - 1)),
         (0xc0, 0x02, nop_m(), mov_lc_gr(8), nop_i()),
-        (0xd0, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_I | IA64_PSR_BN)),
+        (0xd0, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_I)),
         (0xe0, 0x10, nop_m(), nop_i(), bsw1()),
         (0xf0, 0x08, mov_gr_psr_full(7), srlz_d(), nop_i()),
         (0x100, 0x10, nop_m(), nop_i(), br_cond(0x100, 0x1fe0)),
@@ -608,7 +817,7 @@ def test_timer_cover_rfi_preserves_large_frame_halfword_rmw(qemu):
         (0xd0, 0x00, mov_m_gr_cr(4, IA64_CR_ITM), nop_i(), nop_i()),
         (0xe0, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
         (0xf0, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
-        (0x100, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_I | IA64_PSR_BN)),
+        (0x100, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_I)),
         (0x110, 0x10, nop_m(), nop_i(), bsw1()),
         (0x120, 0x08, mov_gr_psr_full(7), srlz_d(), nop_i()),
         (0x130, 0x00, nop_m(), adds(47, 0, 0), nop_i()),
@@ -735,13 +944,17 @@ def test_rse_large_frame_timer_rfi_preserves_high_caller_local(qemu):
         (0x350, 0x00, mov_m_gr_cr(4, IA64_CR_ITV), nop_i(), nop_i()),
         (0x360, *movl_mlx(8, iterations - 1)),
         (0x370, 0x02, nop_m(), mov_lc_gr(8), nop_i()),
-        (0x380, *movl_mlx(7, (1 << 13) | (1 << 14) | (1 << 44))),
+        (0x380, *movl_mlx(7, (1 << 13) | (1 << 14))),
         (0x390, 0x08, mov_gr_psr_full(7), srlz_d(), nop_i()),
         (0x3a0, 0x10, nop_m(), adds(10, 1, 10),
          br_cloop(0x3a0, 0x3a0)),
-        (0x3b0, 0x00, rsm(1 << 14), nop_i(), nop_i()),
-        (0x3c0, 0x00, mov_m_gr_ar(36, 64), nop_i(), nop_i()),
-        (0x3d0, 0x10, nop_m(), nop_i(), br_ret(0)),
+        (0x3b0, 0x00, ld8(11, 3), nop_i(), nop_i()),
+        (0x3c0, 0x00, nop_m(), cmp_eq_imm(6, 7, 0, 11), nop_i()),
+        (0x3d0, 0x10, nop_m(), nop_i(),
+         br_cond(0x3d0, 0x3b0, qp=6)),
+        (0x3e0, 0x00, rsm(1 << 14), nop_i(), nop_i()),
+        (0x3f0, 0x00, mov_m_gr_ar(36, 64), nop_i(), nop_i()),
+        (0x400, 0x10, nop_m(), nop_i(), br_ret(0)),
 
         (0x3000, 0x00, mov_m_cr_gr(16, IA64_CR_SAPIC_IVR),
          nop_i(), nop_i()),
@@ -1002,7 +1215,7 @@ test_async_timer_interrupt_preserves_bank1_grs = require_registers(
          nop_i()),
         (0x90, 0x00, mov_m_gr_cr(0, IA64_CR_ITM), nop_i(),
          nop_i()),
-        (0xa0, *movl_mlx(19, (1 << 13) | (1 << 14) | (1 << 44))),
+        (0xa0, *movl_mlx(19, (1 << 13) | (1 << 14))),
         (0xb0, 0x10, mov_gr_psr_full(19), nop_i(),
          br_cond(0xb0, 0xb0)),
         (0x3000, 0x00, mov_m_cr_gr(5, IA64_CR_SAPIC_IVR), nop_i(),
@@ -1486,7 +1699,7 @@ test_exception_break_x = require_registers("exception_break_x", [
     "ip": IA64_BREAK_VECTOR + 0x20,
     "exception": IA64_EXCP_NONE,
     "fault_ip": 0x10,
-    "fault_imm": 0x34b630b4b820032b,
+    "fault_imm": 0x32b,
 }, entry=0x100000)
 
 test_exception_records_slot_ri = require_registers(
@@ -1599,6 +1812,39 @@ test_iipa_preserved_for_rfi_to_fault = require_registers(
         "ip": IA64_BREAK_VECTOR + 0x40,
         "exception": IA64_EXCP_NONE,
         "r8": 0x40,
+    }, entry=0x10)
+
+test_mov_to_iipa_establishes_last_ip_for_rfi_to_fault = require_registers(
+    "mov_to_iipa_establishes_last_ip_for_rfi_to_fault", [
+        (0x10, *movl_mlx(2, 1 << 13)),
+        (0x20, 0x10, mov_gr_psr_full(2), nop_i(),
+         br_cond(0x20, 0x40)),
+        (0x40, 0x00, nop_m(), nop_i(), nop_i()),
+        (0x50, 0x00, break_m(0x42), nop_i(), nop_i()),
+        (0x90, 0x00, break_m(0x43), nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR, 0x00, mov_m_cr_gr(9, 24), nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x10, 0x00,
+         cmp4_eq_unc_imm(6, 7, 0x42, 9), nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_BREAK_VECTOR + 0x20, IA64_BREAK_VECTOR + 0x50, qp=6)),
+        (IA64_BREAK_VECTOR + 0x30, 0x00, mov_m_cr_gr(8, 22), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0x40, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_BREAK_VECTOR + 0x40, IA64_BREAK_VECTOR + 0x40)),
+        (IA64_BREAK_VECTOR + 0x50, *movl_mlx(19, 1 << 13)),
+        (IA64_BREAK_VECTOR + 0x60, *movl_mlx(20, 0x90)),
+        (IA64_BREAK_VECTOR + 0x70, *movl_mlx(21, 0x1230)),
+        (IA64_BREAK_VECTOR + 0x80, 0x00, mov_m_gr_cr(21, 22), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0x90, 0x00, mov_m_gr_cr(19, 16), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0xa0, 0x00, mov_m_gr_cr(20, 19), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0xb0, 0x10, nop_m(), nop_i(), rfi_b()),
+    ], {
+        "ip": IA64_BREAK_VECTOR + 0x40,
+        "exception": IA64_EXCP_NONE,
+        "r8": 0x1230,
     }, entry=0x10)
 
 test_exception_clears_ifs_keeps_cfm = require_registers(
@@ -4173,16 +4419,16 @@ test_ia32_int3_clears_rf_and_psr_id_after_completion = require_registers(
         "exception": IA64_EXCP_NONE,
     }, entry=0x700, cpu="madison")
 
-test_br_ia_preserves_rf_and_psr_id_until_target_completes = \
+test_br_ia_clears_psr_id_before_ia32_target = \
     require_registers(
-        "br_ia_preserves_rf_and_psr_id_until_target_completes", [
+        "br_ia_clears_psr_id_before_ia32_target", [
             *ia32_environment_bundles(0x700, 0x10),
             (0x10, *movl_mlx(3, (1 << 16) | 2)),
             (0x20, 0x00, mov_m_gr_ar(3, 24), nop_i(), nop_i()),
             (0x30, *movl_mlx(4, 0x200)),
             (0x40, 0x00, nop_m(), mov_br_gr(7, 4), nop_i()),
-            # Only rfi can restore PSR.id.  Make br.ia the first restart
-            # instruction so ordinary IA-64 completion cannot clear it.
+            # rfi restores PSR.id, then br.ia must clear it before the first
+            # IA-32 instruction begins execution.
             (0x50, *movl_mlx(2, IA64_PSR_IC | (1 << 37))),
             (0x60, *movl_mlx(3, 0x100)),
             *rfi_to_gr(0x70, 2, 3),
@@ -4198,7 +4444,7 @@ test_br_ia_preserves_rf_and_psr_id_until_target_completes = \
                      IA64_IA32_INTERCEPT_VECTOR + 0x20)),
         ], {
             "ip": IA64_IA32_INTERCEPT_VECTOR + 0x20,
-            "r9": 1,
+            "r9": 0,
             "r10": (1 << 16) | 2,
             "exception": IA64_EXCP_NONE,
         }, entry=0x700, cpu="madison")
@@ -4300,6 +4546,94 @@ test_br_ia_single_step_trap = require_registers(
         "r12": 1,
         "exception": IA64_EXCP_NONE,
     }, entry=0x700, cpu="madison")
+
+test_native_single_step_traps_predicated_off_instruction = require_registers(
+    "native_single_step_traps_predicated_off_instruction", [
+        (0x10, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_SS)),
+        (0x20, *movl_mlx(3, 0x80)),
+        *rfi_to_gr(0x30, 2, 3),
+        # PR1 is zero.  A nullified instruction still completes successfully.
+        (0x80, 0x00, nop_m() | 1, nop_i(), nop_i()),
+        *_native_completion_trap_handler(IA64_SINGLE_STEP_VECTOR),
+    ], {
+        "ip": IA64_SINGLE_STEP_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_SINGLE_STEP,
+        "r8": 0x80,
+        "r9": 0x80,
+        "r10": IA64_ISR_CODE_SS,
+        "r12": 1,
+        "r13": 0,
+    }, entry=0x10)
+
+test_native_taken_branch_precedes_single_step = require_registers(
+    "native_taken_branch_precedes_single_step", [
+        (0x10, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_TB | IA64_PSR_SS | (2 << 41))),
+        (0x20, *movl_mlx(3, 0x80)),
+        *rfi_to_gr(0x30, 2, 3),
+        (0x80, 0x10, nop_m(), nop_i(), br_cond(0x80, 0x100)),
+        *_native_completion_trap_handler(IA64_TAKEN_BRANCH_VECTOR),
+    ], {
+        "ip": IA64_TAKEN_BRANCH_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_TAKEN_BRANCH,
+        "r8": 0x100,
+        "r9": 0x80,
+        "r10": (IA64_ISR_CODE_TB | IA64_ISR_CODE_SS |
+                (2 << IA64_ISR_EI_SHIFT)),
+        "r12": 0,
+        "r13": 0,
+    }, entry=0x10)
+
+test_native_uia_trap_precedes_taken_branch_and_single_step = require_registers(
+    "native_uia_trap_precedes_taken_branch_and_single_step", [
+        (0x10, *movl_mlx(4, (1 << IA64_IMPL_PA_BITS) | 0x100)),
+        (0x20, 0x00, nop_m(), mov_br_gr(7, 4), nop_i()),
+        (0x30, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_TB | IA64_PSR_SS | (2 << 41))),
+        (0x40, *movl_mlx(3, 0x80)),
+        *rfi_to_gr(0x50, 2, 3),
+        (0x80, 0x10, nop_m(), nop_i(), br_indirect(7)),
+        *_native_completion_trap_handler(IA64_LOWER_PRIV_TRANSFER_VECTOR),
+    ], {
+        "ip": IA64_LOWER_PRIV_TRANSFER_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_UNIMPL_INST_ADDR,
+        "r8": (1 << IA64_IMPL_PA_BITS) | 0x100,
+        "r9": 0x80,
+        "r10": (IA64_ISR_CODE_UI | IA64_ISR_CODE_TB |
+                IA64_ISR_CODE_SS | (2 << IA64_ISR_EI_SHIFT)),
+        "r12": 0,
+        "r13": 0,
+    }, entry=0x10)
+
+test_br_ret_lower_privilege_precedes_taken_branch_and_single_step = \
+    require_registers(
+        "br_ret_lower_privilege_precedes_taken_branch_and_single_step", [
+            (0x10, *movl_mlx(4, 3 << 62)),
+            (0x20, *movl_mlx(5, 0x100)),
+            (0x30, 0x00, nop_m(), mov_m_gr_ar(4, 64),
+             mov_br_gr(7, 5)),
+            (0x40, *movl_mlx(
+                2, IA64_PSR_IC | IA64_PSR_LP | IA64_PSR_TB |
+                   IA64_PSR_SS | (2 << 41))),
+            (0x50, *movl_mlx(3, 0x80)),
+            *rfi_to_gr(0x60, 2, 3),
+            (0x80, 0x10, nop_m(), nop_i(), br_ret(7)),
+            *_native_completion_trap_handler(
+                IA64_LOWER_PRIV_TRANSFER_VECTOR),
+        ], {
+            "ip": IA64_LOWER_PRIV_TRANSFER_VECTOR + 0x50,
+            "exception": IA64_EXCP_NONE,
+            "fault_code": IA64_EXCP_LOWER_PRIVILEGE,
+            "r8": 0x100,
+            "r9": 0x80,
+            "r10": (IA64_ISR_CODE_LP | IA64_ISR_CODE_TB |
+                    IA64_ISR_CODE_SS | (2 << IA64_ISR_EI_SHIFT)),
+            "r12": 0,
+            "r13": 3,
+        }, entry=0x10)
 
 test_rfi_to_ia32_clears_fault_suppression_but_preserves_psr_id = \
     require_registers(
@@ -4724,6 +5058,670 @@ test_rfi_montecito_uncollected_transition_preserves_target = \
             "exception": IA64_EXCP_NONE,
         }, entry=0x10)
 
+
+# SDM Vol. 2, 7.1: an instruction breakpoint is checked before predicate
+# evaluation, so a disabled instruction can still take the Debug fault.
+test_native_ibr_matches_predicated_off_instruction = require_registers(
+    "native_ibr_matches_predicated_off_instruction", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x100)),
+        (0x30, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, 0x00, srlz_i(), nop_i(), nop_i()),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x10, nop_m(), nop_i(), br_cond(0xb0, 0x100)),
+        (0x100, 0x10, ld8(8, 3, qp=1), nop_i(),
+         br_cond(0x100, 0x110)),
+        (0x110, 0x10, nop_m(), nop_i(), br_cond(0x110, 0x110)),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0x100,
+        "r9": 0x100,
+        "r10": IA64_ISR_X,
+    }, entry=0x10)
+
+
+# PSR.id suppresses one instruction-breakpoint check.  It is consumed by the
+# successful, predicated-off slot 0 instruction, exposing the same bundle's
+# slot 1 instruction to the IBR check.
+test_native_psr_id_clears_after_predicated_off_instruction = \
+    require_registers(
+        "native_psr_id_clears_after_predicated_off_instruction", [
+            (0x10, *movl_mlx(4, 0)),
+            (0x20, *movl_mlx(5, 0x100)),
+            (0x30, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+            (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+            (0x60, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x70, 0x00, srlz_i(), nop_i(), nop_i()),
+            (0x80, *movl_mlx(
+                2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_ID)),
+            (0x90, *movl_mlx(3, 0x100)),
+            *rfi_to_gr(0xa0, 2, 3),
+            (0x100, 0x00, ld8(8, 3, qp=1), nop_i(), nop_i()),
+            (0x110, 0x10, nop_m(), nop_i(), br_cond(0x110, 0x110)),
+            (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x30, 0x00, mov_m_cr_gr(11, 16),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x40, 0x00, nop_m(),
+             extr_u(12, 11, 37, 1), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x50, 0x10, nop_m(), nop_i(),
+             br_cond(IA64_DEBUG_VECTOR + 0x50,
+                     IA64_DEBUG_VECTOR + 0x50)),
+        ], {
+            "ip": IA64_DEBUG_VECTOR + 0x50,
+            "exception": IA64_EXCP_NONE,
+            "fault_code": IA64_EXCP_DEBUG,
+            "r8": 0x100,
+            "r9": 0x100,
+            "r10": IA64_ISR_X | (1 << IA64_ISR_EI_SHIFT),
+            "r12": 0,
+        }, entry=0x10)
+
+
+# A predicated-off load performs no data access and therefore cannot match a
+# DBR.  The following true-predicate load in slot 1 must be the faulting one.
+test_native_dbr_predicated_off_load_does_not_match = require_registers(
+    "native_dbr_predicated_off_load_does_not_match", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x200)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x200)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x08, ld8(8, 3, qp=1), ld8(9, 3), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        raw_bundle(0x200, 0x8877665544332211, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(10, 19),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(11, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(12, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0,
+        "r9": 0,
+        "r10": 0xb0,
+        "r11": 0x200,
+        "r12": IA64_ISR_R | (1 << IA64_ISR_EI_SHIFT),
+    }, entry=0x10)
+
+
+# Any matching byte in a datum triggers a DBR.  Data Debug (priority 62)
+# precedes Unaligned Data Reference (priority 63).
+test_native_dbr_overlap_precedes_unaligned_fault = require_registers(
+    "native_dbr_overlap_precedes_unaligned_fault", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x203)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x201)),
+        (0x80, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_AC)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld8(8, 3), nop_i(), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        raw_bundle(0x200, 0x8877665544332211, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r9": 0xb0,
+        "r10": 0x201,
+        "r11": IA64_ISR_R,
+    }, entry=0x10)
+
+
+# The forced-failure response of an advanced load to a non-speculative page
+# is a non-faulting return-value rule.  It does not suppress a qualified DBR
+# match that precedes the memory-attribute response.
+test_native_dbr_precedes_advanced_non_speculative_failure = \
+    require_registers(
+        "native_dbr_precedes_advanced_non_speculative_failure", [
+            (0x10, *movl_mlx(4, 0)),
+            (0x20, *movl_mlx(5, (1 << 63) | 0x200)),
+            (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+            (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+            (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x70, *movl_mlx(3, (1 << 63) | 0x200)),
+            (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+            (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+            (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+            (0xb0, 0x00, ld8_a(8, 3), nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+             br_cond(IA64_DEBUG_VECTOR + 0x30,
+                     IA64_DEBUG_VECTOR + 0x30)),
+        ], {
+            "ip": IA64_DEBUG_VECTOR + 0x30,
+            "exception": IA64_EXCP_NONE,
+            "fault_code": IA64_EXCP_DEBUG,
+            "r9": 0xb0,
+            "r10": (1 << 63) | 0x200,
+            "r11": IA64_ISR_R,
+        }, entry=0x10)
+
+
+# Itanium 2 reports Data Debug for any datum crossing a 16-byte boundary
+# while PSR.db is set, even though no byte matches a programmed DBR.  The
+# fault has priority over the otherwise-applicable unaligned-data fault.
+test_native_madison_cross16_data_debug_precedes_unaligned = \
+    require_registers(
+        "native_madison_cross16_data_debug_precedes_unaligned", [
+            (0x10, *movl_mlx(4, 0)),
+            (0x20, *movl_mlx(5, 0x300)),
+            (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+            (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+            (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x70, *movl_mlx(3, 0x20f)),
+            (0x80, *movl_mlx(
+                2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_AC)),
+            (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+            (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+            (0xb0, 0x00, ld2(8, 3), nop_i(), nop_i()),
+            (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+            (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+             nop_i(), nop_i()),
+            (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+             br_cond(IA64_DEBUG_VECTOR + 0x30,
+                     IA64_DEBUG_VECTOR + 0x30)),
+        ], {
+            "ip": IA64_DEBUG_VECTOR + 0x30,
+            "exception": IA64_EXCP_NONE,
+            "fault_code": IA64_EXCP_DEBUG,
+            "r9": 0xb0,
+            "r10": 0x20f,
+            "r11": IA64_ISR_R,
+        }, entry=0x10, cpu="madison")
+
+
+# The same model-specific match participates in the speculative-load path.
+# The Debug fault remains non-deferred here and records ISR.sp.
+test_native_madison_speculative_cross16_data_debug = require_registers(
+    "native_madison_speculative_cross16_data_debug", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x20f)),
+        (0x80, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_AC)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld2_s(8, 3), nop_i(), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r9": 0xb0,
+        "r10": 0x20f,
+        "r11": IA64_ISR_R | IA64_ISR_SP,
+    }, entry=0x10, cpu="madison")
+
+
+# PSR.dd suppresses the first model-specific match after rfi and is consumed
+# by that successful load.  A second cross-boundary load then takes Debug.
+test_native_madison_cross16_data_debug_respects_psr_dd = require_registers(
+    "native_madison_cross16_data_debug_respects_psr_dd", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x20e)),
+        (0x80, *movl_mlx(4, 0x20f)),
+        (0x90, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_DD)),
+        (0xa0, *movl_mlx(6, 0xd0)),
+        *rfi_to_gr(0xb0, 2, 6),
+        (0xd0, 0x00, ld2(8, 3), nop_i(), nop_i()),
+        (0xe0, 0x00, ld2(9, 4), nop_i(), nop_i()),
+        (0xf0, 0x10, nop_m(), nop_i(), br_cond(0xf0, 0xf0)),
+        raw_bundle(0x200, 0, 0xaa00000000000000),
+        raw_bundle(0x210, 0xbb, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(10, 19),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(11, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(12, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x00, mov_m_cr_gr(13, 16),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x40, 0x00, nop_m(),
+         extr_u(14, 13, 39, 1), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x50, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x50,
+                 IA64_DEBUG_VECTOR + 0x50)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0xaa00,
+        "r9": 0,
+        "r10": 0xe0,
+        "r11": 0x20f,
+        "r12": IA64_ISR_R,
+        "r14": 0,
+    }, entry=0x10, cpu="madison")
+
+
+# Translation and access faults precede the model-specific Debug condition.
+test_native_madison_cross16_higher_fault_precedes_debug = require_registers(
+    "native_madison_cross16_higher_fault_precedes_debug", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, (1 << IA64_IMPL_PA_BITS) | 0xf)),
+        (0x80, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_AC)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld2(8, 3), nop_i(), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        (IA64_GENERAL_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+         nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_GENERAL_VECTOR + 0x30,
+                 IA64_GENERAL_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_GENERAL_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_UNIMPL_DATA_ADDR,
+        "fault_ip": 0xb0,
+        "r9": 0xb0,
+        "r10": (1 << IA64_IMPL_PA_BITS) | 0xf,
+        "r11": IA64_GENEX_UNIMPL_DATA_ADDR | IA64_ISR_R,
+    }, entry=0x10, cpu="madison")
+
+
+# PSR.db remains the global gate for the Itanium 2 cross-boundary rule.
+test_native_madison_cross16_requires_psr_db = require_registers(
+    "native_madison_cross16_requires_psr_db", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x20f)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld2(8, 3), nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_UNALIGNED_VECTOR + 0x30,
+                 IA64_UNALIGNED_VECTOR + 0x30)),
+        raw_bundle(0x200, 0, 0xaa00000000000000),
+        raw_bundle(0x210, 0xbb, 0),
+    ], {
+        "ip": IA64_UNALIGNED_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_UNALIGNED,
+        "r9": 0xb0,
+        "r10": 0x20f,
+        "r11": IA64_ISR_R,
+    }, entry=0x10, cpu="madison")
+
+
+# This extra fault is specific to the selected Madison/Itanium 2 model; the
+# Merced model continues to use programmed DBR address matching alone.
+test_native_merced_cross16_does_not_add_data_debug = require_registers(
+    "native_merced_cross16_does_not_add_data_debug", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x20f)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld2(8, 3), nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_UNALIGNED_VECTOR + 0x30,
+                 IA64_UNALIGNED_VECTOR + 0x30)),
+        raw_bundle(0x200, 0, 0xaa00000000000000),
+        raw_bundle(0x210, 0xbb, 0),
+    ], {
+        "ip": IA64_UNALIGNED_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_UNALIGNED,
+        "r9": 0xb0,
+        "r10": 0x20f,
+        "r11": IA64_ISR_R,
+    }, entry=0x10, cpu="merced")
+
+
+# SDM Vol. 2, 7.1.2: a naturally aligned 10-byte extended operand is a
+# 16-byte breakpoint datum, but an unaligned operand covers only the ten bytes
+# actually transferred.  DBR byte 10 is therefore padding for this load.
+test_native_unaligned_ldfe_ignores_dbr_padding = require_registers(
+    "native_unaligned_ldfe_ignores_dbr_padding", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x20b)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x201)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ldfe(6, 3), nop_i(), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        raw_bundle(0x200, 0, 0),
+    ], {
+        "ip": 0xc0,
+        "exception": IA64_EXCP_NONE,
+    }, entry=0x10, cpu="merced")
+
+
+# The last transferred byte of the same unaligned extended operand must still
+# match, and the fault reports the instruction's unrounded address in IFA.
+test_native_unaligned_ldfe_matches_last_data_byte = require_registers(
+    "native_unaligned_ldfe_matches_last_data_byte", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x20a)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x201)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ldfe(6, 3), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+        raw_bundle(0x200, 0, 0),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0xb0,
+        "r9": 0x201,
+        "r10": IA64_ISR_R,
+    }, entry=0x10, cpu="merced")
+
+
+# The aligned form deliberately expands the same 10-byte transfer to a
+# 16-byte debug datum, so its first padding byte does match.
+test_native_aligned_ldfe_matches_dbr_padding = require_registers(
+    "native_aligned_ldfe_matches_dbr_padding", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x20a)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x200)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ldfe(6, 3), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+        raw_bundle(0x200, 0, 0),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0xb0,
+        "r9": 0x200,
+        "r10": IA64_ISR_R,
+    }, entry=0x10, cpu="merced")
+
+
+# The speculative probe applies the identical unaligned 10-byte datum rule.
+# A padding-only DBR must not raise a non-deferred Debug fault.  Reaching the
+# terminal state with NaTVal proves that the padding did not match.
+test_native_speculative_unaligned_ldfe_ignores_dbr_padding = \
+    require_registers(
+        "native_speculative_unaligned_ldfe_ignores_dbr_padding", [
+            (0x10, *movl_mlx(4, 0)),
+            (0x20, *movl_mlx(5, 0x20b)),
+            (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+            (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+            (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+            (0x70, *movl_mlx(3, 0x201)),
+            (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+            (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+            (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+            (0xb0, 0x00, ldfe_s(6, 3), nop_i(), nop_i()),
+            (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+            raw_bundle(0x200, 0, 0),
+        ], {
+            "ip": 0xc0,
+            "exception": IA64_EXCP_NONE,
+            "f6": ExpectedFP(0, 0x1fffe, nat=True),
+        }, entry=0x10, cpu="merced")
+
+
+# The store path uses the same runtime datum selection.  Byte 10 is padding
+# for an unaligned stfe and therefore cannot trigger a write breakpoint.
+test_native_unaligned_stfe_ignores_dbr_padding = require_registers(
+    "native_unaligned_stfe_ignores_dbr_padding", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x20b)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x41ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x201)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, stfe(3, 1), nop_i(), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        raw_bundle(0x200, 0, 0),
+    ], {
+        "ip": 0xc0,
+        "exception": IA64_EXCP_NONE,
+    }, entry=0x10, cpu="merced")
+
+
+# cmp8xchg16 with bit 3 set compares the upper half, but both breakpoint
+# datums cover the containing aligned 16-byte block.  A byte in the lower
+# half must therefore match.
+test_native_cmp8xchg16_debug_matches_lower_half = require_registers(
+    "native_cmp8xchg16_debug_matches_lower_half", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x200)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0xc1ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x208)),
+        (0x80, *movl_mlx(2, 0)),
+        (0x90, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_DB)),
+        (0xa0, 0x00, mov_gr_psr_full(7), nop_i(), nop_i()),
+        (0xb0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xc0, 0x00, cmp8xchg16_acq(8, 3, 2), nop_i(), nop_i()),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0xd0)),
+        raw_bundle(0x200, 0, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0,
+        "r9": 0xc0,
+        "r10": 0x200,
+        "r11": IA64_ISR_R | IA64_ISR_W,
+    }, entry=0x10, cpu="montecito")
+
+
+# Conversely, the byte immediately following that containing datum is not
+# referenced.  The old raw-r3/size-16 matcher incorrectly included it.
+test_native_cmp8xchg16_debug_excludes_following_byte = require_registers(
+    "native_cmp8xchg16_debug_excludes_following_byte", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x210)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0xc1ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x208)),
+        (0x80, *movl_mlx(2, 0)),
+        (0x90, *movl_mlx(7, IA64_PSR_IC | IA64_PSR_DB)),
+        (0xa0, 0x00, mov_gr_psr_full(7), nop_i(), nop_i()),
+        (0xb0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xc0, 0x00, cmp8xchg16_acq(8, 3, 2), nop_i(), nop_i()),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0xd0)),
+        raw_bundle(0x200, 0, 0),
+    ], {
+        "ip": 0xd0,
+        "exception": IA64_EXCP_NONE,
+        "r8": 0,
+    }, entry=0x10, cpu="montecito")
+
+
+# PSR.dd suppresses a matching data reference once and is cleared by that
+# successful instruction.  The next matching reference faults in slot 1.
+test_native_psr_dd_clears_after_successful_load = require_registers(
+    "native_psr_dd_clears_after_successful_load", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x200)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x200)),
+        (0x80, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_DD)),
+        (0x90, *movl_mlx(6, 0xc0)),
+        *rfi_to_gr(0xa0, 2, 6),
+        (0xc0, 0x08, ld8(8, 3), ld8(9, 3), nop_i()),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0xd0)),
+        raw_bundle(0x200, 0x8877665544332211, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(10, 19),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(11, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(12, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x00, mov_m_cr_gr(13, 16),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x40, 0x00, nop_m(),
+         extr_u(14, 13, 39, 1), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x50, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x50,
+                 IA64_DEBUG_VECTOR + 0x50)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0x8877665544332211,
+        "r9": 0,
+        "r10": 0xc0,
+        "r11": 0x200,
+        "r12": IA64_ISR_R | (1 << IA64_ISR_EI_SHIFT),
+        "r14": 0,
+    }, entry=0x10)
+
 GROUP = 'interrupt'
 CASE_NAMES = (
 
@@ -4734,10 +5732,11 @@ CASE_NAMES = (
     'async_timer_interrupt_never_resumes_mlx_slot2',
     'async_timer_interrupt_preserves_bank1_grs',
     'async_timer_interrupt_records_boundary_ri',
-    'br_ia_preserves_rf_and_psr_id_until_target_completes',
+    'br_ia_clears_psr_id_before_ia32_target',
     'br_ia_single_step_trap',
     'br_ia_taken_branch_trap_precedes_single_step',
     'br_ia_unimplemented_target_preserves_64bit_iip',
+    'br_ret_lower_privilege_precedes_taken_branch_and_single_step',
     'break_preserves_ifa_and_records_iim_isr',
     'cloop_zero_st1_timer_interrupts_batched_loop',
     'counted_self_loop_fallthrough_fault_has_slot1_ri',
@@ -4760,6 +5759,7 @@ CASE_NAMES = (
     'iipa_preserved_for_rfi_to_fault',
     'iipa_reports_current_bundle_after_prior_slot_success',
     'iipa_reports_previous_successful_bundle_for_slot0_fault',
+    'mov_to_iipa_establishes_last_ip_for_rfi_to_fault',
     'ia32_dfh_faults_first_target_instruction',
     'ia32_fisttp_intercepts_before_cr0_em',
     'ia32_dbr_overlap_raises_post_instruction_trap',
@@ -4834,11 +5834,36 @@ CASE_NAMES = (
     'itc_rate_tracks_montecito_pal_ratio',
     'masked_itv_discards_due_timer',
     'masking_itv_preserves_pended_timer_irr',
+    'mandatory_rse_br_ret_fill_external_interrupt_sets_isr_ir',
+    'mandatory_rse_flushrs_accepts_pending_external_interrupt',
+    'mandatory_rse_rfi_prefill_interrupt_preserves_seeded_iipa',
     'mov_from_psr_does_not_copy_execution_slot_to_rfi',
     'mov_pkr_does_not_alias_interruption_crs',
     'mov_to_irr_illegal',
     'mov_to_ivr_illegal',
     'mov_to_read_only_cr_predicate_false',
+    'native_aligned_ldfe_matches_dbr_padding',
+    'native_cmp8xchg16_debug_excludes_following_byte',
+    'native_cmp8xchg16_debug_matches_lower_half',
+    'native_dbr_overlap_precedes_unaligned_fault',
+    'native_dbr_precedes_advanced_non_speculative_failure',
+    'native_dbr_predicated_off_load_does_not_match',
+    'native_ibr_matches_predicated_off_instruction',
+    'native_madison_cross16_data_debug_precedes_unaligned',
+    'native_madison_cross16_data_debug_respects_psr_dd',
+    'native_madison_cross16_higher_fault_precedes_debug',
+    'native_madison_cross16_requires_psr_db',
+    'native_madison_speculative_cross16_data_debug',
+    'native_merced_cross16_does_not_add_data_debug',
+    'native_psr_dd_clears_after_successful_load',
+    'native_psr_id_clears_after_predicated_off_instruction',
+    'native_single_step_traps_predicated_off_instruction',
+    'native_speculative_unaligned_ldfe_ignores_dbr_padding',
+    'native_taken_branch_precedes_single_step',
+    'native_uia_trap_precedes_taken_branch_and_single_step',
+    'native_unaligned_ldfe_ignores_dbr_padding',
+    'native_unaligned_ldfe_matches_last_data_byte',
+    'native_unaligned_stfe_ignores_dbr_padding',
     'nested_exception_keeps_handler_interruption_state',
     'nested_exception_keeps_handler_return_state',
     'past_itm_does_not_fire',

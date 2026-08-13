@@ -14,6 +14,7 @@
 #include "cpu.h"
 #include "arch/arch.h"
 #include "arch/fp.h"
+#include "arch/system.h"
 #include "exec-access.h"
 #include "fpreg.h"
 #include "exec/cpu-common.h"
@@ -25,6 +26,8 @@
 #define IA64_FP_SINGLE_BIAS       127
 #define IA64_FP_SINGLE_MANT_WIDTH 24
 #define IA64_FP_ISR_SWA           0x8ULL
+#define IA64_FP_ISR_FPA_LO        (1ULL << 10)
+#define IA64_FP_ISR_FPA_HI        (1ULL << 14)
 #define IA64_FPSR_TRAPS_MASK      0x3fULL
 #define IA64_FPSR_SF_BITS         13
 #define IA64_FPSR_SF0_SHIFT       6
@@ -100,8 +103,20 @@ static inline void ia64_fr_write(CPUIA64State *env, uint32_t reg,
 static inline void ia64_fr_write_sig(CPUIA64State *env, uint32_t reg,
                                      uint64_t value)
 {
+    uint64_t bit;
+
     ia64_fp_backup_fr(env, reg);
-    ia64_fpreg_from_spill(env, reg, value, IA64_FP_REG_INTEGER_EXP);
+    if (reg <= 1) {
+        return;
+    }
+
+    bit = ia64_fpreg_tag_bit(reg);
+    ia64_fpreg_clear_tags(env, reg);
+    env->fp.fr[reg] = value;
+    env->fp.fr_sig[reg / 64] |= bit;
+    env->fp.fr_int_value[reg] = value;
+    env->fp.fr_int_origin[reg / 64] |= bit;
+    ia64_fpreg_mark_written(env, reg);
 }
 
 static void ia64_fr_write_ext(CPUIA64State *env, uint32_t reg, bool sign,
@@ -145,7 +160,8 @@ static uint64_t ia64_fp_soft_flags_to_ia64(int soft);
 static uint32_t ia64_fpsr_sf_shift(uint32_t sf);
 static uint64_t ia64_fpsr_sf_controls(const CPUIA64State *env, uint32_t sf);
 static void ia64_fp_simd_fault_end(CPUIA64State *env, uint32_t sf,
-                                   int hi_soft, int lo_soft);
+                                   int hi_soft, int lo_soft,
+                                   bool hi_fpa, bool lo_fpa);
 
 static floatx80 ia64_register_format_to_floatx80(CPUIA64State *env,
                                                   bool sign, uint32_t exp,
@@ -492,12 +508,50 @@ void ia64_set_cfm_rrb_fr(CPUIA64State *env, uint32_t new_rrb)
     ia64_set_cfm_rrb_fr_slow(env, new_rrb, old_rrb);
 }
 
+typedef enum IA64FPBinaryOperation {
+    IA64_FP_BINARY_ADD,
+    IA64_FP_BINARY_SUB,
+    IA64_FP_BINARY_MUL,
+    IA64_FP_BINARY_NEG_MUL,
+} IA64FPBinaryOperation;
+
+typedef enum IA64FPMulAddOperation {
+    IA64_FP_MULADD,
+    IA64_FP_MULSUB,
+    IA64_FP_NEG_MULADD,
+} IA64FPMulAddOperation;
+
+static bool ia64_fp_handle_binary_unnormal(CPUIA64State *env, uint32_t sf,
+                                            uint32_t r1, uint32_t r2,
+                                            uint32_t r3,
+                                            IA64FPBinaryOperation op);
+static bool ia64_fp_try_raw_binary(CPUIA64State *env, uint32_t r1,
+                                    uint32_t r2, uint32_t r3, uint32_t sf,
+                                    uint32_t precision,
+                                    IA64FPBinaryOperation op);
+static bool ia64_fp_try_raw_muladd(CPUIA64State *env, uint32_t r1,
+                                    uint32_t r2, uint32_t r3, uint32_t r4,
+                                    uint32_t sf, uint32_t precision,
+                                    IA64FPMulAddOperation op);
+static bool ia64_fp_handle_muladd_special(CPUIA64State *env, uint32_t sf,
+                                          uint32_t r1, uint32_t r2,
+                                          uint32_t r3, uint32_t r4,
+                                          IA64FPMulAddOperation op);
+
 static void ia64_do_fadd(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3)
+                         uint32_t r3, uint32_t sf, uint32_t precision)
 {
     floatx80 result;
 
     if (ia64_fr_write_nat_if_any2(env, r1, r2, r3)) {
+        return;
+    }
+    if (ia64_fp_handle_binary_unnormal(
+            env, sf, r1, r2, r3, IA64_FP_BINARY_ADD)) {
+        return;
+    }
+    if (ia64_fp_try_raw_binary(
+            env, r1, r2, r3, sf, precision, IA64_FP_BINARY_ADD)) {
         return;
     }
     result = floatx80_add(ia64_fr_to_floatx80(env, r2),
@@ -506,47 +560,94 @@ static void ia64_do_fadd(CPUIA64State *env, uint32_t r1, uint32_t r2,
 }
 
 static void ia64_do_fsub(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3)
+                         uint32_t r3, uint32_t sf, uint32_t precision)
 {
+    Float2NaNPropRule saved_rule;
     floatx80 result;
 
     if (ia64_fr_write_nat_if_any2(env, r1, r2, r3)) {
         return;
     }
+    if (ia64_fp_handle_binary_unnormal(
+            env, sf, r1, r2, r3, IA64_FP_BINARY_SUB)) {
+        return;
+    }
+    if (ia64_fp_try_raw_binary(
+            env, r1, r2, r3, sf, precision, IA64_FP_BINARY_SUB)) {
+        return;
+    }
+    /* fsub's SoftFloat B operand is architectural f2, ahead of f3. */
+    saved_rule = get_float_2nan_prop_rule(&env->fp.fp_status);
+    set_float_2nan_prop_rule(float_2nan_prop_ba, &env->fp.fp_status);
     result = floatx80_sub(ia64_fr_to_floatx80(env, r2),
                           ia64_fr_to_floatx80(env, r3), &env->fp.fp_status);
+    set_float_2nan_prop_rule(saved_rule, &env->fp.fp_status);
+    ia64_fr_write_floatx80(env, r1, result);
+}
+
+static void ia64_do_fmpy_common(CPUIA64State *env, uint32_t r1, uint32_t r2,
+                                uint32_t r3, uint32_t sf,
+                                uint32_t precision, bool negate)
+{
+    Float2NaNPropRule saved_rule;
+    floatx80 result;
+
+    if (ia64_fr_write_nat_if_any2(env, r1, r2, r3)) {
+        return;
+    }
+    if (ia64_fp_handle_binary_unnormal(
+            env, sf, r1, r2, r3,
+            negate ? IA64_FP_BINARY_NEG_MUL : IA64_FP_BINARY_MUL)) {
+        return;
+    }
+    if (ia64_fp_try_raw_binary(
+            env, r1, r2, r3, sf, precision,
+            negate ? IA64_FP_BINARY_NEG_MUL : IA64_FP_BINARY_MUL)) {
+        return;
+    }
+    /* fmpy's SoftFloat B operand is architectural f4, ahead of f3. */
+    saved_rule = get_float_2nan_prop_rule(&env->fp.fp_status);
+    set_float_2nan_prop_rule(float_2nan_prop_ba, &env->fp.fp_status);
+    result = floatx80_mul(ia64_fr_to_floatx80(env, r2),
+                          ia64_fr_to_floatx80(env, r3), &env->fp.fp_status);
+    set_float_2nan_prop_rule(saved_rule, &env->fp.fp_status);
+    if (negate && !floatx80_is_any_nan(result)) {
+        result = floatx80_chs(result);
+    }
     ia64_fr_write_floatx80(env, r1, result);
 }
 
 static void ia64_do_fmpy(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3)
+                         uint32_t r3, uint32_t sf, uint32_t precision)
 {
-    floatx80 result;
-
-    if (ia64_fr_write_nat_if_any2(env, r1, r2, r3)) {
-        return;
-    }
-    result = floatx80_mul(ia64_fr_to_floatx80(env, r2),
-                          ia64_fr_to_floatx80(env, r3), &env->fp.fp_status);
-    ia64_fr_write_floatx80(env, r1, result);
+    ia64_do_fmpy_common(env, r1, r2, r3, sf, precision, false);
 }
 
 static floatx80 ia64_floatx80_muladd(CPUIA64State *env, floatx80 a,
                                      floatx80 b, floatx80 c, int flags)
 {
-    float128 result = float128_muladd(
+    Float3NaNPropRule saved_rule =
+        get_float_3nan_prop_rule(&env->fp.fp_status);
+    float128 result;
+    floatx80 rounded;
+
+    /* SoftFloat A, B, C map to architectural f3, f4, f2. */
+    set_float_3nan_prop_rule(float_3nan_prop_bca, &env->fp.fp_status);
+    result = float128_muladd(
         floatx80_to_float128(a, &env->fp.fp_status),
         floatx80_to_float128(b, &env->fp.fp_status),
         floatx80_to_float128(c, &env->fp.fp_status), flags, &env->fp.fp_status);
+    rounded = float128_to_floatx80(result, &env->fp.fp_status);
+    set_float_3nan_prop_rule(saved_rule, &env->fp.fp_status);
 
-    return float128_to_floatx80(result, &env->fp.fp_status);
+    return rounded;
 }
 
 static uint64_t ia64_fr_significand(const CPUIA64State *env, uint32_t reg)
 {
-    bool sign;
-    uint32_t exp;
-    uint64_t mant;
+    uint64_t bit;
+    uint64_t value;
+    uint64_t significand;
 
     if (reg == IA64_FR_ZERO_INDEX) {
         return 0;
@@ -554,8 +655,24 @@ static uint64_t ia64_fr_significand(const CPUIA64State *env, uint32_t reg)
     if (reg == IA64_FR_ONE_INDEX) {
         return IA64_FP_SIGNIFICAND_INTEGER_BIT;
     }
-    return ia64_fr_ext_get(env, reg, &sign, &exp, &mant) ?
-           mant : env->fp.fr[reg];
+
+    bit = ia64_fpreg_tag_bit(reg);
+    if (env->fp.fr_nat[reg / 64] & bit) {
+        return 0;
+    }
+    if (env->fp.fr_ext_valid[reg / 64] & bit) {
+        return env->fp.fr_ext_mant[reg];
+    }
+    if (env->fp.fr_sig[reg / 64] & bit) {
+        return env->fp.fr[reg];
+    }
+
+    value = env->fp.fr[reg];
+    significand = (value & UINT64_C(0x000fffffffffffff)) << 11;
+    if (((value >> 52) & 0x7ff) != 0) {
+        significand |= IA64_FP_SIGNIFICAND_INTEGER_BIT;
+    }
+    return significand;
 }
 
 void ia64_fp_fma(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3)
@@ -572,9 +689,18 @@ void ia64_fp_fma(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3)
 }
 
 static void ia64_do_fma4(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3, uint32_t r4)
+                         uint32_t r3, uint32_t r4, uint32_t sf,
+                         uint32_t precision)
 {
     if (ia64_fr_write_nat_if_any3(env, r1, r2, r3, r4)) {
+        return;
+    }
+    if (ia64_fp_handle_muladd_special(
+            env, sf, r1, r2, r3, r4, IA64_FP_MULADD)) {
+        return;
+    }
+    if (ia64_fp_try_raw_muladd(
+            env, r1, r2, r3, r4, sf, precision, IA64_FP_MULADD)) {
         return;
     }
     ia64_fr_write_floatx80(
@@ -612,8 +738,15 @@ void ia64_fp_xma(CPUIA64State *env, uint32_t r1, uint32_t r2,
     }
 }
 
+static void ia64_fp_compare_exception_check(CPUIA64State *env, uint32_t sf,
+                                            uint32_t r2, uint32_t r3);
+static FloatRelation ia64_fp_register_compare(CPUIA64State *env,
+                                               uint32_t r2, uint32_t r3,
+                                               bool is_abs, bool quiet);
+
 static void ia64_do_fcmp(CPUIA64State *env, uint32_t p1, uint32_t p2,
-                         uint32_t r2, uint32_t r3, uint32_t cond_code)
+                         uint32_t r2, uint32_t r3, uint32_t cond_code,
+                         uint32_t sf)
 {
     FloatRelation rel;
     bool cond;
@@ -624,8 +757,11 @@ static void ia64_do_fcmp(CPUIA64State *env, uint32_t p1, uint32_t p2,
         return;
     }
 
-    rel = floatx80_compare(ia64_fr_to_floatx80(env, r2),
-                           ia64_fr_to_floatx80(env, r3), &env->fp.fp_status);
+    ia64_fp_compare_exception_check(env, sf, r2, r3);
+
+    rel = ia64_fp_register_compare(
+        env, r2, r3, false,
+        (cond_code & 3) == 0 || (cond_code & 3) == 3);
 
     switch (cond_code & 3) {
     case 0:
@@ -649,10 +785,8 @@ static void ia64_do_fcmp(CPUIA64State *env, uint32_t p1, uint32_t p2,
 /* ---- FP min/max (F8 forms select f3 on equality or NaN) ---- */
 
 static void ia64_fminmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3, bool is_max, bool is_abs)
+                         uint32_t r3, bool is_max, bool is_abs, uint32_t sf)
 {
-    floatx80 left;
-    floatx80 right;
     FloatRelation rel;
     bool take_left;
 
@@ -660,49 +794,38 @@ static void ia64_fminmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    left = ia64_fr_to_floatx80(env, r2);
-    right = ia64_fr_to_floatx80(env, r3);
-    rel = floatx80_compare(is_abs ? floatx80_abs(left) : left,
-                           is_abs ? floatx80_abs(right) : right,
-                           &env->fp.fp_status);
+    ia64_fp_compare_exception_check(env, sf, r2, r3);
+    rel = ia64_fp_register_compare(env, r2, r3, is_abs, false);
     take_left = is_max ? rel == float_relation_greater :
                          rel == float_relation_less;
     ia64_fr_copy(env, r1, take_left ? r2 : r3, 1);
 }
 
 static void ia64_do_fmin(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3)
+                         uint32_t r3, uint32_t sf)
 {
-    ia64_fminmax(env, r1, r2, r3, false, false);
+    ia64_fminmax(env, r1, r2, r3, false, false, sf);
 }
 
 static void ia64_do_fmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                         uint32_t r3)
+                         uint32_t r3, uint32_t sf)
 {
-    ia64_fminmax(env, r1, r2, r3, true, false);
+    ia64_fminmax(env, r1, r2, r3, true, false, sf);
 }
 
 static void ia64_do_famin(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                          uint32_t r3)
+                          uint32_t r3, uint32_t sf)
 {
-    ia64_fminmax(env, r1, r2, r3, false, true);
+    ia64_fminmax(env, r1, r2, r3, false, true, sf);
 }
 
 static void ia64_do_famax(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                          uint32_t r3)
+                          uint32_t r3, uint32_t sf)
 {
-    ia64_fminmax(env, r1, r2, r3, true, true);
+    ia64_fminmax(env, r1, r2, r3, true, true, sf);
 }
 
 /* ---- FP reciprocal approximation (frcpa: ~1/x in table index 0) ---- */
-
-static bool ia64_fr_looks_like_setf_sig_payload(uint64_t value)
-{
-    uint64_t exponent = (value >> 52) & 0x7ff;
-    uint64_t fraction = value & 0x000fffffffffffffULL;
-
-    return exponent == 0 && fraction != 0;
-}
 
 static bool ia64_floatx80_rcpa_predicate(floatx80 num, floatx80 den,
                                           float_status *status)
@@ -736,8 +859,8 @@ static void ia64_normalize_fp_register_format(IA64FPRegisterFormat *fmt)
     fmt->exp = fmt->exp > (uint32_t)shift ? fmt->exp - shift : 0;
 }
 
-static IA64FPRegisterFormat ia64_fr_register_format(CPUIA64State *env,
-                                                     uint32_t reg)
+static IA64FPRegisterFormat ia64_fr_raw_register_format(CPUIA64State *env,
+                                                         uint32_t reg)
 {
     uint64_t low;
     uint64_t high;
@@ -747,7 +870,6 @@ static IA64FPRegisterFormat ia64_fr_register_format(CPUIA64State *env,
     fmt.sign = (high >> 17) & 1;
     fmt.exp = (high & 0xffff) | (((high >> 16) & 1) << 16);
     fmt.mant = low;
-    ia64_normalize_fp_register_format(&fmt);
     return fmt;
 }
 
@@ -778,6 +900,339 @@ static bool ia64_fp_register_format_is_nan(
 {
     return fmt->exp == IA64_FP_REG_SPECIAL_EXP &&
            fmt->mant != IA64_FP_SIGNIFICAND_INTEGER_BIT;
+}
+
+static bool ia64_fp_register_format_is_unsupported(
+    const IA64FPRegisterFormat *fmt)
+{
+    return fmt->exp == IA64_FP_REG_SPECIAL_EXP &&
+           !(fmt->mant & IA64_FP_SIGNIFICAND_INTEGER_BIT);
+}
+
+static bool ia64_fp_register_format_is_supported_nan(
+    const IA64FPRegisterFormat *fmt)
+{
+    return fmt->exp == IA64_FP_REG_SPECIAL_EXP &&
+           (fmt->mant & IA64_FP_SIGNIFICAND_INTEGER_BIT) &&
+           fmt->mant != IA64_FP_SIGNIFICAND_INTEGER_BIT;
+}
+
+static bool ia64_fp_register_format_is_unnormal(
+    const IA64FPRegisterFormat *fmt)
+{
+    return fmt->exp != IA64_FP_REG_SPECIAL_EXP &&
+           ((fmt->exp == 0 && fmt->mant != 0) ||
+            (fmt->exp != 0 &&
+             !(fmt->mant & IA64_FP_SIGNIFICAND_INTEGER_BIT)));
+}
+
+static void ia64_fp_note_unnormal_operand(CPUIA64State *env, uint32_t sf,
+                                          bool used)
+{
+    if (!used) {
+        return;
+    }
+    if (!(ia64_fp_active_traps(env, sf) & (1U << 1))) {
+        ia64_raise_fp_fault(env, 1U << 1);
+    }
+    float_raise(float_flag_input_denormal_used, &env->fp.fp_status);
+}
+
+static bool ia64_fp_register_format_is_pseudozero(
+    const IA64FPRegisterFormat *fmt)
+{
+    return fmt->mant == 0 &&
+           ia64_fp_register_format_is_unnormal(fmt);
+}
+
+static bool ia64_fp_register_format_is_snan(
+    const IA64FPRegisterFormat *fmt)
+{
+    return ia64_fp_register_format_is_supported_nan(fmt) &&
+           !(fmt->mant & (UINT64_C(1) << 62));
+}
+
+static int ia64_fp_register_magnitude_compare(
+    const IA64FPRegisterFormat *left,
+    const IA64FPRegisterFormat *right)
+{
+    uint64_t left_mant = left->mant;
+    uint64_t right_mant = right->mant;
+    int32_t left_exp;
+    int32_t right_exp;
+
+    if (ia64_fp_register_format_is_infinity(left)) {
+        return ia64_fp_register_format_is_infinity(right) ? 0 : 1;
+    }
+    if (ia64_fp_register_format_is_infinity(right)) {
+        return -1;
+    }
+    if (left_mant == 0) {
+        return right_mant == 0 ? 0 : -1;
+    }
+    if (right_mant == 0) {
+        return 1;
+    }
+
+    /*
+     * Exponent zero is the canonical double-extended denormal island in
+     * register format.  fp_reg_read gives it the mathematical exponent of
+     * an extended denormal; all other finite encodings use the 17-bit
+     * register exponent directly.  Keep the exponent signed so the smallest
+     * wide-range unnormal values remain ordered instead of being clamped.
+     */
+    left_exp = left->exp == 0 ? 0xc001 : left->exp;
+    right_exp = right->exp == 0 ? 0xc001 : right->exp;
+    left_exp -= clz64(left_mant);
+    right_exp -= clz64(right_mant);
+    left_mant <<= clz64(left_mant);
+    right_mant <<= clz64(right_mant);
+
+    if (left_exp != right_exp) {
+        return left_exp < right_exp ? -1 : 1;
+    }
+    if (left_mant != right_mant) {
+        return left_mant < right_mant ? -1 : 1;
+    }
+    return 0;
+}
+
+static FloatRelation ia64_fp_register_compare(CPUIA64State *env,
+                                               uint32_t r2, uint32_t r3,
+                                               bool is_abs, bool quiet)
+{
+    IA64FPRegisterFormat left = ia64_fr_raw_register_format(env, r2);
+    IA64FPRegisterFormat right = ia64_fr_raw_register_format(env, r3);
+    bool left_nan = ia64_fp_register_format_is_nan(&left);
+    bool right_nan = ia64_fp_register_format_is_nan(&right);
+    int magnitude;
+
+    if (ia64_fp_register_format_is_unsupported(&left) ||
+        ia64_fp_register_format_is_unsupported(&right) ||
+        ia64_fp_register_format_is_snan(&left) ||
+        ia64_fp_register_format_is_snan(&right) ||
+        (!quiet && (left_nan || right_nan))) {
+        float_raise(float_flag_invalid, &env->fp.fp_status);
+    }
+    if (left_nan || right_nan) {
+        return float_relation_unordered;
+    }
+
+    magnitude = ia64_fp_register_magnitude_compare(&left, &right);
+    if (magnitude == 0 || is_abs) {
+        return magnitude < 0 ? float_relation_less :
+               magnitude > 0 ? float_relation_greater :
+                               float_relation_equal;
+    }
+    if (left.sign != right.sign) {
+        return left.sign ? float_relation_less : float_relation_greater;
+    }
+    if (left.sign) {
+        magnitude = -magnitude;
+    }
+    return magnitude < 0 ? float_relation_less :
+           magnitude > 0 ? float_relation_greater : float_relation_equal;
+}
+
+static void ia64_fp_compare_exception_check(CPUIA64State *env, uint32_t sf,
+                                            uint32_t r2, uint32_t r3)
+{
+    IA64FPRegisterFormat left = ia64_fr_raw_register_format(env, r2);
+    IA64FPRegisterFormat right = ia64_fr_raw_register_format(env, r3);
+
+    /* All unsupported and NaN responses precede the D response. */
+    if (ia64_fp_register_format_is_unsupported(&left) ||
+        ia64_fp_register_format_is_unsupported(&right) ||
+        ia64_fp_register_format_is_supported_nan(&left) ||
+        ia64_fp_register_format_is_supported_nan(&right)) {
+        return;
+    }
+    ia64_fp_note_unnormal_operand(
+        env, sf, ia64_fp_register_format_is_unnormal(&left) ||
+                 ia64_fp_register_format_is_unnormal(&right));
+}
+
+static bool ia64_fp_handle_binary_unnormal(CPUIA64State *env, uint32_t sf,
+                                            uint32_t r1, uint32_t r2,
+                                            uint32_t r3,
+                                            IA64FPBinaryOperation op)
+{
+    IA64FPRegisterFormat left = ia64_fr_raw_register_format(env, r2);
+    IA64FPRegisterFormat right = ia64_fr_raw_register_format(env, r3);
+    bool left_inf;
+    bool right_inf;
+    bool other_invalid = false;
+    bool pseudozero_multiply = false;
+    bool uses_unnormal;
+
+    uses_unnormal = ia64_fp_register_format_is_unnormal(&left) ||
+                    ia64_fp_register_format_is_unnormal(&right);
+    if (!uses_unnormal) {
+        return false;
+    }
+
+    /* Unsupported operands and all NaN responses precede D. */
+    if (ia64_fp_register_format_is_unsupported(&left) ||
+        ia64_fp_register_format_is_unsupported(&right) ||
+        ia64_fp_register_format_is_supported_nan(&left) ||
+        ia64_fp_register_format_is_supported_nan(&right)) {
+        return false;
+    }
+
+    left_inf = ia64_fp_register_format_is_infinity(&left);
+    right_inf = ia64_fp_register_format_is_infinity(&right);
+    switch (op) {
+    case IA64_FP_BINARY_ADD:
+        other_invalid = left_inf && right_inf &&
+                        left.sign != right.sign;
+        break;
+    case IA64_FP_BINARY_SUB:
+        other_invalid = left_inf && right_inf &&
+                        left.sign == right.sign;
+        break;
+    case IA64_FP_BINARY_MUL:
+    case IA64_FP_BINARY_NEG_MUL:
+        pseudozero_multiply =
+            (left_inf && ia64_fp_register_format_is_pseudozero(&right)) ||
+            (right_inf && ia64_fp_register_format_is_pseudozero(&left));
+        other_invalid = !pseudozero_multiply &&
+            ((left_inf && ia64_fp_register_format_is_zero(&right)) ||
+             (right_inf && ia64_fp_register_format_is_zero(&left)));
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    ia64_fp_note_unnormal_operand(env, sf, !other_invalid);
+    if (pseudozero_multiply) {
+        /* IA-64's one pseudo-zero exception: pseudo-zero * infinity. */
+        ia64_fr_write_ext(env, r1,
+                          left.sign ^ right.sign ^
+                          (op == IA64_FP_BINARY_NEG_MUL),
+                          IA64_FP_REG_SPECIAL_EXP,
+                          IA64_FP_SIGNIFICAND_INTEGER_BIT);
+        return true;
+    }
+    return false;
+}
+
+static bool ia64_fp_handle_muladd_special(CPUIA64State *env, uint32_t sf,
+                                          uint32_t r1, uint32_t r2,
+                                          uint32_t r3, uint32_t r4,
+                                          IA64FPMulAddOperation op)
+{
+    IA64FPRegisterFormat addend = ia64_fr_raw_register_format(env, r2);
+    IA64FPRegisterFormat left = ia64_fr_raw_register_format(env, r3);
+    IA64FPRegisterFormat right = ia64_fr_raw_register_format(env, r4);
+    bool uses_unnormal;
+    bool left_inf;
+    bool right_inf;
+    bool addend_inf;
+    bool pseudozero_multiply;
+    bool invalid_zero_multiply;
+    bool product_inf;
+    bool product_sign;
+    bool addend_sign;
+    bool other_invalid;
+
+    if (ia64_fp_register_format_is_unsupported(&addend) ||
+        ia64_fp_register_format_is_unsupported(&left) ||
+        ia64_fp_register_format_is_unsupported(&right)) {
+        float_raise(float_flag_invalid, &env->fp.fp_status);
+        ia64_fr_write_floatx80(
+            env, r1, floatx80_default_nan(&env->fp.fp_status));
+        return true;
+    }
+
+    uses_unnormal = ia64_fp_register_format_is_unnormal(&addend) ||
+                    ia64_fp_register_format_is_unnormal(&left) ||
+                    ia64_fp_register_format_is_unnormal(&right);
+    if (!uses_unnormal) {
+        return false;
+    }
+
+    /* Register-prioritized NaN propagation precedes D. */
+    if (ia64_fp_register_format_is_supported_nan(&addend) ||
+        ia64_fp_register_format_is_supported_nan(&left) ||
+        ia64_fp_register_format_is_supported_nan(&right)) {
+        return false;
+    }
+
+    left_inf = ia64_fp_register_format_is_infinity(&left);
+    right_inf = ia64_fp_register_format_is_infinity(&right);
+    addend_inf = ia64_fp_register_format_is_infinity(&addend);
+    pseudozero_multiply =
+        (left_inf && ia64_fp_register_format_is_pseudozero(&right)) ||
+        (right_inf && ia64_fp_register_format_is_pseudozero(&left));
+    invalid_zero_multiply = !pseudozero_multiply &&
+        ((left_inf && ia64_fp_register_format_is_zero(&right)) ||
+         (right_inf && ia64_fp_register_format_is_zero(&left)));
+    product_inf = (left_inf || right_inf) && !invalid_zero_multiply;
+    product_sign = left.sign ^ right.sign ^
+                   (op == IA64_FP_NEG_MULADD);
+    addend_sign = addend.sign ^ (op == IA64_FP_MULSUB);
+    other_invalid = invalid_zero_multiply ||
+                    (r2 != IA64_FR_ZERO_INDEX && product_inf &&
+                     addend_inf && product_sign != addend_sign);
+    if (other_invalid) {
+        return false;
+    }
+
+    ia64_fp_note_unnormal_operand(env, sf, true);
+    if (pseudozero_multiply) {
+        ia64_fr_write_ext(env, r1, product_sign,
+                          IA64_FP_REG_SPECIAL_EXP,
+                          IA64_FP_SIGNIFICAND_INTEGER_BIT);
+        return true;
+    }
+    return false;
+}
+
+static bool ia64_frcpa_uses_unnormal_operand(
+    const IA64FPRegisterFormat *num,
+    const IA64FPRegisterFormat *den)
+{
+    bool num_zero;
+    bool den_zero;
+    bool num_inf;
+    bool den_inf;
+
+    if (!ia64_fp_register_format_is_unnormal(num) &&
+        !ia64_fp_register_format_is_unnormal(den)) {
+        return false;
+    }
+    /* NaN propagation and Invalid have priority over D. */
+    if (ia64_fp_register_format_is_supported_nan(num) ||
+        ia64_fp_register_format_is_supported_nan(den) ||
+        ia64_fp_register_format_is_unsupported(num) ||
+        ia64_fp_register_format_is_unsupported(den)) {
+        return false;
+    }
+
+    num_zero = ia64_fp_register_format_is_zero(num);
+    den_zero = ia64_fp_register_format_is_zero(den);
+    num_inf = ia64_fp_register_format_is_infinity(num);
+    den_inf = ia64_fp_register_format_is_infinity(den);
+
+    /* Invalid (0/0, infinity/infinity) and Zero Divide precede D. */
+    if ((num_zero && den_zero) || (num_inf && den_inf) ||
+        (den_zero && !num_zero && !num_inf)) {
+        return false;
+    }
+    return true;
+}
+
+static bool ia64_frsqrta_uses_unnormal_operand(
+    const IA64FPRegisterFormat *val)
+{
+    if (!ia64_fp_register_format_is_unnormal(val) ||
+        ia64_fp_register_format_is_supported_nan(val) ||
+        ia64_fp_register_format_is_unsupported(val)) {
+        return false;
+    }
+
+    /* A negative nonzero operand raises Invalid before D; -pseudo-zero does not. */
+    return !val->sign || ia64_fp_register_format_is_zero(val);
 }
 
 static bool ia64_frcpa_limits_swa_fault(
@@ -912,25 +1367,22 @@ static const uint16_t ia64_recip_sqrt_table[256] = {
     0x5be, 0x5bb, 0x5b8, 0x5b5, 0x5b2, 0x5af, 0x5ac, 0x5aa,
 };
 
-static floatx80 ia64_floatx80_rcpa_approx(CPUIA64State *env,
-                                           uint32_t den_reg)
+static void ia64_frcpa_write_approx(CPUIA64State *env, uint32_t r1,
+                                    const IA64FPRegisterFormat *den)
 {
-    IA64FPRegisterFormat den = ia64_fr_register_format(env, den_reg);
-
-    return ia64_register_format_to_floatx80(
-        env, den.sign, ia64_fp_register_recip_exp(den.exp),
-        (uint64_t)ia64_recip_table[ia64_recip_table_index(den.mant)] << 53);
+    ia64_fr_write_ext(
+        env, r1, den->sign, ia64_fp_register_recip_exp(den->exp),
+        (uint64_t)ia64_recip_table[
+            ia64_recip_table_index(den->mant)] << 53);
 }
 
-static floatx80 ia64_floatx80_rsqrta_approx(CPUIA64State *env,
-                                            uint32_t reg)
+static void ia64_frsqrta_write_approx(CPUIA64State *env, uint32_t r1,
+                                      const IA64FPRegisterFormat *val)
 {
-    IA64FPRegisterFormat val = ia64_fr_register_format(env, reg);
-
-    return ia64_register_format_to_floatx80(
-        env, false, ia64_fp_register_rsqrt_exp(val.exp),
+    ia64_fr_write_ext(
+        env, r1, false, ia64_fp_register_rsqrt_exp(val->exp),
         (uint64_t)ia64_recip_sqrt_table[
-            ia64_recip_sqrt_table_index(&val)] << 53);
+            ia64_recip_sqrt_table_index(val)] << 53);
 }
 
 static floatx80 ia64_floatx80_rcpa(floatx80 num, floatx80 den,
@@ -940,6 +1392,59 @@ static floatx80 ia64_floatx80_rcpa(floatx80 num, floatx80 den,
         0x3fff, IA64_FP_SIGNIFICAND_INTEGER_BIT);
 
     return floatx80_div(approximate ? one : num, den, status);
+}
+
+static bool ia64_frcpa_raw_response(CPUIA64State *env, uint32_t r1,
+                                    const IA64FPRegisterFormat *num,
+                                    const IA64FPRegisterFormat *den,
+                                    bool *predicate)
+{
+    bool num_zero;
+    bool den_zero;
+    bool num_inf;
+    bool den_inf;
+    bool num_normal;
+    bool den_normal;
+    bool sign;
+
+    if (ia64_fp_register_format_is_nan(num) ||
+        ia64_fp_register_format_is_nan(den)) {
+        return false;
+    }
+
+    num_zero = ia64_fp_register_format_is_zero(num);
+    den_zero = ia64_fp_register_format_is_zero(den);
+    num_inf = ia64_fp_register_format_is_infinity(num);
+    den_inf = ia64_fp_register_format_is_infinity(den);
+    num_normal = ia64_fp_register_format_is_normal(num);
+    den_normal = ia64_fp_register_format_is_normal(den);
+    if (!(num_zero || num_inf || num_normal) ||
+        !(den_zero || den_inf || den_normal)) {
+        return false;
+    }
+
+    sign = num->sign ^ den->sign;
+    *predicate = false;
+    if ((num_zero && den_zero) || (num_inf && den_inf)) {
+        float_raise(float_flag_invalid, &env->fp.fp_status);
+        ia64_fr_write_floatx80(
+            env, r1, floatx80_default_nan(&env->fp.fp_status));
+    } else if (den_zero) {
+        if (num_normal) {
+            float_raise(float_flag_divbyzero, &env->fp.fp_status);
+        }
+        ia64_fr_write_ext(env, r1, sign, IA64_FP_REG_SPECIAL_EXP,
+                          IA64_FP_SIGNIFICAND_INTEGER_BIT);
+    } else if (den_inf || num_zero) {
+        ia64_fr_write_ext(env, r1, sign, 0, 0);
+    } else if (num_inf) {
+        ia64_fr_write_ext(env, r1, sign, IA64_FP_REG_SPECIAL_EXP,
+                          IA64_FP_SIGNIFICAND_INTEGER_BIT);
+    } else {
+        ia64_frcpa_write_approx(env, r1, den);
+        *predicate = true;
+    }
+    return true;
 }
 
 typedef struct IA64FPSWAFormat {
@@ -957,6 +1462,11 @@ typedef struct IA64FPSWARawResult {
     bool half_greater;
     bool half_equal;
 } IA64FPSWARawResult;
+
+typedef struct IA64FPWide {
+    __uint128_t high;
+    __uint128_t low;
+} IA64FPWide;
 
 static IA64FPSWAFormat ia64_fpswa_format(CPUIA64State *env, uint32_t reg)
 {
@@ -1085,6 +1595,648 @@ static bool ia64_fpswa_exception_masked(uint64_t fpsr, uint32_t sf,
 
     return ((sf != 0) && (controls & IA64_FPSR_SF_TD)) ||
            (fpsr & flag);
+}
+
+/* Deliver an exact finite non-zero result in the selected computation model. */
+static bool ia64_fp_deliver_raw(CPUIA64State *env, uint32_t r1,
+                                const IA64FPSWARawResult *input,
+                                uint32_t sf, uint32_t precision)
+{
+    IA64FPSWARawResult raw = *input;
+    uint64_t controls = ia64_fpsr_sf_controls(env, sf);
+    uint32_t precision_bits;
+    uint32_t precision_shift;
+    uint32_t rounding = (controls >> 4) & 3;
+    int32_t min_exp;
+    int32_t max_exp;
+    int32_t result_exp;
+    __uint128_t rounded;
+    uint64_t result_mant;
+    int soft = 0;
+    bool inexact;
+    bool fpa;
+    bool masked;
+
+    if (raw.mant == 0) {
+        ia64_fr_write_ext(env, r1, raw.sign, 0, 0);
+        return true;
+    }
+
+    if (precision == 1) {
+        precision_bits = 24;
+        if (controls & 2) {
+            min_exp = 0x00001;
+            max_exp = 0x1fffe;
+        } else {
+            min_exp = 0x0ff81;
+            max_exp = 0x1007e;
+        }
+    } else if (precision == 2) {
+        precision_bits = 53;
+        if (controls & 2) {
+            min_exp = 0x00001;
+            max_exp = 0x1fffe;
+        } else {
+            min_exp = 0x0fc01;
+            max_exp = 0x103fe;
+        }
+    } else if (precision == 0) {
+        switch ((controls >> 2) & 3) {
+        case 0:
+            precision_bits = 24;
+            break;
+        case 2:
+            precision_bits = 53;
+            break;
+        case 3:
+            precision_bits = 64;
+            break;
+        default:
+            return false;
+        }
+        if (controls & 2) {
+            min_exp = 0x00001;
+            max_exp = 0x1fffe;
+        } else {
+            min_exp = 0x0c001;
+            max_exp = 0x13ffe;
+        }
+    } else {
+        return false;
+    }
+    precision_shift = 64 - precision_bits;
+
+    /* First round with unbounded exponent range, as required by Figure 5-12. */
+    rounded = ia64_fpswa_round_right(&raw, precision_shift, rounding,
+                                     &inexact, &fpa);
+    result_exp = raw.exp;
+    if (rounded == ((__uint128_t)1 << precision_bits)) {
+        rounded >>= 1;
+        result_exp++;
+    }
+    result_mant = (uint64_t)rounded << precision_shift;
+
+    if (result_exp > max_exp) {
+        masked = ia64_fpswa_exception_masked(env->ar_fpsr, sf, 1U << 3);
+        soft = float_flag_overflow;
+        if (!masked) {
+            /* Enabled overflow returns the unbounded exponent modulo 2^17. */
+            if (inexact) {
+                soft |= float_flag_inexact;
+            }
+        } else {
+            /* The bounded overflow response is always inexact. */
+            soft |= float_flag_inexact;
+            if (rounding == 0 ||
+                (rounding == 1 && raw.sign) ||
+                (rounding == 2 && !raw.sign)) {
+                result_exp = IA64_FP_REG_SPECIAL_EXP;
+                result_mant = IA64_FP_SIGNIFICAND_INTEGER_BIT;
+                fpa = true;
+            } else {
+                result_exp = max_exp;
+                result_mant = UINT64_MAX << precision_shift;
+                fpa = false;
+            }
+        }
+    } else if (result_exp < min_exp) {
+        masked = ia64_fpswa_exception_masked(env->ar_fpsr, sf, 1U << 4);
+        if (!masked) {
+            /* Enabled underflow returns the unbounded exponent modulo 2^17. */
+            soft = float_flag_underflow;
+            if (inexact) {
+                soft |= float_flag_inexact;
+            }
+        } else if (controls & 1) {
+            /* FTZ applies even when the tiny result would otherwise be exact. */
+            result_exp = 0;
+            result_mant = 0;
+            soft = float_flag_underflow | float_flag_inexact;
+            fpa = false;
+        } else {
+            uint32_t exponent_shift = (uint32_t)(min_exp - raw.exp);
+            uint32_t denormal_shift =
+                exponent_shift > UINT32_MAX - precision_shift ? UINT32_MAX :
+                precision_shift + exponent_shift;
+
+            /* Re-round the exact input once for the bounded exponent range. */
+            rounded = ia64_fpswa_round_right(&raw, denormal_shift, rounding,
+                                             &inexact, &fpa);
+            if (rounded == ((__uint128_t)1 << (precision_bits - 1))) {
+                result_mant = IA64_FP_SIGNIFICAND_INTEGER_BIT;
+                result_exp = min_exp;
+            } else {
+                result_mant = (uint64_t)rounded << precision_shift;
+                result_exp = result_mant == 0 ? 0 : min_exp;
+            }
+            if (inexact) {
+                soft = float_flag_underflow | float_flag_inexact;
+            }
+        }
+    } else if (inexact) {
+        soft = float_flag_inexact;
+    }
+
+    if (result_exp == 0 && result_mant == 0) {
+        ia64_fr_write_ext(env, r1, raw.sign, 0, 0);
+    } else {
+        ia64_fr_write_ext(env, r1, raw.sign,
+                          (uint32_t)result_exp & IA64_FP_WRE_EXP_MASK,
+                          result_mant);
+    }
+    env->fp.transaction.trap_fpa = fpa;
+    if (soft != 0) {
+        float_raise(soft, &env->fp.fp_status);
+    }
+    return true;
+}
+
+static bool ia64_fp_deliver_finite(CPUIA64State *env, uint32_t r1,
+                                   const IA64FPRegisterFormat *value,
+                                   uint32_t sf, uint32_t precision)
+{
+    IA64FPSWARawResult raw = { 0 };
+    int normalize;
+
+    if (value->exp == IA64_FP_REG_SPECIAL_EXP || value->mant == 0) {
+        return false;
+    }
+    raw.sign = value->sign;
+    raw.exp = value->exp == 0 ? 0x0c001 : (int32_t)value->exp;
+    raw.mant = value->mant;
+    normalize = clz64(raw.mant);
+    raw.mant <<= normalize;
+    raw.exp -= normalize;
+    return ia64_fp_deliver_raw(env, r1, &raw, sf, precision);
+}
+
+static void ia64_fp_raw_set_fraction(IA64FPSWARawResult *raw,
+                                     uint64_t fraction, bool tail)
+{
+    const uint64_t half = 1ULL << 63;
+
+    raw->tail = fraction != 0 || tail;
+    raw->half_greater = fraction > half ||
+                        (fraction == half && tail);
+    raw->half_equal = fraction == half && !tail;
+}
+
+static __uint128_t ia64_fp_shift_right128(__uint128_t value, uint32_t shift,
+                                          bool *discarded)
+{
+    __uint128_t mask;
+
+    if (shift == 0) {
+        *discarded = false;
+        return value;
+    }
+    if (shift >= 128) {
+        *discarded = value != 0;
+        return 0;
+    }
+    mask = (((__uint128_t)1 << shift) - 1);
+    *discarded = (value & mask) != 0;
+    return value >> shift;
+}
+
+static uint32_t ia64_fp_clz128(__uint128_t value)
+{
+    uint64_t high = value >> 64;
+
+    return high != 0 ? clz64(high) : 64 + clz64((uint64_t)value);
+}
+
+static bool ia64_fp_static_binary_operand(CPUIA64State *env, uint32_t reg,
+                                          IA64FPSWAFormat *value)
+{
+    IA64FPRegisterFormat raw = ia64_fr_raw_register_format(env, reg);
+    uint32_t normalize;
+
+    if (raw.exp == IA64_FP_REG_SPECIAL_EXP) {
+        return false;
+    }
+    value->sign = raw.sign;
+    if (raw.mant == 0) {
+        value->exp = 0;
+        value->mant = 0;
+        value->unnormal = raw.exp != 0;
+        return true;
+    }
+    value->exp = raw.exp == 0 ? 0x0c001 : (int32_t)raw.exp;
+    value->mant = raw.mant;
+    normalize = clz64(value->mant);
+    value->mant <<= normalize;
+    value->exp -= normalize;
+    value->unnormal = normalize != 0;
+    return true;
+}
+
+static bool ia64_fp_static_addsub_raw(CPUIA64State *env, uint32_t r2,
+                                      uint32_t r3, uint32_t sf,
+                                      IA64FPBinaryOperation op,
+                                      IA64FPSWARawResult *raw)
+{
+    IA64FPSWAFormat left;
+    IA64FPSWAFormat right;
+    __uint128_t left_aligned;
+    __uint128_t right_aligned;
+    __uint128_t result;
+    int32_t result_exp;
+    uint32_t normalize;
+    bool left_discarded;
+    bool right_discarded;
+    bool carry;
+    int magnitude_compare;
+
+    if (!ia64_fp_static_binary_operand(env, r2, &left) ||
+        !ia64_fp_static_binary_operand(env, r3, &right)) {
+        return false;
+    }
+    if (op == IA64_FP_BINARY_SUB) {
+        right.sign = !right.sign;
+    }
+    if (left.mant == 0 || right.mant == 0) {
+        if (left.mant == 0 && right.mant == 0) {
+            raw->sign = left.sign == right.sign ? left.sign :
+                ((ia64_fpsr_sf_controls(env, sf) >> 4) & 3) == 1;
+            return true;
+        }
+        if (left.mant == 0) {
+            raw->sign = right.sign;
+            raw->exp = right.exp;
+            raw->mant = right.mant;
+        } else {
+            raw->sign = left.sign;
+            raw->exp = left.exp;
+            raw->mant = left.mant;
+        }
+        return true;
+    }
+    result_exp = MAX(left.exp, right.exp);
+    left_aligned = ia64_fp_shift_right128(
+        (__uint128_t)left.mant << 64, result_exp - left.exp,
+        &left_discarded);
+    right_aligned = ia64_fp_shift_right128(
+        (__uint128_t)right.mant << 64, result_exp - right.exp,
+        &right_discarded);
+
+    if (left.sign == right.sign) {
+        result = left_aligned + right_aligned;
+        carry = result < left_aligned;
+        raw->sign = left.sign;
+        if (carry) {
+            raw->exp = result_exp + 1;
+            raw->mant = IA64_FP_SIGNIFICAND_INTEGER_BIT |
+                        (uint64_t)(result >> 65);
+            ia64_fp_raw_set_fraction(
+                raw, (uint64_t)(result >> 1),
+                (result & 1) != 0 || left_discarded || right_discarded);
+        } else {
+            raw->exp = result_exp;
+            raw->mant = result >> 64;
+            ia64_fp_raw_set_fraction(
+                raw, (uint64_t)result,
+                left_discarded || right_discarded);
+        }
+        return true;
+    }
+
+    magnitude_compare = left.exp != right.exp ?
+        (left.exp > right.exp ? 1 : -1) :
+        (left.mant > right.mant ? 1 :
+         left.mant < right.mant ? -1 : 0);
+    if (magnitude_compare == 0) {
+        raw->sign = ((ia64_fpsr_sf_controls(env, sf) >> 4) & 3) == 1;
+        return true;
+    }
+    if (magnitude_compare > 0) {
+        result = left_aligned - right_aligned;
+        if (right_discarded) {
+            result--;
+        }
+        raw->sign = left.sign;
+    } else {
+        result = right_aligned - left_aligned;
+        if (left_discarded) {
+            result--;
+        }
+        raw->sign = right.sign;
+    }
+    normalize = ia64_fp_clz128(result);
+    result <<= normalize;
+    raw->exp = result_exp - normalize;
+    raw->mant = result >> 64;
+    ia64_fp_raw_set_fraction(
+        raw, (uint64_t)result,
+        left_discarded || right_discarded);
+    return true;
+}
+
+static bool ia64_fp_static_mul_raw(CPUIA64State *env, uint32_t r2,
+                                   uint32_t r3, bool negate,
+                                   IA64FPSWARawResult *raw)
+{
+    IA64FPSWAFormat left;
+    IA64FPSWAFormat right;
+    __uint128_t product;
+
+    if (!ia64_fp_static_binary_operand(env, r2, &left) ||
+        !ia64_fp_static_binary_operand(env, r3, &right)) {
+        return false;
+    }
+    product = (__uint128_t)left.mant * right.mant;
+    raw->sign = left.sign ^ right.sign ^ negate;
+    if (product == 0) {
+        return true;
+    }
+    raw->exp = left.exp + right.exp - IA64_FP_WRE_BIAS;
+    if (product >> 127) {
+        raw->exp++;
+        raw->mant = product >> 64;
+        ia64_fp_raw_set_fraction(raw, (uint64_t)product, false);
+    } else {
+        raw->mant = product >> 63;
+        ia64_fp_raw_set_fraction(raw, (uint64_t)(product << 1), false);
+    }
+    return true;
+}
+
+static bool ia64_fp_try_raw_binary(CPUIA64State *env, uint32_t r1,
+                                    uint32_t r2, uint32_t r3, uint32_t sf,
+                                    uint32_t precision,
+                                    IA64FPBinaryOperation op)
+{
+    IA64FPSWARawResult raw = { 0 };
+    bool valid;
+
+    if (op == IA64_FP_BINARY_ADD || op == IA64_FP_BINARY_SUB) {
+        valid = ia64_fp_static_addsub_raw(env, r2, r3, sf, op, &raw);
+    } else {
+        valid = ia64_fp_static_mul_raw(
+            env, r2, r3, op == IA64_FP_BINARY_NEG_MUL, &raw);
+    }
+    return valid && ia64_fp_deliver_raw(
+                        env, r1, &raw, sf, precision);
+}
+
+static bool ia64_fp_wide_is_zero(const IA64FPWide *value)
+{
+    return value->high == 0 && value->low == 0;
+}
+
+static int ia64_fp_wide_compare(const IA64FPWide *left,
+                                const IA64FPWide *right)
+{
+    if (left->high != right->high) {
+        return left->high > right->high ? 1 : -1;
+    }
+    if (left->low != right->low) {
+        return left->low > right->low ? 1 : -1;
+    }
+    return 0;
+}
+
+static IA64FPWide ia64_fp_wide_shift_right(IA64FPWide value, uint32_t shift,
+                                            bool *discarded)
+{
+    IA64FPWide result = { 0 };
+    __uint128_t mask;
+    uint32_t high_shift;
+
+    if (shift == 0) {
+        *discarded = false;
+        return value;
+    }
+    if (shift < 128) {
+        mask = (((__uint128_t)1 << shift) - 1);
+        *discarded = (value.low & mask) != 0;
+        result.high = value.high >> shift;
+        result.low = (value.high << (128 - shift)) |
+                     (value.low >> shift);
+        return result;
+    }
+    if (shift == 128) {
+        *discarded = value.low != 0;
+        result.low = value.high;
+        return result;
+    }
+    if (shift < 256) {
+        high_shift = shift - 128;
+        mask = (((__uint128_t)1 << high_shift) - 1);
+        *discarded = value.low != 0 || (value.high & mask) != 0;
+        result.low = value.high >> high_shift;
+        return result;
+    }
+    *discarded = !ia64_fp_wide_is_zero(&value);
+    return result;
+}
+
+static IA64FPWide ia64_fp_wide_add(IA64FPWide left, IA64FPWide right,
+                                    bool *carry)
+{
+    IA64FPWide result;
+    __uint128_t high_sum;
+    bool low_carry;
+
+    result.low = left.low + right.low;
+    low_carry = result.low < left.low;
+    high_sum = left.high + right.high;
+    *carry = high_sum < left.high;
+    result.high = high_sum + low_carry;
+    *carry |= result.high < high_sum;
+    return result;
+}
+
+static IA64FPWide ia64_fp_wide_sub(IA64FPWide left, IA64FPWide right)
+{
+    IA64FPWide result;
+    bool borrow = left.low < right.low;
+
+    result.low = left.low - right.low;
+    result.high = left.high - right.high - borrow;
+    return result;
+}
+
+static void ia64_fp_wide_decrement(IA64FPWide *value)
+{
+    if (value->low-- == 0) {
+        value->high--;
+    }
+}
+
+static uint32_t ia64_fp_wide_clz(const IA64FPWide *value)
+{
+    uint64_t word;
+
+    word = value->high >> 64;
+    if (word != 0) {
+        return clz64(word);
+    }
+    word = value->high;
+    if (word != 0) {
+        return 64 + clz64(word);
+    }
+    word = value->low >> 64;
+    if (word != 0) {
+        return 128 + clz64(word);
+    }
+    return 192 + clz64((uint64_t)value->low);
+}
+
+static IA64FPWide ia64_fp_wide_shift_left(IA64FPWide value, uint32_t shift)
+{
+    IA64FPWide result = { 0 };
+
+    if (shift == 0) {
+        return value;
+    }
+    if (shift < 128) {
+        result.high = (value.high << shift) |
+                      (value.low >> (128 - shift));
+        result.low = value.low << shift;
+    } else if (shift == 128) {
+        result.high = value.low;
+    } else if (shift < 256) {
+        result.high = value.low << (shift - 128);
+    }
+    return result;
+}
+
+static void ia64_fp_wide_to_raw(IA64FPWide value, int32_t exp,
+                                bool sign, bool fractional_tail,
+                                IA64FPSWARawResult *raw)
+{
+    uint32_t normalize = ia64_fp_wide_clz(&value);
+
+    value = ia64_fp_wide_shift_left(value, normalize);
+    raw->sign = sign;
+    raw->exp = exp - normalize;
+    raw->mant = value.high >> 64;
+    ia64_fp_raw_set_fraction(
+        raw, (uint64_t)value.high,
+        value.low != 0 || fractional_tail);
+}
+
+static bool ia64_fp_static_muladd_raw(CPUIA64State *env, uint32_t r2,
+                                      uint32_t r3, uint32_t r4, uint32_t sf,
+                                      IA64FPMulAddOperation op,
+                                      IA64FPSWARawResult *raw)
+{
+    IA64FPSWAFormat addend;
+    IA64FPSWAFormat left;
+    IA64FPSWAFormat right;
+    IA64FPWide product = { 0 };
+    IA64FPWide addend_value = { 0 };
+    IA64FPWide product_aligned;
+    IA64FPWide addend_aligned;
+    IA64FPWide result;
+    __uint128_t exact_product;
+    int32_t product_exp;
+    int32_t result_exp;
+    int magnitude_compare;
+    bool product_sign;
+    bool addend_sign;
+    bool product_discarded;
+    bool addend_discarded;
+    bool fractional_tail;
+    bool carry;
+
+    if (!ia64_fp_static_binary_operand(env, r3, &left) ||
+        !ia64_fp_static_binary_operand(env, r4, &right) ||
+        !ia64_fp_static_binary_operand(env, r2, &addend)) {
+        return false;
+    }
+
+    exact_product = (__uint128_t)left.mant * right.mant;
+    product_sign = left.sign ^ right.sign ^
+                   (op == IA64_FP_NEG_MULADD);
+    addend_sign = addend.sign ^ (op == IA64_FP_MULSUB);
+    if (exact_product == 0) {
+        if (addend.mant != 0) {
+            raw->sign = addend_sign;
+            raw->exp = addend.exp;
+            raw->mant = addend.mant;
+        } else {
+            raw->sign = product_sign == addend_sign ? product_sign :
+                ((ia64_fpsr_sf_controls(env, sf) >> 4) & 3) == 1;
+        }
+        return true;
+    }
+    product_exp = left.exp + right.exp - IA64_FP_WRE_BIAS;
+    if (exact_product >> 127) {
+        product.high = exact_product;
+        product_exp++;
+    } else {
+        product.high = exact_product << 1;
+    }
+
+    if (addend.mant == 0) {
+        ia64_fp_wide_to_raw(product, product_exp, product_sign, false, raw);
+        return true;
+    }
+    addend_value.high = (__uint128_t)addend.mant << 64;
+    result_exp = MAX(product_exp, addend.exp);
+    product_aligned = ia64_fp_wide_shift_right(
+        product, result_exp - product_exp, &product_discarded);
+    addend_aligned = ia64_fp_wide_shift_right(
+        addend_value, result_exp - addend.exp, &addend_discarded);
+
+    if (product_sign == addend_sign) {
+        result = ia64_fp_wide_add(product_aligned, addend_aligned, &carry);
+        fractional_tail = product_discarded || addend_discarded;
+        if (carry) {
+            raw->sign = product_sign;
+            raw->exp = result_exp + 1;
+            raw->mant = IA64_FP_SIGNIFICAND_INTEGER_BIT |
+                        (uint64_t)(result.high >> 65);
+            ia64_fp_raw_set_fraction(
+                raw, result.high >> 1,
+                (result.high & 1) != 0 || result.low != 0 ||
+                fractional_tail);
+        } else {
+            ia64_fp_wide_to_raw(result, result_exp, product_sign,
+                                fractional_tail, raw);
+        }
+        return true;
+    }
+
+    magnitude_compare = product_exp != addend.exp ?
+        (product_exp > addend.exp ? 1 : -1) :
+        ia64_fp_wide_compare(&product, &addend_value);
+    if (magnitude_compare == 0) {
+        raw->sign = ((ia64_fpsr_sf_controls(env, sf) >> 4) & 3) == 1;
+        return true;
+    }
+    if (magnitude_compare > 0) {
+        result = ia64_fp_wide_sub(product_aligned, addend_aligned);
+        if (addend_discarded) {
+            ia64_fp_wide_decrement(&result);
+        }
+        raw->sign = product_sign;
+    } else {
+        result = ia64_fp_wide_sub(addend_aligned, product_aligned);
+        if (product_discarded) {
+            ia64_fp_wide_decrement(&result);
+        }
+        raw->sign = addend_sign;
+    }
+    fractional_tail = product_discarded || addend_discarded;
+    ia64_fp_wide_to_raw(result, result_exp, raw->sign,
+                        fractional_tail, raw);
+    return true;
+}
+
+static bool ia64_fp_try_raw_muladd(CPUIA64State *env, uint32_t r1,
+                                    uint32_t r2, uint32_t r3, uint32_t r4,
+                                    uint32_t sf, uint32_t precision,
+                                    IA64FPMulAddOperation op)
+{
+    IA64FPSWARawResult raw = { 0 };
+
+    if (!ia64_fp_static_muladd_raw(env, r2, r3, r4, sf, op, &raw)) {
+        return false;
+    }
+    return ia64_fp_deliver_raw(env, r1, &raw, sf, precision);
 }
 
 static void ia64_fpswa_cache_result(CPUIA64State *env,
@@ -1218,15 +2370,31 @@ static void ia64_fpswa_prepare_sqrt(CPUIA64State *env, uint32_t r1,
     ia64_fpswa_cache_result(env, &raw, sf, val.unnormal);
 }
 
+static int ia64_fp_approx_soft_flags(int soft)
+{
+    /* Approximation instructions do not report O, U, or I. */
+    return soft & ~(float_flag_overflow |
+                    float_flag_underflow |
+                    float_flag_inexact |
+                    float_flag_output_denormal_flushed);
+}
+
+static void ia64_fp_approx_restrict_status(float_status *status)
+{
+    set_float_exception_flags(
+        ia64_fp_approx_soft_flags(get_float_exception_flags(status)), status);
+}
+
 static void ia64_do_frcpa(CPUIA64State *env, uint32_t r1, uint32_t p2,
                           uint32_t r2, uint32_t r3, uint32_t sf)
 {
     floatx80 num;
     floatx80 den;
     bool predicate;
+    IA64FPRegisterFormat num_raw;
+    IA64FPRegisterFormat den_raw;
     IA64FPRegisterFormat num_fmt;
     IA64FPRegisterFormat den_fmt;
-    bool approximate;
 
     if (ia64_fr_nat_get(env, r2) || ia64_fr_nat_get(env, r3)) {
         ia64_fr_write_nat(env, r1);
@@ -1234,23 +2402,33 @@ static void ia64_do_frcpa(CPUIA64State *env, uint32_t r1, uint32_t p2,
         return;
     }
 
-    num_fmt = ia64_fr_register_format(env, r2);
-    den_fmt = ia64_fr_register_format(env, r3);
+    num_raw = ia64_fr_raw_register_format(env, r2);
+    den_raw = ia64_fr_raw_register_format(env, r3);
+    num_fmt = num_raw;
+    den_fmt = den_raw;
+    ia64_normalize_fp_register_format(&num_fmt);
+    ia64_normalize_fp_register_format(&den_fmt);
     if (ia64_frcpa_limits_swa_fault(&num_fmt, &den_fmt)) {
         ia64_fpswa_prepare_divide(env, r1, p2, r2, r3, sf);
         ia64_raise_fp_fault(env, IA64_FP_ISR_SWA);
     }
+    ia64_fp_note_unnormal_operand(
+        env, sf, ia64_frcpa_uses_unnormal_operand(&num_raw, &den_raw));
 
-    num = ia64_fr_to_floatx80(env, r2);
-    den = ia64_fr_to_floatx80(env, r3);
-    predicate = ia64_floatx80_rcpa_predicate(
-        num, den, &env->fp.fp_status);
-    approximate = predicate &&
-                  ia64_fp_register_format_is_normal(&den_fmt);
-    ia64_fr_write_floatx80(
-        env, r1, approximate ? ia64_floatx80_rcpa_approx(env, r3) :
-        ia64_floatx80_rcpa(num, den, predicate, &env->fp.fp_status));
+    if (!ia64_frcpa_raw_response(
+            env, r1, &num_fmt, &den_fmt, &predicate)) {
+        num = ia64_fr_to_floatx80(env, r2);
+        den = ia64_fr_to_floatx80(env, r3);
+        predicate = !ia64_fp_register_format_is_unsupported(&num_fmt) &&
+                    !ia64_fp_register_format_is_unsupported(&den_fmt) &&
+                    ia64_floatx80_rcpa_predicate(
+                        num, den, &env->fp.fp_status);
+        ia64_fr_write_floatx80(
+            env, r1, ia64_floatx80_rcpa(
+                num, den, predicate, &env->fp.fp_status));
+    }
     ia64_pr_write(env, p2, predicate);
+    ia64_fp_approx_restrict_status(&env->fp.fp_status);
 }
 
 static bool ia64_float32_rcpa_predicate(float32 num, float32 den)
@@ -1283,6 +2461,26 @@ static bool ia64_float32_register_format(float32 val,
     fmt->sign = bits >> 31;
     fmt->exp = exp + IA64_FP_WRE_BIAS - IA64_FP_SINGLE_BIAS;
     fmt->mant = IA64_FP_SIGNIFICAND_INTEGER_BIT | ((uint64_t)frac << 40);
+    return true;
+}
+
+static bool ia64_float32_normalized_register_format(
+    float32 val, IA64FPRegisterFormat *fmt)
+{
+    uint32_t bits = float32_val(val);
+    uint32_t frac = bits & 0x7fffff;
+
+    if (ia64_float32_register_format(val, fmt)) {
+        return true;
+    }
+    if ((bits & 0x7f800000) != 0 || frac == 0) {
+        return false;
+    }
+
+    fmt->sign = bits >> 31;
+    fmt->exp = IA64_FP_WRE_BIAS + 1 - IA64_FP_SINGLE_BIAS;
+    fmt->mant = (uint64_t)frac << 40;
+    ia64_normalize_fp_register_format(fmt);
     return true;
 }
 
@@ -1325,8 +2523,8 @@ static bool ia64_float32_fprcpa_predicate(const IA64FPRegisterFormat *num,
 static void ia64_do_fprcpa(CPUIA64State *env, uint32_t r1, uint32_t p2,
                            uint32_t r2, uint32_t r3, uint32_t sf)
 {
-    uint64_t num = env->fp.fr[r2];
-    uint64_t den = env->fp.fr[r3];
+    uint64_t num = ia64_fr_significand(env, r2);
+    uint64_t den = ia64_fr_significand(env, r3);
     float32 num_hi = make_float32(num >> 32);
     float32 num_lo = make_float32(num);
     float32 den_hi = make_float32(den >> 32);
@@ -1360,30 +2558,25 @@ static void ia64_do_fprcpa(CPUIA64State *env, uint32_t r1, uint32_t p2,
         lo_pred = ia64_float32_rcpa_predicate(num_lo, den_lo);
         hi_result = hi_pred && hi_normal ?
                     ia64_float32_rcpa_approx(env, &den_hi_fmt) :
-                    ia64_float32_rcpa(num_hi, den_hi, hi_pred,
+                    ia64_float32_rcpa(num_hi, den_hi,
+                                      hi_pred && !float32_is_denormal(den_hi),
                                       &hi_status);
         lo_result = lo_pred && lo_normal ?
                     ia64_float32_rcpa_approx(env, &den_lo_fmt) :
-                    ia64_float32_rcpa(num_lo, den_lo, lo_pred,
+                    ia64_float32_rcpa(num_lo, den_lo,
+                                      lo_pred && !float32_is_denormal(den_lo),
                                       &lo_status);
-        hi_soft = get_float_exception_flags(&hi_status);
-        lo_soft = get_float_exception_flags(&lo_status);
+        hi_soft = ia64_fp_approx_soft_flags(
+            get_float_exception_flags(&hi_status));
+        lo_soft = ia64_fp_approx_soft_flags(
+            get_float_exception_flags(&lo_status));
         hi_pred = hi_pred && hi_normal &&
                   ia64_float32_fprcpa_predicate(&num_hi_fmt, &den_hi_fmt);
         lo_pred = lo_pred && lo_normal &&
                   ia64_float32_fprcpa_predicate(&num_lo_fmt, &den_lo_fmt);
     }
 
-    {
-        uint64_t traps = ia64_fp_active_traps(env, sf);
-        uint64_t hi_fault = ia64_fp_soft_flags_to_ia64(hi_soft) & ~traps & 0x7;
-        uint64_t lo_fault = ia64_fp_soft_flags_to_ia64(lo_soft) & ~traps & 0x7;
-
-        set_float_exception_flags(hi_soft | lo_soft, &env->fp.fp_status);
-        if (hi_fault || lo_fault) {
-            ia64_raise_fp_fault(env, lo_fault | (hi_fault << 4));
-        }
-    }
+    ia64_fp_simd_fault_end(env, sf, hi_soft, lo_soft, false, false);
 
     ia64_fr_write_sig(env, r1,
                       ((uint64_t)float32_val(hi_result) << 32) |
@@ -1407,6 +2600,7 @@ void ia64_fp_fclass(CPUIA64State *env, uint32_t p1, uint32_t p2,
     bool is_qnan;
     bool is_snan;
     bool is_normal;
+    bool has_integer_bit;
     bool sign_match;
     bool type_match;
     bool member;
@@ -1414,19 +2608,20 @@ void ia64_fp_fclass(CPUIA64State *env, uint32_t p1, uint32_t p2,
     ia64_fpreg_to_spill(env, f2, &mant, &high);
     exp = (high & 0xffff) | (((high >> 16) & 1) << 16);
     is_neg = (high >> 17) & 1;
-    is_zero = !is_nat && mant == 0 && exp != IA64_FP_REG_SPECIAL_EXP;
+    has_integer_bit = mant & IA64_FP_SIGNIFICAND_INTEGER_BIT;
+    is_zero = !is_nat && mant == 0 && exp == 0;
     is_inf = !is_nat && exp == IA64_FP_REG_SPECIAL_EXP &&
              mant == IA64_FP_SIGNIFICAND_INTEGER_BIT;
     is_qnan = !is_nat && exp == IA64_FP_REG_SPECIAL_EXP &&
-              mant >= 0xc000000000000000ULL;
+              has_integer_bit && (mant & (UINT64_C(1) << 62));
     is_snan = !is_nat && exp == IA64_FP_REG_SPECIAL_EXP &&
-              mant > IA64_FP_SIGNIFICAND_INTEGER_BIT &&
-              mant < 0xc000000000000000ULL;
-    is_unorm = !is_nat && !is_zero &&
-                exp != IA64_FP_REG_SPECIAL_EXP &&
-                (!(mant & IA64_FP_SIGNIFICAND_INTEGER_BIT) || exp == 0);
-    is_normal = !is_nat && !is_zero && !is_unorm && !is_inf &&
-                !is_qnan && !is_snan;
+              has_integer_bit && (mant << 1) != 0 &&
+              !(mant & (UINT64_C(1) << 62));
+    is_unorm = !is_nat && exp != IA64_FP_REG_SPECIAL_EXP &&
+                ((exp == 0 && mant != 0) ||
+                 (exp != 0 && !has_integer_bit));
+    is_normal = !is_nat && exp != 0 &&
+                exp != IA64_FP_REG_SPECIAL_EXP && has_integer_bit;
     sign_match = ((fclass9 & 0x001) && !is_neg) ||
                  ((fclass9 & 0x002) && is_neg);
     type_match = ((fclass9 & 0x004) && is_zero) ||
@@ -1527,7 +2722,8 @@ void ia64_fp_flogical_and(CPUIA64State *env, uint32_t r1,
         return;
     }
 
-    ia64_fr_write_sig(env, r1, env->fp.fr[r2] & env->fp.fr[r3]);
+    ia64_fr_write_sig(env, r1, ia64_fr_significand(env, r2) &
+                               ia64_fr_significand(env, r3));
 }
 
 void ia64_fp_flogical_andcm(CPUIA64State *env, uint32_t r1,
@@ -1537,7 +2733,8 @@ void ia64_fp_flogical_andcm(CPUIA64State *env, uint32_t r1,
         return;
     }
 
-    ia64_fr_write_sig(env, r1, env->fp.fr[r2] & ~env->fp.fr[r3]);
+    ia64_fr_write_sig(env, r1, ia64_fr_significand(env, r2) &
+                               ~ia64_fr_significand(env, r3));
 }
 
 void ia64_fp_flogical_or(CPUIA64State *env, uint32_t r1,
@@ -1547,7 +2744,8 @@ void ia64_fp_flogical_or(CPUIA64State *env, uint32_t r1,
         return;
     }
 
-    ia64_fr_write_sig(env, r1, env->fp.fr[r2] | env->fp.fr[r3]);
+    ia64_fr_write_sig(env, r1, ia64_fr_significand(env, r2) |
+                               ia64_fr_significand(env, r3));
 }
 
 void ia64_fp_flogical_xor(CPUIA64State *env, uint32_t r1,
@@ -1557,12 +2755,15 @@ void ia64_fp_flogical_xor(CPUIA64State *env, uint32_t r1,
         return;
     }
 
-    ia64_fr_write_sig(env, r1, env->fp.fr[r2] ^ env->fp.fr[r3]);
+    ia64_fr_write_sig(env, r1, ia64_fr_significand(env, r2) ^
+                               ia64_fr_significand(env, r3));
 }
 
 void ia64_fp_fswap(CPUIA64State *env, uint32_t r1, uint32_t r2,
                   uint32_t r3, uint32_t form)
 {
+    uint64_t f2;
+    uint64_t f3;
     uint32_t hi;
     uint32_t lo;
 
@@ -1570,8 +2771,10 @@ void ia64_fp_fswap(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    hi = env->fp.fr[r3];
-    lo = env->fp.fr[r2] >> 32;
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
+    hi = f3;
+    lo = f2 >> 32;
     if (form == 1) {
         hi ^= 0x80000000U;
     } else if (form == 2) {
@@ -1584,6 +2787,8 @@ void ia64_fp_fswap(CPUIA64State *env, uint32_t r1, uint32_t r2,
 void ia64_fp_fmix(CPUIA64State *env, uint32_t r1, uint32_t r2,
                  uint32_t r3, uint32_t form)
 {
+    uint64_t f2;
+    uint64_t f3;
     uint32_t hi;
     uint32_t lo;
 
@@ -1591,12 +2796,14 @@ void ia64_fp_fmix(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
     if (form == 1) {
-        hi = env->fp.fr[r2];
-        lo = env->fp.fr[r3];
+        hi = f2;
+        lo = f3;
     } else {
-        hi = env->fp.fr[r2] >> 32;
-        lo = form == 2 ? env->fp.fr[r3] >> 32 : env->fp.fr[r3];
+        hi = f2 >> 32;
+        lo = form == 2 ? f3 >> 32 : f3;
     }
 
     ia64_fr_write_sig(env, r1, ((uint64_t)hi << 32) | lo);
@@ -1605,6 +2812,8 @@ void ia64_fp_fmix(CPUIA64State *env, uint32_t r1, uint32_t r2,
 void ia64_fp_fsxt(CPUIA64State *env, uint32_t r1, uint32_t r2,
                  uint32_t r3, uint32_t form)
 {
+    uint64_t f2;
+    uint64_t f3;
     uint32_t hi;
     uint32_t lo;
 
@@ -1612,12 +2821,14 @@ void ia64_fp_fsxt(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
     if (form == 1) {
-        hi = (env->fp.fr[r2] >> 63) ? UINT32_MAX : 0;
-        lo = env->fp.fr[r3] >> 32;
+        hi = (f2 >> 63) ? UINT32_MAX : 0;
+        lo = f3 >> 32;
     } else {
-        hi = ((env->fp.fr[r2] >> 31) & 1) ? UINT32_MAX : 0;
-        lo = env->fp.fr[r3];
+        hi = ((f2 >> 31) & 1) ? UINT32_MAX : 0;
+        lo = f3;
     }
 
     ia64_fr_write_sig(env, r1, ((uint64_t)hi << 32) | lo);
@@ -1633,6 +2844,8 @@ static uint64_t ia64_pack_fp32_lanes(uint32_t hi, uint32_t lo)
 void ia64_fp_fpmerge(CPUIA64State *env, uint32_t r1, uint32_t r2,
                     uint32_t r3, uint32_t form)
 {
+    uint64_t f2;
+    uint64_t f3;
     uint32_t f2_hi;
     uint32_t f2_lo;
     uint32_t f3_hi;
@@ -1644,10 +2857,12 @@ void ia64_fp_fpmerge(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    f2_hi = env->fp.fr[r2] >> 32;
-    f2_lo = env->fp.fr[r2];
-    f3_hi = env->fp.fr[r3] >> 32;
-    f3_lo = env->fp.fr[r3];
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
+    f2_hi = f2 >> 32;
+    f2_lo = f2;
+    f3_hi = f3 >> 32;
+    f3_lo = f3;
 
     if (form == 0) {
         hi = ((f2_hi ^ 0x80000000U) & 0x80000000U) |
@@ -1693,6 +2908,8 @@ static void ia64_do_fpminmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
 {
     float_status hi_status = env->fp.fp_status;
     float_status lo_status = env->fp.fp_status;
+    uint64_t f2;
+    uint64_t f3;
     uint32_t f2_hi;
     uint32_t f2_lo;
     uint32_t f3_hi;
@@ -1704,16 +2921,19 @@ static void ia64_do_fpminmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    f2_hi = env->fp.fr[r2] >> 32;
-    f2_lo = env->fp.fr[r2];
-    f3_hi = env->fp.fr[r3] >> 32;
-    f3_lo = env->fp.fr[r3];
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
+    f2_hi = f2 >> 32;
+    f2_lo = f2;
+    f3_hi = f3 >> 32;
+    f3_lo = f3;
     hi = ia64_fpminmax_lane(f2_hi, f3_hi, is_max != 0, is_abs != 0,
                             &hi_status);
     lo = ia64_fpminmax_lane(f2_lo, f3_lo, is_max != 0, is_abs != 0,
                             &lo_status);
     ia64_fp_simd_fault_end(env, sf, get_float_exception_flags(&hi_status),
-                           get_float_exception_flags(&lo_status));
+                           get_float_exception_flags(&lo_status),
+                           false, false);
 
     ia64_fr_write_sig(env, r1, ia64_pack_fp32_lanes(hi, lo));
 }
@@ -1721,9 +2941,15 @@ static void ia64_do_fpminmax(CPUIA64State *env, uint32_t r1, uint32_t r2,
 static bool ia64_fpcmp_lane(uint32_t a_bits, uint32_t b_bits, uint32_t frel,
                             float_status *status)
 {
-    FloatRelation rel = float32_compare(make_float32(a_bits),
-                                        make_float32(b_bits),
-                                        status);
+    FloatRelation rel;
+
+    if ((frel & 3) == 0 || (frel & 3) == 3) {
+        rel = float32_compare_quiet(make_float32(a_bits),
+                                    make_float32(b_bits), status);
+    } else {
+        rel = float32_compare(make_float32(a_bits), make_float32(b_bits),
+                              status);
+    }
 
     switch (frel & 7) {
     case 0:
@@ -1750,6 +2976,8 @@ static void ia64_do_fpcmp(CPUIA64State *env, uint32_t r1, uint32_t r2,
 {
     float_status hi_status = env->fp.fp_status;
     float_status lo_status = env->fp.fp_status;
+    uint64_t f2;
+    uint64_t f3;
     uint32_t hi;
     uint32_t lo;
 
@@ -1757,29 +2985,71 @@ static void ia64_do_fpcmp(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    hi = ia64_fpcmp_lane(env->fp.fr[r2] >> 32, env->fp.fr[r3] >> 32,
-                         frel, &hi_status) ? UINT32_MAX : 0;
-    lo = ia64_fpcmp_lane(env->fp.fr[r2], env->fp.fr[r3], frel, &lo_status) ?
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
+    hi = ia64_fpcmp_lane(f2 >> 32, f3 >> 32, frel, &hi_status) ?
+         UINT32_MAX : 0;
+    lo = ia64_fpcmp_lane(f2, f3, frel, &lo_status) ?
          UINT32_MAX : 0;
     ia64_fp_simd_fault_end(env, sf, get_float_exception_flags(&hi_status),
-                           get_float_exception_flags(&lo_status));
+                           get_float_exception_flags(&lo_status),
+                           false, false);
 
     ia64_fr_write_sig(env, r1, ia64_pack_fp32_lanes(hi, lo));
 }
 
+static uint32_t ia64_fpcvt_signed_magnitude(uint32_t value)
+{
+    return (value & (UINT32_C(1) << 31)) ? -value : value;
+}
+
+static bool ia64_fpcvt_rounds_magnitude_up(float32 value, uint32_t result,
+                                           bool is_unsigned,
+                                           const float_status *fp_status)
+{
+    float_status status = *fp_status;
+    uint32_t truncated;
+
+    set_float_exception_flags(0, &status);
+    if (is_unsigned) {
+        truncated = float32_to_uint32_round_to_zero(value, &status);
+        return result > truncated;
+    }
+
+    truncated = (uint32_t)float32_to_int32_round_to_zero(value, &status);
+    return ia64_fpcvt_signed_magnitude(result) >
+           ia64_fpcvt_signed_magnitude(truncated);
+}
+
 static uint32_t ia64_fpcvt_lane(uint32_t value, bool is_unsigned,
-                                bool is_trunc, float_status *status)
+                                bool is_trunc, bool *fpa,
+                                float_status *status)
 {
     float32 f = make_float32(value);
+    uint32_t result;
 
     if (is_unsigned) {
-        return is_trunc ?
+        result = is_trunc ?
             float32_to_uint32_round_to_zero(f, status) :
             float32_to_uint32(f, status);
+    } else {
+        result = is_trunc ?
+            (uint32_t)float32_to_int32_round_to_zero(f, status) :
+            (uint32_t)float32_to_int32(f, status);
     }
-    return is_trunc ?
-        (uint32_t)float32_to_int32_round_to_zero(f, status) :
-        (uint32_t)float32_to_int32(f, status);
+
+    if (get_float_exception_flags(status) & float_flag_invalid) {
+        return UINT32_C(0x80000000);
+    }
+    if (!is_trunc &&
+        (get_float_exception_flags(status) & float_flag_inexact)) {
+        *fpa = ia64_fpcvt_rounds_magnitude_up(f, result, is_unsigned,
+                                               status);
+    }
+    if (float32_is_denormal(f)) {
+        float_raise(float_flag_input_denormal_used, status);
+    }
+    return result;
 }
 
 static void ia64_do_fpcvt(CPUIA64State *env, uint32_t r1, uint32_t r2,
@@ -1788,8 +3058,11 @@ static void ia64_do_fpcvt(CPUIA64State *env, uint32_t r1, uint32_t r2,
 {
     float_status hi_status = env->fp.fp_status;
     float_status lo_status = env->fp.fp_status;
+    uint64_t f2;
     uint32_t hi;
     uint32_t lo;
+    bool hi_fpa = false;
+    bool lo_fpa = false;
     int hi_soft;
     int lo_soft;
 
@@ -1798,43 +3071,96 @@ static void ia64_do_fpcvt(CPUIA64State *env, uint32_t r1, uint32_t r2,
         return;
     }
 
-    hi = ia64_fpcvt_lane(env->fp.fr[r2] >> 32, is_unsigned != 0,
-                         is_trunc != 0, &hi_status);
-    lo = ia64_fpcvt_lane(env->fp.fr[r2], is_unsigned != 0,
-                         is_trunc != 0, &lo_status);
+    f2 = ia64_fr_significand(env, r2);
+    hi = ia64_fpcvt_lane(f2 >> 32, is_unsigned != 0,
+                         is_trunc != 0, &hi_fpa, &hi_status);
+    lo = ia64_fpcvt_lane(f2, is_unsigned != 0,
+                         is_trunc != 0, &lo_fpa, &lo_status);
     hi_soft = get_float_exception_flags(&hi_status);
     lo_soft = get_float_exception_flags(&lo_status);
-
-    {
-        uint64_t traps = ia64_fp_active_traps(env, sf);
-        uint64_t hi_fault = ia64_fp_soft_flags_to_ia64(hi_soft) & ~traps & 0x7;
-        uint64_t lo_fault = ia64_fp_soft_flags_to_ia64(lo_soft) & ~traps & 0x7;
-
-        set_float_exception_flags(hi_soft | lo_soft, &env->fp.fp_status);
-        if (hi_fault || lo_fault) {
-            ia64_raise_fp_fault(env, lo_fault | (hi_fault << 4));
-        }
-    }
+    ia64_fp_simd_fault_end(env, sf, hi_soft, lo_soft, hi_fpa, lo_fpa);
 
     ia64_fr_write_sig(env, r1, ia64_pack_fp32_lanes(hi, lo));
 }
 
-static uint32_t ia64_fpma_lane(uint32_t addend_bits, uint32_t multiplicand_bits,
-                               uint32_t multiplier_bits, uint32_t form,
-                               float_status *status)
+static uint32_t ia64_fpma_lane_result(uint32_t addend_bits,
+                                      uint32_t multiplicand_bits,
+                                      uint32_t multiplier_bits,
+                                      uint32_t form, bool pure_multiply,
+                                      float_status *status)
 {
+    Float3NaNPropRule saved_rule = get_float_3nan_prop_rule(status);
     float32 addend = make_float32(addend_bits);
     float32 multiplicand = make_float32(multiplicand_bits);
     float32 multiplier = make_float32(multiplier_bits);
+    int flags = 0;
+    uint32_t result;
 
-    if (form == 1) {
-        addend = float32_chs(addend);
-    } else if (form == 2) {
-        multiplicand = float32_chs(multiplicand);
+    if (pure_multiply) {
+        Float2NaNPropRule saved_mul_rule = get_float_2nan_prop_rule(status);
+        float32 product;
+
+        if (form == 2 && !float32_is_any_nan(multiplicand) &&
+            !float32_is_any_nan(multiplier)) {
+            /* fpnmpy negates the exact product before directed rounding. */
+            multiplicand = float32_chs(multiplicand);
+        }
+        /* SoftFloat B is architectural f4, ahead of f3. */
+        set_float_2nan_prop_rule(float_2nan_prop_ba, status);
+        product = float32_mul(multiplicand, multiplier, status);
+        set_float_2nan_prop_rule(saved_mul_rule, status);
+        return float32_val(product);
     }
 
-    return float32_val(float32_muladd(multiplicand, multiplier, addend,
-                                      0, status));
+    if (form == 1) {
+        flags = float_muladd_negate_c;
+    } else if (form == 2) {
+        flags = float_muladd_negate_product;
+    }
+
+    /* SoftFloat A, B, C map to architectural f3, f4, f2. */
+    set_float_3nan_prop_rule(float_3nan_prop_bca, status);
+    result = float32_val(float32_muladd(multiplicand, multiplier, addend,
+                                       flags, status));
+    set_float_3nan_prop_rule(saved_rule, status);
+    return result;
+}
+
+static uint32_t ia64_fpma_lane(uint32_t addend_bits,
+                               uint32_t multiplicand_bits,
+                               uint32_t multiplier_bits, uint32_t form,
+                               bool pure_multiply, bool *fpa,
+                               float_status *status)
+{
+    uint32_t result = ia64_fpma_lane_result(
+        addend_bits, multiplicand_bits, multiplier_bits, form,
+        pure_multiply, status);
+    int soft = get_float_exception_flags(status);
+
+    /* IA-64 FTZ always reports both U and I for a flushed tiny result. */
+    if (get_flush_to_zero(status) &&
+        float32_is_zero(make_float32(result)) &&
+        (soft & float_flag_inexact) &&
+        !(soft & (float_flag_invalid | float_flag_overflow))) {
+        float_raise(float_flag_output_denormal_flushed, status);
+        soft |= float_flag_output_denormal_flushed;
+    }
+
+    if (!(soft & float_flag_invalid) &&
+        (soft & (float_flag_overflow | float_flag_underflow |
+                 float_flag_inexact | float_flag_output_denormal_flushed))) {
+        float_status truncated_status = *status;
+        uint32_t truncated;
+
+        set_float_exception_flags(0, &truncated_status);
+        set_float_rounding_mode(float_round_to_zero, &truncated_status);
+        truncated = ia64_fpma_lane_result(
+            addend_bits, multiplicand_bits, multiplier_bits, form,
+            pure_multiply, &truncated_status);
+        *fpa = (result & UINT32_C(0x7fffffff)) >
+               (truncated & UINT32_C(0x7fffffff));
+    }
+    return result;
 }
 
 static void ia64_do_fpma(CPUIA64State *env, uint32_t r1, uint32_t r2,
@@ -1843,19 +3169,34 @@ static void ia64_do_fpma(CPUIA64State *env, uint32_t r1, uint32_t r2,
 {
     float_status hi_status = env->fp.fp_status;
     float_status lo_status = env->fp.fp_status;
+    uint64_t f2;
+    uint64_t f3;
+    uint64_t f4;
     uint32_t hi;
     uint32_t lo;
+    uint64_t traps;
+    bool hi_fpa = false;
+    bool lo_fpa = false;
 
     if (ia64_fr_write_nat_if_any3(env, r1, r2, r3, r4)) {
         return;
     }
 
-    hi = ia64_fpma_lane(env->fp.fr[r2] >> 32, env->fp.fr[r3] >> 32,
-                        env->fp.fr[r4] >> 32, form, &hi_status);
-    lo = ia64_fpma_lane(env->fp.fr[r2], env->fp.fr[r3], env->fp.fr[r4], form,
-                        &lo_status);
+    f2 = ia64_fr_significand(env, r2);
+    f3 = ia64_fr_significand(env, r3);
+    f4 = ia64_fr_significand(env, r4);
+    traps = ia64_fp_active_traps(env, sf);
+    hi_status.rebias_overflow = lo_status.rebias_overflow =
+        !(traps & (1U << 3));
+    hi_status.rebias_underflow = lo_status.rebias_underflow =
+        !(traps & (1U << 4));
+    hi = ia64_fpma_lane(f2 >> 32, f3 >> 32, f4 >> 32, form,
+                        r2 == IA64_FR_ZERO_INDEX, &hi_fpa, &hi_status);
+    lo = ia64_fpma_lane(f2, f3, f4, form,
+                        r2 == IA64_FR_ZERO_INDEX, &lo_fpa, &lo_status);
     ia64_fp_simd_fault_end(env, sf, get_float_exception_flags(&hi_status),
-                           get_float_exception_flags(&lo_status));
+                           get_float_exception_flags(&lo_status),
+                           hi_fpa, lo_fpa);
 
     ia64_fr_write_sig(env, r1, ia64_pack_fp32_lanes(hi, lo));
 }
@@ -1910,24 +3251,76 @@ static uint64_t ia64_fp_soft_flags_to_ia64(int soft)
                 float_flag_output_denormal_flushed)) {
         flags |= 1U << 4;
     }
-    if (soft & float_flag_inexact) {
+    if (soft & (float_flag_inexact |
+                float_flag_output_denormal_flushed)) {
         flags |= 1U << 5;
     }
 
     return flags;
 }
 
+static uint64_t ia64_fp_packed_fault_code(uint64_t hi_flags,
+                                          uint64_t lo_flags)
+{
+    /* Table 8-3: Parallel FP-HI is ISR.code[3:0], LO is [7:4]. */
+    return (hi_flags & 0xf) | ((lo_flags & 0xf) << 4);
+}
+
+static uint16_t ia64_fp_packed_trap_code(uint64_t hi_flags,
+                                         uint64_t lo_flags,
+                                         bool hi_fpa, bool lo_fpa)
+{
+    uint16_t code;
+
+    /* Table 8-3: LO O/U/I/FPA is [10:7], HI is [14:11]. */
+    code = ((lo_flags & 0x38) << 4) | ((hi_flags & 0x38) << 8);
+    if (lo_fpa) {
+        code |= IA64_FP_ISR_FPA_LO;
+    }
+    if (hi_fpa) {
+        code |= IA64_FP_ISR_FPA_HI;
+    }
+    return code;
+}
+
+static uint64_t ia64_fp_completion_traps(uint64_t flags, uint64_t traps)
+{
+    uint64_t enabled = flags & ~traps & 0x38;
+
+    /* Figure 5-12 reports concurrent I with an enabled O/U response. */
+    if (enabled & 0x18) {
+        enabled |= flags & (1U << 5);
+    }
+    return enabled;
+}
+
 static void ia64_fp_simd_fault_end(CPUIA64State *env, uint32_t sf,
-                                   int hi_soft, int lo_soft)
+                                   int hi_soft, int lo_soft,
+                                   bool hi_fpa, bool lo_fpa)
 {
     uint64_t traps = ia64_fp_active_traps(env, sf);
-    uint64_t hi_fault = ia64_fp_soft_flags_to_ia64(hi_soft) & ~traps & 0x7;
-    uint64_t lo_fault = ia64_fp_soft_flags_to_ia64(lo_soft) & ~traps & 0x7;
+    uint64_t hi_flags;
+    uint64_t lo_flags;
+    uint64_t hi_fault;
+    uint64_t lo_fault;
+    uint64_t hi_trap;
+    uint64_t lo_trap;
+
+    hi_flags = ia64_fp_soft_flags_to_ia64(hi_soft);
+    lo_flags = ia64_fp_soft_flags_to_ia64(lo_soft);
+    hi_fault = hi_flags & ~traps & 0x7;
+    lo_fault = lo_flags & ~traps & 0x7;
+    hi_trap = ia64_fp_completion_traps(hi_flags, traps);
+    lo_trap = ia64_fp_completion_traps(lo_flags, traps);
 
     set_float_exception_flags(hi_soft | lo_soft, &env->fp.fp_status);
     if (hi_fault || lo_fault) {
-        ia64_raise_fp_fault(env, lo_fault | (hi_fault << 4));
+        ia64_raise_fp_fault(
+            env, ia64_fp_packed_fault_code(hi_fault, lo_fault));
     }
+    env->fp.transaction.packed_trap = true;
+    env->fp.transaction.packed_trap_code = ia64_fp_packed_trap_code(
+        hi_trap, lo_trap, hi_fpa && hi_trap, lo_fpa && lo_trap);
 }
 
 static void ia64_fp_restore_state(CPUIA64State *env)
@@ -2004,6 +3397,9 @@ static void ia64_fp_begin(CPUIA64State *env, uint32_t sf,
     env->fp.transaction.backup_pr_mask = 0;
     env->fp.transaction.backup_psr_mf =
         env->psr & (IA64_PSR_MFL | IA64_PSR_MFH);
+    env->fp.transaction.trap_fpa = false;
+    env->fp.transaction.packed_trap_code = 0;
+    env->fp.transaction.packed_trap = false;
     env->fp.transaction.active = true;
 
     set_float_rounding_mode(rounding[(controls >> 4) & 3],
@@ -2059,11 +3455,27 @@ static void ia64_fp_end(CPUIA64State *env, uint32_t sf)
             next_ip += 16;
             next_slot = 0;
         }
-        env->psr = (env->psr & ~IA64_PSR_RI_MASK) |
-                   ((uint64_t)next_slot << IA64_PSR_RI_SHIFT);
-        env->cr_isr = ((enabled & 0x38) << 8) | 1;
-        ia64_raise_exception(env, IA64_EXCP_FP_TRAP, next_ip, trap_ip,
-                               slot);
+        uint64_t fp_isr;
+
+        if (env->fp.transaction.packed_trap) {
+            fp_isr = env->fp.transaction.packed_trap_code |
+                     IA64_ISR_CODE_FP;
+        } else {
+            uint64_t reported = ia64_fp_completion_traps(flags, traps);
+
+            fp_isr = (reported << 8) | IA64_ISR_CODE_FP;
+            if (env->fp.transaction.trap_fpa) {
+                fp_isr |= IA64_FP_ISR_FPA_HI;
+            }
+        }
+
+        /* A trapping FP instruction completed successfully. */
+        ia64_system_clear_psr_fault_suppression(env);
+        ia64_check_native_traps(
+            env, next_ip, trap_ip,
+            IA64_NATIVE_TRAP_SLOTS(next_slot, slot),
+            IA64_NATIVE_TRAP_FP, fp_isr, env->psr);
+        g_assert_not_reached();
     }
 }
 
@@ -2108,9 +3520,22 @@ uint64_t ia64_fp_fchkf(CPUIA64State *env, uint32_t sf)
 /* ---- FP multiply-subtract (fms; fma with a negated addend) ---- */
 
 static void ia64_do_fms(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                        uint32_t r3, uint32_t r4)
+                        uint32_t r3, uint32_t r4, uint32_t sf,
+                        uint32_t precision)
 {
+    if (r2 == IA64_FR_ZERO_INDEX) {
+        ia64_do_fmpy_common(env, r1, r3, r4, sf, precision, false);
+        return;
+    }
     if (ia64_fr_write_nat_if_any3(env, r1, r2, r3, r4)) {
+        return;
+    }
+    if (ia64_fp_handle_muladd_special(
+            env, sf, r1, r2, r3, r4, IA64_FP_MULSUB)) {
+        return;
+    }
+    if (ia64_fp_try_raw_muladd(
+            env, r1, r2, r3, r4, sf, precision, IA64_FP_MULSUB)) {
         return;
     }
     ia64_fr_write_floatx80(
@@ -2135,9 +3560,22 @@ void ia64_fp_fnma(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3)
 }
 
 static void ia64_do_fnma4(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                          uint32_t r3, uint32_t r4)
+                          uint32_t r3, uint32_t r4, uint32_t sf,
+                          uint32_t precision)
 {
+    if (r2 == IA64_FR_ZERO_INDEX) {
+        ia64_do_fmpy_common(env, r1, r3, r4, sf, precision, true);
+        return;
+    }
     if (ia64_fr_write_nat_if_any3(env, r1, r2, r3, r4)) {
+        return;
+    }
+    if (ia64_fp_handle_muladd_special(
+            env, sf, r1, r2, r3, r4, IA64_FP_NEG_MULADD)) {
+        return;
+    }
+    if (ia64_fp_try_raw_muladd(
+            env, r1, r2, r3, r4, sf, precision, IA64_FP_NEG_MULADD)) {
         return;
     }
     ia64_fr_write_floatx80(
@@ -2154,6 +3592,8 @@ void ia64_fp_fselect(CPUIA64State *env, uint32_t r1,
                      uint32_t r2, uint32_t r3, uint32_t r4)
 {
     uint64_t mask;
+    uint64_t left;
+    uint64_t right;
 
     /*
      * IA-64 fselect: f1 = (f3 AND f2) OR (f4 AND NOT f2)
@@ -2162,21 +3602,29 @@ void ia64_fp_fselect(CPUIA64State *env, uint32_t r1,
     if (ia64_fr_write_nat_if_any3(env, r1, r2, r3, r4)) {
         return;
     }
-    mask = env->fp.fr[r2];
-    ia64_fr_write_sig(env, r1,
-                      (env->fp.fr[r3] & mask) | (env->fp.fr[r4] & ~mask));
+    mask = ia64_fr_significand(env, r2);
+    left = ia64_fr_significand(env, r3);
+    right = ia64_fr_significand(env, r4);
+    ia64_fr_write_sig(env, r1, (left & mask) | (right & ~mask));
 }
 
 /* ---- FP normalize ---- */
 
 static void ia64_do_fnorm(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                          uint32_t r3)
+                          uint32_t r3, uint32_t sf, uint32_t precision)
 {
+    IA64FPRegisterFormat raw;
     floatx80 value;
 
     (void)r2;
     if (ia64_fr_nat_get(env, r3)) {
         ia64_fr_write_nat(env, r1);
+        return;
+    }
+    raw = ia64_fr_raw_register_format(env, r3);
+    ia64_fp_note_unnormal_operand(
+        env, sf, ia64_fp_register_format_is_unnormal(&raw));
+    if (ia64_fp_deliver_finite(env, r1, &raw, sf, precision)) {
         return;
     }
     if (ia64_fr_sig_get(env, r3)) {
@@ -2189,9 +3637,6 @@ static void ia64_do_fnorm(CPUIA64State *env, uint32_t r1, uint32_t r2,
          * pseudo-op, so consuming one records the D exception before the
          * payload is normalized.
          */
-        if (!(integer & IA64_FP_SIGNIFICAND_INTEGER_BIT)) {
-            float_raise(float_flag_input_denormal_used, &env->fp.fp_status);
-        }
         value = float128_to_floatx80(
             uint64_to_float128(integer, &env->fp.fp_status),
             &env->fp.fp_status);
@@ -2209,13 +3654,24 @@ static void ia64_do_fnorm(CPUIA64State *env, uint32_t r1, uint32_t r2,
 
 /* ---- FP absolute / negate / negate-absolute ---- */
 
+static uint64_t ia64_fr_packed_significand(CPUIA64State *env, uint32_t reg)
+{
+    uint64_t significand;
+    uint64_t high;
+
+    ia64_fpreg_to_spill(env, reg, &significand, &high);
+    return significand;
+}
+
 void ia64_fp_fpabs(CPUIA64State *env, uint32_t r1, uint32_t r2)
 {
     if (ia64_fr_nat_get(env, r2)) {
         ia64_fr_write_nat(env, r1);
         return;
     }
-    ia64_fr_copy(env, r1, r2, 0);
+    ia64_fr_write_sig(env, r1,
+                      ia64_fr_packed_significand(env, r2) &
+                      UINT64_C(0x7fffffff7fffffff));
 }
 
 void ia64_fp_fpneg(CPUIA64State *env, uint32_t r1, uint32_t r2)
@@ -2224,7 +3680,9 @@ void ia64_fp_fpneg(CPUIA64State *env, uint32_t r1, uint32_t r2)
         ia64_fr_write_nat(env, r1);
         return;
     }
-    ia64_fr_copy(env, r1, r2, -1);
+    ia64_fr_write_sig(env, r1,
+                      ia64_fr_packed_significand(env, r2) ^
+                      UINT64_C(0x8000000080000000));
 }
 
 void ia64_fp_fpnegabs(CPUIA64State *env, uint32_t r1, uint32_t r2)
@@ -2233,7 +3691,9 @@ void ia64_fp_fpnegabs(CPUIA64State *env, uint32_t r1, uint32_t r2)
         ia64_fr_write_nat(env, r1);
         return;
     }
-    ia64_fr_copy(env, r1, r2, 2);
+    ia64_fr_write_sig(env, r1,
+                      ia64_fr_packed_significand(env, r2) |
+                      UINT64_C(0x8000000080000000));
 }
 
 void ia64_fp_fcvt_xf(CPUIA64State *env, uint32_t r1, uint32_t r2)
@@ -2267,40 +3727,95 @@ void ia64_fp_fcvt_xf(CPUIA64State *env, uint32_t r1, uint32_t r2)
                       magnitude << shift);
 }
 
-static void ia64_do_fcvt_fx(CPUIA64State *env, uint32_t r1, uint32_t r2,
-                            uint32_t is_unsigned, uint32_t is_trunc)
+static bool ia64_fcvt_raw_to_integer(const IA64FPRegisterFormat *input,
+                                     bool is_unsigned, uint32_t rounding,
+                                     uint64_t *result, bool *inexact,
+                                     bool *fpa)
 {
-    uint64_t value = env->fp.fr[r2];
-    floatx80 fp_value;
+    IA64FPSWARawResult raw = { 0 };
+    __uint128_t rounded;
+    int32_t exp;
+    uint32_t normalize;
+    uint32_t shift;
+
+    *inexact = false;
+    *fpa = false;
+    if (input->exp == IA64_FP_REG_SPECIAL_EXP) {
+        return false;
+    }
+    if (input->mant == 0) {
+        *result = 0;
+        return true;
+    }
+
+    raw.sign = input->sign;
+    raw.mant = input->mant;
+    exp = input->exp == 0 ? 0x0c001 : (int32_t)input->exp;
+    normalize = clz64(raw.mant);
+    raw.mant <<= normalize;
+    exp -= normalize;
+
+    /* A normalized value above this exponent has magnitude at least 2^64. */
+    if (exp > IA64_FP_REG_INTEGER_EXP) {
+        return false;
+    }
+    shift = IA64_FP_REG_INTEGER_EXP - exp;
+    rounded = ia64_fpswa_round_right(&raw, shift, rounding, inexact, fpa);
+
+    if (rounded > UINT64_MAX) {
+        return false;
+    }
+    if (is_unsigned) {
+        if (input->sign && rounded != 0) {
+            return false;
+        }
+        *result = rounded;
+    } else if (input->sign) {
+        if (rounded > (UINT64_C(1) << 63)) {
+            return false;
+        }
+        *result = -(uint64_t)rounded;
+    } else {
+        if (rounded > INT64_MAX) {
+            return false;
+        }
+        *result = rounded;
+    }
+    return true;
+}
+
+static void ia64_do_fcvt_fx(CPUIA64State *env, uint32_t r1, uint32_t r2,
+                            uint32_t is_unsigned, uint32_t is_trunc,
+                            uint32_t sf)
+{
+    IA64FPRegisterFormat raw;
     uint64_t result;
+    uint32_t rounding;
+    bool inexact;
+    bool fpa;
+    bool valid;
 
     if (ia64_fr_nat_get(env, r2)) {
         ia64_fr_write_nat(env, r1);
         return;
     }
 
-    /*
-     * fcvt.fx[u] writes an integer significand result.  Preserve operands
-     * that are already tracked in significand form through the conversion.
-     */
-    if (ia64_fr_sig_get(env, r2) ||
-        ia64_fr_looks_like_setf_sig_payload(value)) {
-        ia64_fr_write_sig(env, r1, value);
-        return;
-    }
-
-    fp_value = ia64_fr_to_floatx80(env, r2);
-    if (is_unsigned) {
-        float128 fp128 = floatx80_to_float128(fp_value, &env->fp.fp_status);
-
-        result = is_trunc ?
-            float128_to_uint64_round_to_zero(fp128, &env->fp.fp_status) :
-            float128_to_uint64(fp128, &env->fp.fp_status);
+    raw = ia64_fr_raw_register_format(env, r2);
+    rounding = is_trunc ? 3 :
+               ((ia64_fpsr_sf_controls(env, sf) >> 4) & 3);
+    valid = ia64_fcvt_raw_to_integer(
+        &raw, is_unsigned, rounding, &result, &inexact, &fpa);
+    if (!valid) {
+        result = UINT64_C(0x8000000000000000);
+        float_raise(float_flag_invalid, &env->fp.fp_status);
     } else {
-        result = is_trunc ?
-            (uint64_t)floatx80_to_int64_round_to_zero(
-                fp_value, &env->fp.fp_status) :
-            (uint64_t)floatx80_to_int64(fp_value, &env->fp.fp_status);
+        /* Invalid conversion responses take precedence over D. */
+        ia64_fp_note_unnormal_operand(
+            env, sf, ia64_fp_register_format_is_unnormal(&raw));
+        if (inexact) {
+            env->fp.transaction.trap_fpa = fpa;
+            float_raise(float_flag_inexact, &env->fp.fp_status);
+        }
     }
     ia64_fr_write_sig(env, r1, result);
 }
@@ -2360,6 +3875,41 @@ static floatx80 ia64_floatx80_rsqrta(floatx80 val, float_status *status)
     return floatx80_div(one, sqrtv, status);
 }
 
+static bool ia64_frsqrta_raw_response(CPUIA64State *env, uint32_t r1,
+                                      const IA64FPRegisterFormat *val,
+                                      bool *predicate)
+{
+    if (ia64_fp_register_format_is_nan(val)) {
+        return false;
+    }
+
+    *predicate = false;
+    if (ia64_fp_register_format_is_zero(val)) {
+        ia64_fr_write_ext(env, r1, val->sign, 0, 0);
+    } else if (ia64_fp_register_format_is_infinity(val)) {
+        if (val->sign) {
+            float_raise(float_flag_invalid, &env->fp.fp_status);
+            ia64_fr_write_floatx80(
+                env, r1, floatx80_default_nan(&env->fp.fp_status));
+        } else {
+            ia64_fr_write_ext(env, r1, false, IA64_FP_REG_SPECIAL_EXP,
+                              IA64_FP_SIGNIFICAND_INTEGER_BIT);
+        }
+    } else if (ia64_fp_register_format_is_normal(val)) {
+        if (val->sign) {
+            float_raise(float_flag_invalid, &env->fp.fp_status);
+            ia64_fr_write_floatx80(
+                env, r1, floatx80_default_nan(&env->fp.fp_status));
+        } else {
+            ia64_frsqrta_write_approx(env, r1, val);
+            *predicate = true;
+        }
+    } else {
+        return false;
+    }
+    return true;
+}
+
 static bool ia64_float32_rsqrta_predicate(float32 val)
 {
     return !float32_is_zero(val) &&
@@ -2402,7 +3952,7 @@ static bool ia64_float32_fprsqrta_predicate(
 static void ia64_do_fprsqrta(CPUIA64State *env, uint32_t r1, uint32_t p2,
                              uint32_t r3, uint32_t sf)
 {
-    uint64_t val = env->fp.fr[r3];
+    uint64_t val = ia64_fr_significand(env, r3);
     float32 hi = make_float32(val >> 32);
     float32 lo = make_float32(val);
     bool hi_pred;
@@ -2421,8 +3971,10 @@ static void ia64_do_fprsqrta(CPUIA64State *env, uint32_t r1, uint32_t p2,
     {
         IA64FPRegisterFormat hi_fmt = { 0 };
         IA64FPRegisterFormat lo_fmt = { 0 };
-        bool hi_normal = ia64_float32_register_format(hi, &hi_fmt);
-        bool lo_normal = ia64_float32_register_format(lo, &lo_fmt);
+        bool hi_normal =
+            ia64_float32_normalized_register_format(hi, &hi_fmt);
+        bool lo_normal =
+            ia64_float32_normalized_register_format(lo, &lo_fmt);
         float_status hi_status = env->fp.fp_status;
         float_status lo_status = env->fp.fp_status;
 
@@ -2434,24 +3986,23 @@ static void ia64_do_fprsqrta(CPUIA64State *env, uint32_t r1, uint32_t p2,
         lo_result = lo_pred && lo_normal ?
                     ia64_float32_rsqrta_approx(env, &lo_fmt) :
                     ia64_float32_rsqrta(lo, &lo_status);
-        hi_soft = get_float_exception_flags(&hi_status);
-        lo_soft = get_float_exception_flags(&lo_status);
+        if (hi_pred && float32_is_denormal(hi)) {
+            float_raise(float_flag_input_denormal_used, &hi_status);
+        }
+        if (lo_pred && float32_is_denormal(lo)) {
+            float_raise(float_flag_input_denormal_used, &lo_status);
+        }
+        hi_soft = ia64_fp_approx_soft_flags(
+            get_float_exception_flags(&hi_status));
+        lo_soft = ia64_fp_approx_soft_flags(
+            get_float_exception_flags(&lo_status));
         hi_pred = hi_pred && hi_normal &&
                   ia64_float32_fprsqrta_predicate(&hi_fmt);
         lo_pred = lo_pred && lo_normal &&
                   ia64_float32_fprsqrta_predicate(&lo_fmt);
     }
 
-    {
-        uint64_t traps = ia64_fp_active_traps(env, sf);
-        uint64_t hi_fault = ia64_fp_soft_flags_to_ia64(hi_soft) & ~traps & 0x7;
-        uint64_t lo_fault = ia64_fp_soft_flags_to_ia64(lo_soft) & ~traps & 0x7;
-
-        set_float_exception_flags(hi_soft | lo_soft, &env->fp.fp_status);
-        if (hi_fault || lo_fault) {
-            ia64_raise_fp_fault(env, lo_fault | (hi_fault << 4));
-        }
-    }
+    ia64_fp_simd_fault_end(env, sf, hi_soft, lo_soft, false, false);
 
     ia64_fr_write_sig(env, r1,
                       ((uint64_t)float32_val(hi_result) << 32) |
@@ -2463,6 +4014,7 @@ static void ia64_do_frsqrta(CPUIA64State *env, uint32_t r1, uint32_t p2,
                             uint32_t r3, uint32_t sf)
 {
     floatx80 val;
+    IA64FPRegisterFormat raw;
     IA64FPRegisterFormat fmt;
     bool predicate;
 
@@ -2472,27 +4024,26 @@ static void ia64_do_frsqrta(CPUIA64State *env, uint32_t r1, uint32_t p2,
         return;
     }
 
-    fmt = ia64_fr_register_format(env, r3);
+    raw = ia64_fr_raw_register_format(env, r3);
+    fmt = raw;
+    ia64_normalize_fp_register_format(&fmt);
     if (ia64_frsqrta_limits_swa_fault(&fmt)) {
         ia64_fpswa_prepare_sqrt(env, r1, p2, r3, sf);
         ia64_raise_fp_fault(env, IA64_FP_ISR_SWA);
     }
+    ia64_fp_note_unnormal_operand(
+        env, sf, ia64_frsqrta_uses_unnormal_operand(&raw));
 
-    val = ia64_fr_to_floatx80(env, r3);
-    if (floatx80_is_zero(val) ||
-        (!floatx80_is_neg(val) &&
-         floatx80_is_infinity(val, &env->fp.fp_status))) {
-        ia64_fr_copy(env, r1, r3, 1);
-        ia64_pr_write(env, p2, false);
-        return;
+    if (!ia64_frsqrta_raw_response(env, r1, &fmt, &predicate)) {
+        val = ia64_fr_to_floatx80(env, r3);
+        predicate = !ia64_fp_register_format_is_unsupported(&fmt) &&
+                    ia64_floatx80_rsqrta_predicate(
+                        val, &env->fp.fp_status);
+        ia64_fr_write_floatx80(
+            env, r1, ia64_floatx80_rsqrta(val, &env->fp.fp_status));
     }
-
-    predicate = ia64_floatx80_rsqrta_predicate(val, &env->fp.fp_status);
-    ia64_fr_write_floatx80(
-        env, r1, predicate && ia64_fp_register_format_is_normal(&fmt) ?
-        ia64_floatx80_rsqrta_approx(env, r3) :
-        ia64_floatx80_rsqrta(val, &env->fp.fp_status));
     ia64_pr_write(env, p2, predicate);
+    ia64_fp_approx_restrict_status(&env->fp.fp_status);
 }
 
 static uint32_t ia64_fp_context_sf(uint32_t context)
@@ -2520,7 +4071,8 @@ void ia64_fp_fadd(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                  uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fadd(env, r1, r2, r3);
+    ia64_do_fadd(env, r1, r2, r3, ia64_fp_context_sf(context),
+                 ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2528,7 +4080,8 @@ void ia64_fp_fsub(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                  uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fsub(env, r1, r2, r3);
+    ia64_do_fsub(env, r1, r2, r3, ia64_fp_context_sf(context),
+                 ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2536,7 +4089,8 @@ void ia64_fp_fmpy(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                  uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fmpy(env, r1, r2, r3);
+    ia64_do_fmpy(env, r1, r2, r3, ia64_fp_context_sf(context),
+                 ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2544,7 +4098,8 @@ void ia64_fp_fma4(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                  uint32_t r4, uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fma4(env, r1, r2, r3, r4);
+    ia64_do_fma4(env, r1, r2, r3, r4, ia64_fp_context_sf(context),
+                 ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2552,7 +4107,8 @@ void ia64_fp_fcmp(CPUIA64State *env, uint32_t p1, uint32_t p2, uint32_t r2,
                  uint32_t r3, uint32_t cond_code, uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fcmp(env, p1, p2, r2, r3, cond_code);
+    ia64_do_fcmp(env, p1, p2, r2, r3, cond_code,
+                 ia64_fp_context_sf(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2561,7 +4117,7 @@ void ia64_fp_fcmp(CPUIA64State *env, uint32_t p1, uint32_t p2, uint32_t r2,
                        uint32_t r3, uint32_t context)                       \
     {                                                                       \
         ia64_fp_begin_context(env, context);                                \
-        ia64_do_##name(env, r1, r2, r3);                                   \
+        ia64_do_##name(env, r1, r2, r3, ia64_fp_context_sf(context));       \
         ia64_fp_end_context(env, context);                                  \
     }
 
@@ -2629,7 +4185,8 @@ void ia64_fp_fms(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                 uint32_t r4, uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fms(env, r1, r2, r3, r4);
+    ia64_do_fms(env, r1, r2, r3, r4, ia64_fp_context_sf(context),
+                ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2637,7 +4194,9 @@ void ia64_fp_fnma4(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                   uint32_t r4, uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fnma4(env, r1, r2, r3, r4);
+    ia64_do_fnma4(env, r1, r2, r3, r4,
+                  ia64_fp_context_sf(context),
+                  ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2645,7 +4204,8 @@ void ia64_fp_fnorm(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3,
                   uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fnorm(env, r1, r2, r3);
+    ia64_do_fnorm(env, r1, r2, r3, ia64_fp_context_sf(context),
+                  ia64_fp_context_precision(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2654,7 +4214,8 @@ void ia64_fp_fcvt_fx(CPUIA64State *env, uint32_t r1, uint32_t r2,
                     uint32_t context)
 {
     ia64_fp_begin_context(env, context);
-    ia64_do_fcvt_fx(env, r1, r2, is_unsigned, is_trunc);
+    ia64_do_fcvt_fx(env, r1, r2, is_unsigned, is_trunc,
+                    ia64_fp_context_sf(context));
     ia64_fp_end_context(env, context);
 }
 
@@ -2851,18 +4412,16 @@ void ia64_fp_fpswa_dispatch(CPUIA64State *env, uintptr_t ra)
 
 void ia64_fp_fpack(CPUIA64State *env, uint32_t r1, uint32_t r2, uint32_t r3)
 {
-    float_status status = env->fp.fp_status;
-    float32 hi;
-    float32 lo;
+    uint32_t hi;
+    uint32_t lo;
 
     if (ia64_fr_nat_get(env, r2) || ia64_fr_nat_get(env, r3)) {
         ia64_fr_write_nat(env, r1);
         return;
     }
 
-    hi = floatx80_to_float32(ia64_fr_to_floatx80(env, r2), &status);
-    status = env->fp.fp_status;
-    lo = floatx80_to_float32(ia64_fr_to_floatx80(env, r3), &status);
+    hi = ia64_fpreg_to_binary32(env, r2);
+    lo = ia64_fpreg_to_binary32(env, r3);
     ia64_fr_write_sig(env, r1, ((uint64_t)hi << 32) | lo);
 }
 

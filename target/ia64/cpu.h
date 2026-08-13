@@ -42,8 +42,10 @@
 #define IA64_AR_COUNT    128
 #define IA64_CR_COUNT    128
 #define IA64_DBR_COUNT   16
+#define IA64_DBR_IMPLEMENTED_COUNT 8
 #define IA64_FR_COUNT    128
 #define IA64_IBR_COUNT   16
+#define IA64_IBR_IMPLEMENTED_COUNT 8
 #define IA64_PMC_COUNT   64
 #define IA64_PMD_COUNT   64
 #define IA64_PKR_COUNT   16
@@ -67,6 +69,9 @@
 #define IA64_CPUID4_LB   (1ULL << 0)  /* brl, long branch */
 #define IA64_CPUID4_SD   (1ULL << 1)  /* spontaneous deferral */
 #define IA64_CPUID4_AO   (1ULL << 2)  /* ld16/st16/cmp8xchg16 atomics */
+#define IA64_CPUID4_RU   (1ULL << 3)  /* resource utilization counter */
+#define IA64_CPUID4_CZ   (1ULL << 32) /* clz */
+#define IA64_CPUID4_X2   (1ULL << 33) /* mpy4/mpyshl4 */
 
 /*
  * Direct-mapped lookup for modeled TR/TC entries.  IA-64's minimum page is
@@ -123,6 +128,7 @@
 #define IA64_PSR_DI      (1ULL << 22)
 #define IA64_PSR_SI      (1ULL << 23)
 #define IA64_PSR_DB      (1ULL << 24)
+#define IA64_PSR_LP      (1ULL << 25)
 #define IA64_PSR_TB      (1ULL << 26)
 #define IA64_PSR_RT      (1ULL << 27)
 #define IA64_PSR_IS      (1ULL << 34)
@@ -141,7 +147,7 @@
 #define IA64_PSR_RI_MASK (3ULL << 41)
 #define IA64_PSR_RI_SHIFT  41
 #define IA64_PSR_FAULT_SUPPRESS_MASK \
-    (IA64_PSR_DA | IA64_PSR_DD | IA64_PSR_ED | IA64_PSR_IA)
+    (IA64_PSR_ID | IA64_PSR_DA | IA64_PSR_DD | IA64_PSR_ED | IA64_PSR_IA)
 
 #define IA64_REGION_SHIFT 61
 #define IA64_REGION_MASK  ((1ULL << IA64_REGION_BITS) - 1)
@@ -287,9 +293,18 @@ static inline bool ia64_cfm_frame_fields_valid(uint32_t sof, uint32_t sol,
 /* NaT Consumption ISR.code{5:4} = 2 for a NaTPage reference. */
 #define IA64_ISR_CODE_NAT_PAGE 0x20
 /* Concurrent trap conditions reported in ISR.code (SDM Vol. 2, Table 8-3). */
+#define IA64_ISR_CODE_FP       (1ULL << 0)
+#define IA64_ISR_CODE_LP       (1ULL << 1)
 #define IA64_ISR_CODE_TB       (1ULL << 2)
 #define IA64_ISR_CODE_SS       (1ULL << 3)
 #define IA64_ISR_CODE_UI       (1ULL << 4)
+
+/* Conditions supplied to the common successful-instruction trap check. */
+#define IA64_NATIVE_TRAP_TAKEN  (1U << 0)
+#define IA64_NATIVE_TRAP_LOWER  (1U << 1)
+#define IA64_NATIVE_TRAP_FP     (1U << 2)
+#define IA64_NATIVE_TRAP_SLOTS(target, source) \
+    (((target) & 3U) | (((source) & 3U) << 2))
 
 /* ---- ITIR fields ---- */
 #define IA64_ITIR_PS_MASK    0x3f
@@ -303,8 +318,10 @@ static inline bool ia64_cfm_frame_fields_valid(uint32_t sof, uint32_t sol,
 #define IA64_PURGEABLE_PAGE_SIZE_MASK IA64_INSERTABLE_PAGE_SIZE_MASK
 
 /* ---- General exception codes ---- */
-#define IA64_GENEX_UNIMPL_DATA_ADDR 43
-#define IA64_GENEX_UNIMPL_INST_ADDR 69
+/* ISR.code{7:4}; code{3:0} remains available to non-access instructions. */
+#define IA64_GENEX_UNIMPL_DATA_ADDR (3ULL << 4)
+/* A fetch-side Unimplemented Instruction Address fault has zero trap code. */
+#define IA64_GENEX_UNIMPL_INST_ADDR 0
 
 /* ---- Protection Key Register fields ---- */
 #define IA64_PKR_VALID       (1ULL << 0)
@@ -399,6 +416,7 @@ typedef enum IA64BranchRegisterIndex {
 typedef enum IA64FloatingRegisterIndex {
     IA64_FR_ZERO_INDEX = 0,
     IA64_FR_ONE_INDEX = 1,
+    IA64_FR_ROTATING_BASE = 32,
 } IA64FloatingRegisterIndex;
 
 typedef enum IA64RegionRegisterIndex {
@@ -499,6 +517,7 @@ typedef enum IA64ApplicationRegisterIndex {
     IA64_AR_UNAT = 36,
     IA64_AR_FPSR = 40,
     IA64_AR_ITC = 44,
+    IA64_AR_RUC = 45,
     IA64_AR_PFS = 64,
     IA64_AR_LC = 65,
     IA64_AR_EC = 66,
@@ -612,6 +631,8 @@ typedef enum IA64Exception {
     IA64_EXCP_IA32_INTERRUPT = 36,
     IA64_EXCP_TAKEN_BRANCH = 37,
     IA64_EXCP_SINGLE_STEP = 38,
+    IA64_EXCP_DEBUG = 39,
+    IA64_EXCP_LOWER_PRIVILEGE = 40,
     IA64_EXCP_MAX,
 } IA64Exception;
 
@@ -762,6 +783,11 @@ typedef struct IA64FirmwareDebugRseState {
     uint8_t cfm_rrb_fr;
     uint8_t cfm_rrb_pr;
     bool cfle;
+    bool completion_pending;
+    bool completion_demoted;
+    uint64_t completion_psr;
+    uint64_t completion_source_ip;
+    uint8_t completion_source_slot;
 } IA64FirmwareDebugRseState;
 
 typedef enum IA64MemorySpeculation {
@@ -769,6 +795,32 @@ typedef enum IA64MemorySpeculation {
     IA64_MEM_LIMITED_SPECULATION,
     IA64_MEM_SPECULATIVE,
 } IA64MemorySpeculation;
+
+/*
+ * Alignment policy carried by translated memory instructions.  The datum
+ * size is deliberately separate from its natural alignment: an extended
+ * floating-point operand transfers 10 bytes but has a 16-byte natural
+ * boundary.  The compact descriptor keeps the TCG helper ABI small enough
+ * to use for both ordinary and speculative references.
+ */
+typedef enum IA64AlignmentClass {
+    IA64_ALIGNMENT_GENERIC,
+    IA64_ALIGNMENT_INTEGER,
+    IA64_ALIGNMENT_FP,
+    IA64_ALIGNMENT_FP_PAIR,
+    IA64_ALIGNMENT_FP_FILL_SPILL,
+    IA64_ALIGNMENT_NATURAL_REQUIRED,
+} IA64AlignmentClass;
+
+#define IA64_ALIGNMENT_DATUM_MASK       0xffU
+#define IA64_ALIGNMENT_NATURAL_SHIFT    8
+#define IA64_ALIGNMENT_NATURAL_MASK     (0xffU << IA64_ALIGNMENT_NATURAL_SHIFT)
+#define IA64_ALIGNMENT_CLASS_SHIFT      16
+#define IA64_ALIGNMENT_CLASS_MASK       (0xffU << IA64_ALIGNMENT_CLASS_SHIFT)
+#define IA64_ALIGNMENT_INFO(datum, natural, cls)                         \
+    (((uint32_t)(datum) & IA64_ALIGNMENT_DATUM_MASK) |                   \
+     (((uint32_t)(natural) & 0xffU) << IA64_ALIGNMENT_NATURAL_SHIFT) |   \
+     (((uint32_t)(cls) & 0xffU) << IA64_ALIGNMENT_CLASS_SHIFT))
 
 static inline IA64MemorySpeculation
 ia64_pte_memory_speculation(uint64_t pte)
@@ -942,6 +994,12 @@ typedef struct CPUArchState {
     uint64_t bundles_retired;
 
     IA64FPState fp;
+
+    /*
+     * Non-architectural bridge for 64-bit packed TCG vector results.  It is
+     * always overwritten before use and is intentionally not migrated.
+     */
+    uint64_t tcg_vec_scratch;
 
 } CPUIA64State;
 
@@ -1161,9 +1219,7 @@ ia64_tlb_find_cached(CPUIA64State *env, uint64_t va, uint32_t rid,
         ((va ^ cached->va) & cached->page_mask) == 0) {
         if (cached->slot < tlb_count &&
             cached->slot_generation == tlb[cached->slot].micro_generation) {
-            if (ia64_tlb_match(&tlb[cached->slot], va, rid)) {
-                return &tlb[cached->slot];
-            }
+            return &tlb[cached->slot];
         }
     }
 
@@ -1328,7 +1384,11 @@ bool ia64_translate_data_access(CPUIA64State *env, uint64_t va,
 
 void ia64_set_psr(CPUIA64State *env, uint64_t value);
 void ia64_set_psr_bn(CPUIA64State *env, bool bank1);
+#ifdef CONFIG_DEBUG_TCG
 void ia64_rse_delivery_check(CPUIA64State *env, int excp);
+#else
+#define ia64_rse_delivery_check(env, excp) do { } while (0)
+#endif
 
 CPUState *ia64_cpu_by_sapic_id(uint8_t id, uint8_t eid);
 void ia64_sapic_set_irq(CPUState *cs, uint8_t vector);
@@ -1442,11 +1502,13 @@ struct IA64CPUClass {
     uint8_t tc_levels;
     uint8_t perf_counter_width;
     uint8_t memory_attribute_mask;
+    uint16_t fc_line_size;
     uint64_t implemented_pmc_mask;
     uint64_t implemented_pmd_mask;
     uint64_t perf_cycles_mask;
     uint64_t perf_retired_mask;
     bool rse_has_clean_partition;
+    bool data_debug_cross_16byte;
     bool has_native_ia32;
     bool has_virtualization;
     bool is_montecito;

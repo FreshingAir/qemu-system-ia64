@@ -63,13 +63,13 @@ def break_f(imm=0, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def clrrrb_b(qp=0, ignored=0):
+def clrrrb_b(ignored=0):
     return EndGroupInsn(
-        0x20000000 | bitfield(ignored, 6, 21) | bitfield(qp, 0, 6))
+        0x20000000 | bitfield(ignored, 6, 21))
 
-def clrrrb_pr_b(qp=0, ignored=0):
+def clrrrb_pr_b(ignored=0):
     return EndGroupInsn(
-        0x28000000 | bitfield(ignored, 6, 21) | bitfield(qp, 0, 6))
+        0x28000000 | bitfield(ignored, 6, 21))
 
 def pal_break(qp=0):
     return break_m(0x100000, qp)
@@ -122,9 +122,8 @@ def mov_br_gr(b1, r2, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def rfi_b(qp=0):
-    return EndGroupInsn(
-        bitfield(0x08, 27, 6) | bitfield(qp, 0, 6))
+def rfi_b():
+    return EndGroupInsn(bitfield(0x08, 27, 6))
 
 def rfi_to_gr(address, psr_reg, target_reg):
     """Install a full PSR and resume at the IIP held in target_reg."""
@@ -134,8 +133,8 @@ def rfi_to_gr(address, psr_reg, target_reg):
         (address + 0x10, 0x11, nop_m(), nop_i(), rfi_b()),
     ]
 
-def epc_b(qp=0, ignored=0):
-    return bitfield(0x10, 27, 6) | bitfield(ignored, 6, 21) | bitfield(qp, 0, 6)
+def epc_b(ignored=0):
+    return bitfield(0x10, 27, 6) | bitfield(ignored, 6, 21)
 
 def mov_ar(r1, ar_num, qp=0):
     return (op(1) | bitfield(0x2a, 27, 6)
@@ -329,9 +328,10 @@ def mov_rr_read(dest_reg, addr_reg, qp=0, ignored36=0):
             | bitfield(addr_reg, 20, 7) | bitfield(dest_reg, 6, 7)
             | bitfield(qp, 0, 6))
 
-def mov_cpuid(r1, index_reg, qp=0, bit36=0):
+def mov_cpuid(r1, index_reg, qp=0, bit36=0, ignored=0):
     return (op(1) | bitfield(bit36, 36, 1) | bitfield(0x17, 27, 6)
-            | bitfield(index_reg, 20, 7) | bitfield(r1, 6, 7)
+            | bitfield(index_reg, 20, 7) | bitfield(ignored, 13, 7)
+            | bitfield(r1, 6, 7)
             | bitfield(qp, 0, 6))
 
 def mov_dahr_read(r1, index_reg, qp=0, bit36=0, ignored=0):
@@ -339,9 +339,24 @@ def mov_dahr_read(r1, index_reg, qp=0, bit36=0, ignored=0):
             | bitfield(index_reg, 20, 7) | bitfield(ignored, 13, 7)
             | bitfield(r1, 6, 7) | bitfield(qp, 0, 6))
 
-def mov_msr_read(r1, index_reg, qp=0, bit36=0):
+def mov_dahr_write(dahr, value, qp=0):
+    value &= 0xffff
+    return (
+        bitfield((value >> 15) & 1, 36, 1)
+        | bitfield(1, 31, 2)
+        | bitfield(2, 27, 4)
+        | bitfield(1, 26, 1)
+        | bitfield(dahr, 23, 3)
+        | bitfield((value >> 4) & 0x7ff, 12, 11)
+        | bitfield(1, 10, 2)
+        | bitfield(value & 0xf, 6, 4)
+        | bitfield(qp, 0, 6)
+    )
+
+def mov_msr_read(r1, index_reg, qp=0, bit36=0, ignored=0):
     return (op(1) | bitfield(bit36, 36, 1) | bitfield(0x16, 27, 6)
-            | bitfield(index_reg, 20, 7) | bitfield(r1, 6, 7)
+            | bitfield(index_reg, 20, 7) | bitfield(ignored, 13, 7)
+            | bitfield(r1, 6, 7)
             | bitfield(qp, 0, 6))
 
 def mov_msr_write(index_reg, value_reg, qp=0, bit36=0):
@@ -448,31 +463,23 @@ def sum_um(mask, qp=0):
 def rum(mask, qp=0):
     return psr_mask_op(0x05, mask, qp)
 
-def bsw0(qp=0):
-    return EndGroupInsn(
-        bitfield(0x0c, 27, 6) | bitfield(qp, 0, 6))
+def bsw0():
+    return EndGroupInsn(bitfield(0x0c, 27, 6))
 
-def bsw1(qp=0):
-    return EndGroupInsn(
-        bitfield(0x0d, 27, 6) | bitfield(qp, 0, 6))
+def bsw1():
+    return EndGroupInsn(bitfield(0x0d, 27, 6))
 
-def vmsw0(qp=0):
-    return bitfield(0x18, 27, 6) | bitfield(qp, 0, 6)
+def vmsw0():
+    return bitfield(0x18, 27, 6)
 
-def vmsw1(qp=0):
-    return bitfield(0x19, 27, 6) | bitfield(qp, 0, 6)
+def vmsw1():
+    return bitfield(0x19, 27, 6)
 
-def flushrs_enc(qp=0):
-    return StartGroupInsn(
-        bitfield(0x0c, 27, 6)
-        | bitfield(qp, 0, 6)
-    )
+def flushrs_enc():
+    return StartGroupInsn(bitfield(0x0c, 27, 6))
 
-def loadrs_enc(qp=0):
-    return StartGroupInsn(
-        bitfield(0x0a, 27, 6)
-        | bitfield(qp, 0, 6)
-    )
+def loadrs_enc():
+    return StartGroupInsn(bitfield(0x0a, 27, 6))
 
 def fsetc(sf, amask, omask, qp=0):
     return (
@@ -504,11 +511,23 @@ def fchkf(sf, source, target, qp=0, ignored26=0):
         | bitfield(qp, 0, 6)
     )
 
-def hint_m(qp=0):
-    return bitfield(1, 27, 6) | bitfield(64, 20, 7) | bitfield(qp, 0, 6)
+def hint_m(imm=0, qp=0):
+    return (
+        bitfield(1, 27, 6)
+        | bitfield(1, 26, 1)
+        | bitfield(imm & 0xfffff, 6, 20)
+        | bitfield((imm >> 20) & 1, 36, 1)
+        | bitfield(qp, 0, 6)
+    )
 
-def hint_i(qp=0):
-    return bitfield(1, 27, 6) | bitfield(64, 20, 7) | bitfield(qp, 0, 6)
+def hint_i(imm=0, qp=0):
+    return (
+        bitfield(1, 27, 6)
+        | bitfield(1, 26, 1)
+        | bitfield(imm & 0xfffff, 6, 20)
+        | bitfield((imm >> 20) & 1, 36, 1)
+        | bitfield(qp, 0, 6)
+    )
 
 def mov_grpmc_indexed(r3, r2, qp=0, bit36=0):
     return (
@@ -581,12 +600,12 @@ def brp_loop_imp():
 def brp_sptk():
     return 0xf1fcf84840
 
-def cover_b(qp=0):
-    return EndGroupInsn(0x10000000 | bitfield(qp, 0, 6))
+def cover_b():
+    return EndGroupInsn(0x10000000)
 
-def cover_b_ignored_fields(qp=0):
+def cover_b_ignored_fields():
     return EndGroupInsn(
-        cover_b(qp)
+        cover_b()
         | bitfield(1, 12, 1)
         | bitfield(6, 13, 7)
         | bitfield(79, 20, 7)
@@ -659,6 +678,7 @@ __all__ = (
     'mov_rr_read',
     'mov_cpuid',
     'mov_dahr_read',
+    'mov_dahr_write',
     'mov_msr_read',
     'mov_msr_write',
     'itr_i',

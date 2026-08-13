@@ -193,6 +193,7 @@ IA64_EXCEPTION_VECTORS = {
     IA64_EXCP_VIRTUALIZATION: IA64_VIRTUALIZATION_VECTOR,
     IA64_EXCP_TAKEN_BRANCH: IA64_TAKEN_BRANCH_VECTOR,
     IA64_EXCP_SINGLE_STEP: IA64_SINGLE_STEP_VECTOR,
+    IA64_EXCP_LOWER_PRIVILEGE: IA64_LOWER_PRIV_TRANSFER_VECTOR,
 }
 
 
@@ -257,14 +258,14 @@ def require_exception(name, bundles, excp, fault_ip=None, fault_imm=None,
 
 
 def require_uncollected_reserved_field(name, bundles, fault_ip, fault_imm,
-                                       entry=0x10):
+                                       entry=0x10, cpu=None):
     return require_registers(name, bundles, {
         "ip": fault_ip,
         "fault_ip": fault_ip,
         "fault_imm": fault_imm,
         "exception": IA64_EXCP_RESERVED_REG_FIELD,
         "fault_code": IA64_EXCP_RESERVED_REG_FIELD,
-    }, entry=entry)
+    }, entry=entry, cpu=cpu)
 
 
 

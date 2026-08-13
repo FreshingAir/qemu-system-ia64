@@ -32,6 +32,11 @@ uint64_t helper_simd_psad1(uint64_t a, uint64_t b)
     return ia64_simd_psad1_value(a, b);
 }
 
+uint64_t helper_simd_pshladd2(uint64_t a, uint64_t b, uint32_t count)
+{
+    return ia64_simd_pshladd2_value(a, b, count);
+}
+
 uint64_t helper_simd_mux(uint32_t op_sel, uint64_t value, uint32_t imm)
 {
     return ia64_simd_mux_value(op_sel, value, imm);

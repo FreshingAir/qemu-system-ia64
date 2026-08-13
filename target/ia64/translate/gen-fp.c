@@ -31,6 +31,7 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
     TCGv_i64 value;
+    TCGv_i64 exponent;
     TCGLabel *slow = NULL;
     TCGLabel *done = NULL;
 
@@ -51,20 +52,47 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
         tcg_gen_mov_i64(value, ia64_fr_binary_src(op->source1));
         break;
     case IA64_FP_COPY_ABS:
-        tcg_gen_andi_i64(value, ia64_fr_binary_src(op->source1), INT64_MAX);
-        break;
     case IA64_FP_COPY_NEG:
-        tcg_gen_xori_i64(value, ia64_fr_binary_src(op->source1),
-                         UINT64_C(1) << 63);
-        break;
     case IA64_FP_COPY_NEG_ABS:
-        tcg_gen_ori_i64(value, ia64_fr_binary_src(op->source1),
-                        UINT64_C(1) << 63);
+        if (op->source1 <= 1) {
+            tcg_gen_movi_i64(value, op->source1 == IA64_FR_ONE_INDEX ?
+                            UINT64_C(1) << 63 : 0);
+        } else {
+            /*
+             * The packed sign pseudo-ops are fpmerge operations over the
+             * architected significand, not scalar operations over the
+             * binary64 cache.  Reconstruct that significand for the fast
+             * representation; tagged register formats take the helper path.
+             */
+            tcg_gen_andi_i64(value, ia64_fr_binary_src(op->source1),
+                             UINT64_C(0x000fffffffffffff));
+            tcg_gen_shli_i64(value, value, 11);
+            exponent = tcg_temp_new_i64();
+            tcg_gen_andi_i64(exponent, ia64_fr_binary_src(op->source1),
+                             UINT64_C(0x7ff0000000000000));
+            tcg_gen_setcondi_i64(TCG_COND_NE, exponent, exponent, 0);
+            tcg_gen_shli_i64(exponent, exponent, 63);
+            tcg_gen_or_i64(value, value, exponent);
+        }
+        if (mode == IA64_FP_COPY_ABS) {
+            tcg_gen_andi_i64(value, value,
+                             UINT64_C(0x7fffffff7fffffff));
+        } else if (mode == IA64_FP_COPY_NEG) {
+            tcg_gen_xori_i64(value, value,
+                             UINT64_C(0x8000000080000000));
+        } else {
+            tcg_gen_ori_i64(value, value,
+                            UINT64_C(0x8000000080000000));
+        }
         break;
     default:
         g_assert_not_reached();
     }
-    ia64_gen_fr_mov(op->destination, value);
+    if (mode == IA64_FP_COPY) {
+        ia64_gen_fr_mov(op->destination, value);
+    } else {
+        ia64_gen_fr_mov_sig(op->destination, value);
+    }
     if (op->source1 <= 1) {
         return;
     }
@@ -94,176 +122,80 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
     gen_set_label(done);
 }
 
-static void ia64_gen_fp_write_sig_or_nat(const Ia64Instruction *insn,
-                                         TCGv_i64 value)
-{
-    const IA64FloatingOperands *op = &insn->operands.floating;
-    TCGv_i64 nat;
-    TCGLabel *write_nat;
-    TCGLabel *done;
-
-    if (op->destination <= 1) {
-        return;
-    }
-
-    if (op->source1 <= 1 && op->source2 <= 1) {
-        ia64_gen_fr_mov_sig(op->destination, value);
-        return;
-    }
-
-    write_nat = gen_new_label();
-    done = gen_new_label();
-    if (op->source1 <= 1) {
-        nat = ia64_gen_fr_nat_read(op->source2);
-    } else if (op->source2 <= 1) {
-        nat = ia64_gen_fr_nat_read(op->source1);
-    } else {
-        nat = tcg_temp_new_i64();
-        tcg_gen_or_i64(nat, ia64_gen_fr_nat_read(op->source1),
-                       ia64_gen_fr_nat_read(op->source2));
-    }
-    tcg_gen_brcondi_i64(TCG_COND_NE, nat, 0, write_nat);
-    ia64_gen_fr_mov_sig(op->destination, value);
-    tcg_gen_br(done);
-    gen_set_label(write_nat);
-    ia64_gen_fr_set_nat(op->destination);
-    gen_set_label(done);
-}
-
 static void ia64_gen_fp_logical(const Ia64Instruction *insn, uint32_t mode)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    TCGv_i64 result;
 
-    if (op->destination <= 1) {
-        return;
-    }
-    result = tcg_temp_new_i64();
+    /* Helpers read the architected significand for every FR representation. */
     switch (mode) {
     case 0:
-        tcg_gen_and_i64(result, ia64_fr_binary_src(op->source1),
-                        ia64_fr_binary_src(op->source2));
+        gen_helper_flogical_and(tcg_env,
+                                tcg_constant_i32(op->destination),
+                                tcg_constant_i32(op->source1),
+                                tcg_constant_i32(op->source2));
         break;
     case 1:
-        tcg_gen_andc_i64(result, ia64_fr_binary_src(op->source1),
-                         ia64_fr_binary_src(op->source2));
+        gen_helper_flogical_andcm(tcg_env,
+                                  tcg_constant_i32(op->destination),
+                                  tcg_constant_i32(op->source1),
+                                  tcg_constant_i32(op->source2));
         break;
     case 2:
-        tcg_gen_or_i64(result, ia64_fr_binary_src(op->source1),
-                       ia64_fr_binary_src(op->source2));
+        gen_helper_flogical_or(tcg_env,
+                               tcg_constant_i32(op->destination),
+                               tcg_constant_i32(op->source1),
+                               tcg_constant_i32(op->source2));
         break;
     case 3:
-        tcg_gen_xor_i64(result, ia64_fr_binary_src(op->source1),
-                        ia64_fr_binary_src(op->source2));
+        gen_helper_flogical_xor(tcg_env,
+                                tcg_constant_i32(op->destination),
+                                tcg_constant_i32(op->source1),
+                                tcg_constant_i32(op->source2));
         break;
     default:
         g_assert_not_reached();
     }
-    ia64_gen_fp_write_sig_or_nat(insn, result);
 }
 
 static void ia64_gen_fp_swap(const Ia64Instruction *insn, uint32_t form)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    TCGv_i64 result;
-    TCGv_i64 low;
 
-    if (op->destination <= 1) {
-        return;
-    }
-    result = tcg_temp_new_i64();
-    low = tcg_temp_new_i64();
-    tcg_gen_shli_i64(result, ia64_fr_binary_src(op->source2), 32);
-    tcg_gen_shri_i64(low, ia64_fr_binary_src(op->source1), 32);
-    tcg_gen_or_i64(result, result, low);
-    if (form == 1) {
-        tcg_gen_xori_i64(result, result, UINT64_C(1) << 63);
-    } else if (form == 2) {
-        tcg_gen_xori_i64(result, result, UINT64_C(1) << 31);
-    }
-    ia64_gen_fp_write_sig_or_nat(insn, result);
+    gen_helper_fswap(tcg_env, tcg_constant_i32(op->destination),
+                     tcg_constant_i32(op->source1),
+                     tcg_constant_i32(op->source2),
+                     tcg_constant_i32(form));
 }
 
 static void ia64_gen_fp_mix(const Ia64Instruction *insn, uint32_t form)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    const uint64_t high_mask = UINT64_C(0xffffffff00000000);
-    TCGv_i64 result;
-    TCGv_i64 low;
 
-    if (op->destination <= 1) {
-        return;
-    }
-    result = tcg_temp_new_i64();
-    low = tcg_temp_new_i64();
-    if (form == 1) {
-        tcg_gen_shli_i64(result, ia64_fr_binary_src(op->source1), 32);
-        tcg_gen_andi_i64(low, ia64_fr_binary_src(op->source2),
-                         UINT32_MAX);
-    } else {
-        tcg_gen_andi_i64(result, ia64_fr_binary_src(op->source1),
-                         high_mask);
-        if (form == 2) {
-            tcg_gen_shri_i64(low, ia64_fr_binary_src(op->source2), 32);
-        } else {
-            tcg_gen_andi_i64(low, ia64_fr_binary_src(op->source2),
-                             UINT32_MAX);
-        }
-    }
-    tcg_gen_or_i64(result, result, low);
-    ia64_gen_fp_write_sig_or_nat(insn, result);
+    gen_helper_fmix(tcg_env, tcg_constant_i32(op->destination),
+                    tcg_constant_i32(op->source1),
+                    tcg_constant_i32(op->source2),
+                    tcg_constant_i32(form));
 }
 
 static void ia64_gen_fp_sxt(const Ia64Instruction *insn, uint32_t form)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    TCGv_i64 result;
-    TCGv_i64 low;
 
-    if (op->destination <= 1) {
-        return;
-    }
-    result = tcg_temp_new_i64();
-    low = tcg_temp_new_i64();
-    if (form == 1) {
-        tcg_gen_sari_i64(result, ia64_fr_binary_src(op->source1), 63);
-        tcg_gen_andi_i64(result, result, UINT64_C(0xffffffff00000000));
-        tcg_gen_shri_i64(low, ia64_fr_binary_src(op->source2), 32);
-    } else {
-        tcg_gen_ext32s_i64(result, ia64_fr_binary_src(op->source1));
-        tcg_gen_andi_i64(result, result, UINT64_C(0xffffffff00000000));
-        tcg_gen_andi_i64(low, ia64_fr_binary_src(op->source2), UINT32_MAX);
-    }
-    tcg_gen_or_i64(result, result, low);
-    ia64_gen_fp_write_sig_or_nat(insn, result);
+    gen_helper_fsxt(tcg_env, tcg_constant_i32(op->destination),
+                    tcg_constant_i32(op->source1),
+                    tcg_constant_i32(op->source2),
+                    tcg_constant_i32(form));
 }
 
 static void ia64_gen_fp_parallel_merge(const Ia64Instruction *insn,
                                        uint32_t form)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    uint64_t left_mask;
-    TCGv_i64 left;
-    TCGv_i64 right;
-    TCGv_i64 result;
 
-    if (op->destination <= 1) {
-        return;
-    }
-    left_mask = form == 2 ? UINT64_C(0xff800000ff800000) :
-                            UINT64_C(0x8000000080000000);
-    left = tcg_temp_new_i64();
-    right = tcg_temp_new_i64();
-    result = tcg_temp_new_i64();
-    if (form == 0) {
-        tcg_gen_not_i64(left, ia64_fr_binary_src(op->source1));
-        tcg_gen_andi_i64(left, left, left_mask);
-    } else {
-        tcg_gen_andi_i64(left, ia64_fr_binary_src(op->source1), left_mask);
-    }
-    tcg_gen_andi_i64(right, ia64_fr_binary_src(op->source2), ~left_mask);
-    tcg_gen_or_i64(result, left, right);
-    ia64_gen_fp_write_sig_or_nat(insn, result);
+    gen_helper_fpmerge(tcg_env, tcg_constant_i32(op->destination),
+                       tcg_constant_i32(op->source1),
+                       tcg_constant_i32(op->source2),
+                       tcg_constant_i32(form));
 }
 
 static void ia64_gen_fmerge_helper(const IA64FloatingOperands *op,

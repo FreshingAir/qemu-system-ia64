@@ -241,6 +241,25 @@ if 'ia64-softmmu' in target_dirs
        timeout: 30,
        suite: ['unit', 'ia64'])
 
+  ia64_rse_migration_test = executable(
+    'test-ia64-rse-migration',
+    [
+      'test-ia64-rse-migration.c',
+      meson.project_source_root() / 'target/ia64/rse-migration.c',
+    ],
+    c_args: [
+      '-DCOMPILING_PER_TARGET',
+      '-DCONFIG_TARGET="ia64-softmmu-config-target.h"',
+      '-DCONFIG_DEVICES="ia64-softmmu-config-devices.h"',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-rse-migration', ia64_rse_migration_test,
+       protocol: 'tap',
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
   ia64_simd_test = executable(
     'test-ia64-simd',
     [

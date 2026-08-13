@@ -20,6 +20,21 @@ typedef enum Ia64PredicateUpdate {
 } Ia64PredicateUpdate;
 
 /*
+ * The opcode tables distinguish architecturally reserved encodings from
+ * encodings which fault only when their qualifying predicate is true.
+ * Keep that distinction in the decoded instruction instead of collapsing
+ * both cases into an unqualified IA64_OP_ILLEGAL.
+ */
+typedef enum Ia64EncodingClass {
+    IA64_ENCODING_DEFINED,
+    IA64_ENCODING_IGNORED,
+    IA64_ENCODING_RESERVED,
+    IA64_ENCODING_RESERVED_IF_QP,
+    IA64_ENCODING_RESERVED_IF_QP_B,
+    IA64_ENCODING_CONSTANT_ZERO_VIOLATION,
+} Ia64EncodingClass;
+
+/*
  * All views below describe the decoder's canonical operand slots.  Keeping
  * the raw decoder spelling in its own view makes it impossible for an
  * instruction generator to accidentally depend on encoding-oriented r1/r2
@@ -172,6 +187,7 @@ typedef struct Ia64Instruction {
     uint8_t slot;
     uint8_t qp;
     IA64Operands operands;
+    Ia64EncodingClass encoding_class;
     Ia64PredicateUpdate pred_update;
     bool hint_m_reg_increment;
     bool reg_base_update;

@@ -11,6 +11,7 @@
 #include "exec-access.h"
 #include "fpreg.h"
 #include "hw/ia64/ia64_vpc_abi.h"
+#include "qemu/atomic.h"
 
 #define FW_BOOT_NONSTANDARD_DIRECT_BASE 0x0000000080000000ULL
 #define FW_BOOT_NONSTANDARD_DIRECT_RR \
@@ -350,6 +351,11 @@ static void ia64_fw_debug_save_rse(CPUIA64State *env)
     state->cfm_rrb_fr = env->cfm_rrb_fr;
     state->cfm_rrb_pr = env->cfm_rrb_pr;
     state->cfle = env->rse.rse_cfle;
+    state->completion_pending = env->rse.rse_completion_pending;
+    state->completion_demoted = env->rse.rse_completion_demoted;
+    state->completion_psr = env->rse.rse_completion_psr;
+    state->completion_source_ip = env->rse.rse_completion_source_ip;
+    state->completion_source_slot = env->rse.rse_completion_source_slot;
     debug->rse_valid = true;
 }
 
@@ -387,6 +393,11 @@ static void ia64_fw_debug_restore_rse(CPUIA64State *env)
     ia64_set_cfm_rrb_fr(env, state->cfm_rrb_fr);
     ia64_set_cfm_rrb_pr(env, state->cfm_rrb_pr);
     env->rse.rse_cfle = state->cfle;
+    env->rse.rse_completion_pending = state->completion_pending;
+    env->rse.rse_completion_demoted = state->completion_demoted;
+    env->rse.rse_completion_psr = state->completion_psr;
+    env->rse.rse_completion_source_ip = state->completion_source_ip;
+    env->rse.rse_completion_source_slot = state->completion_source_slot;
 }
 
 uint32_t ia64_firmware_debug_save(CPUIA64State *env)
@@ -672,14 +683,29 @@ static bool ia64_debug_read_code(CPUState *cs, uint64_t addr, void *buf,
 }
 
 static bool ia64_firmware_data_access(CPUIA64State *env, uint64_t addr,
-                                      void *buf, size_t size, bool is_write)
+                                      void *buf, size_t size, bool is_write,
+                                      bool ordered)
 {
     uint64_t pa;
 
     if (!ia64_translate_data_access(env, addr, is_write, &pa)) {
         return false;
     }
-    return ia64_exec_physical_rw(pa, buf, size, is_write);
+    /*
+     * Match the one-way barriers emitted by the translated memory path.
+     * Translation and all fault qualification must precede a release, while
+     * an acquire takes effect only after the load has completed successfully.
+     */
+    if (ordered && is_write) {
+        smp_mb_release();
+    }
+    if (!ia64_exec_physical_rw(pa, buf, size, is_write)) {
+        return false;
+    }
+    if (ordered && !is_write) {
+        smp_mb_acquire();
+    }
+    return true;
 }
 
 static void ia64_resume_after_instruction(CPUIA64State *env, uint64_t ip,
@@ -692,6 +718,31 @@ static void ia64_resume_after_instruction(CPUIA64State *env, uint64_t ip,
         env->ip = ip;
         env->psr |= (uint64_t)(slot + 1) << IA64_PSR_RI_SHIFT;
     }
+}
+
+static void ia64_firmware_complete_instruction(CPUIA64State *env,
+                                               uint64_t source_ip,
+                                               uint8_t source_slot,
+                                               bool group_start)
+{
+    uint8_t target_slot =
+        (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT;
+
+    /*
+     * The translated instruction exited on its Unaligned fault, so none of
+     * the ordinary successful-retirement bookkeeping was emitted.  Once the
+     * firmware assist has completed it, perform that bookkeeping before any
+     * completion trap exactly as the translated path would.
+     */
+    if (env->psr & IA64_PSR_IC) {
+        env->last_successful_bundle = ia64_ip_bundle_addr(source_ip);
+    }
+    ia64_system_clear_psr_fault_suppression(env);
+    env->instruction_group_start = group_start;
+    env->exception_state.exception = IA64_EXCP_NONE;
+    ia64_check_native_traps(
+        env, env->ip, source_ip,
+        IA64_NATIVE_TRAP_SLOTS(target_slot, source_slot), 0, 0, env->psr);
 }
 
 static void ia64_gr_nat_clear_runtime(CPUIA64State *env, uint8_t reg)
@@ -727,24 +778,41 @@ static void ia64_gr_nat_set_runtime(CPUIA64State *env, uint8_t reg, bool nat)
     ia64_rse_mark_gr_dirty(env, reg);
 }
 
-static void ia64_unaligned_base_update(CPUIA64State *env,
-                                       const Ia64Instruction *insn,
-                                       uint64_t addr)
+typedef struct Ia64UnalignedBaseUpdate {
+    uint64_t increment;
+    bool base_nat;
+    bool increment_nat;
+} Ia64UnalignedBaseUpdate;
+
+static Ia64UnalignedBaseUpdate
+ia64_unaligned_base_update_snapshot(CPUIA64State *env,
+                                    const Ia64Instruction *insn)
+{
+    Ia64UnalignedBaseUpdate update = { 0 };
+
+    if (insn->reg_base_update) {
+        update.increment = env->gr[insn->operands.common.source1];
+        update.base_nat = ia64_gr_nat_get_runtime(
+            env, insn->operands.common.source2);
+        update.increment_nat = ia64_gr_nat_get_runtime(
+            env, insn->operands.common.source1);
+    }
+    return update;
+}
+
+static void ia64_unaligned_base_update(
+    CPUIA64State *env, const Ia64Instruction *insn, uint64_t addr,
+    const Ia64UnalignedBaseUpdate *update)
 {
     if (insn->operands.common.source2 == IA64_GR_ZERO) {
         return;
     }
 
     if (insn->reg_base_update) {
-        bool base_nat = ia64_gr_nat_get_runtime(
-            env, insn->operands.common.source2);
-        bool inc_nat = ia64_gr_nat_get_runtime(
-            env, insn->operands.common.source1);
-
         env->gr[insn->operands.common.source2] =
-            addr + env->gr[insn->operands.common.source1];
+            addr + update->increment;
         ia64_gr_nat_set_runtime(env, insn->operands.common.source2,
-                                base_nat || inc_nat);
+                                update->base_nat || update->increment_nat);
     } else if (insn->imm_base_update) {
         env->gr[insn->operands.common.source2] =
             addr + insn->operands.common.immediate;
@@ -848,6 +916,9 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
         bool check_load_clear = ia64_opcode_is_check_load_clear(insn.opcode);
         bool check_load_no_clear =
             ia64_opcode_is_check_load_no_clear(insn.opcode);
+        Ia64UnalignedBaseUpdate base_update =
+            ia64_unaligned_base_update_snapshot(env, &insn);
+        uint64_t alat_generation = 0;
 
         memop = ia64_runtime_data_memop(
             env, ia64_memop_for_opcode(insn.opcode));
@@ -862,10 +933,12 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
             (env->cr_isr & IA64_ISR_SP) &&
             (env->cr_isr & IA64_ISR_ED)) {
             ia64_firmware_defer_speculative_load(env, &insn);
-            ia64_unaligned_base_update(env, &insn, addr);
+            ia64_unaligned_base_update(env, &insn, addr, &base_update);
             ia64_resume_after_instruction(
                 env, env->exception_state.fault_ip, fault_slot);
-            env->exception_state.exception = IA64_EXCP_NONE;
+            ia64_firmware_complete_instruction(
+                env, env->exception_state.fault_ip, fault_slot,
+                template_info->stop_after[fault_slot]);
             return true;
         }
 
@@ -877,10 +950,12 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
         if (ia64_opcode_is_data_speculative_load(insn.opcode)) {
             ia64_alat_invalidate_reg(env,
                                      insn.operands.common.destination);
-            ia64_unaligned_base_update(env, &insn, addr);
+            ia64_unaligned_base_update(env, &insn, addr, &base_update);
             ia64_resume_after_instruction(
                 env, env->exception_state.fault_ip, fault_slot);
-            env->exception_state.exception = IA64_EXCP_NONE;
+            ia64_firmware_complete_instruction(
+                env, env->exception_state.fault_ip, fault_slot,
+                template_info->stop_after[fault_slot]);
             return true;
         }
 
@@ -889,15 +964,25 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
             ia64_alat_check_load_addr(env,
                                       insn.operands.common.destination,
                                       addr, size, check_load_clear)) {
-            ia64_unaligned_base_update(env, &insn, addr);
+            /* ld.c.clr.acq orders the ALAT lookup even on an ALAT hit. */
+            if (insn.mem_acquire) {
+                smp_mb_acquire();
+            }
+            ia64_unaligned_base_update(env, &insn, addr, &base_update);
             ia64_resume_after_instruction(
                 env, env->exception_state.fault_ip, fault_slot);
-            env->exception_state.exception = IA64_EXCP_NONE;
+            ia64_firmware_complete_instruction(
+                env, env->exception_state.fault_ip, fault_slot,
+                template_info->stop_after[fault_slot]);
             return true;
         }
 
+        if (check_load_no_clear && env->alat_state.alat_full) {
+            alat_generation = ia64_alat_load_begin(env);
+        }
         if (size > sizeof(data) ||
-            !ia64_firmware_data_access(env, addr, data, size, false)) {
+            !ia64_firmware_data_access(env, addr, data, size, false,
+                                       insn.mem_acquire)) {
             return false;
         }
         if (insn.operands.common.destination != IA64_GR_ZERO) {
@@ -915,20 +1000,28 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
             } else {
                 ia64_gr_nat_clear_runtime(
                     env, insn.operands.common.destination);
-                if (check_load_no_clear && env->alat_state.alat_full) {
+                if (check_load_no_clear && env->alat_state.alat_full &&
+                    ia64_exec_advanced_load_allowed(
+                        env, addr, ia64_exec_mmu_index(env, false))) {
                     ia64_alat_set(env, insn.operands.common.destination,
-                                  addr, size);
+                                  addr, size, alat_generation);
                 }
             }
         }
-        ia64_unaligned_base_update(env, &insn, addr);
+        ia64_unaligned_base_update(env, &insn, addr, &base_update);
         ia64_resume_after_instruction(env, env->exception_state.fault_ip,
                                       fault_slot);
-        env->exception_state.exception = IA64_EXCP_NONE;
+        ia64_firmware_complete_instruction(
+            env, env->exception_state.fault_ip, fault_slot,
+            template_info->stop_after[fault_slot]);
         return true;
     }
 
     if (ia64_opcode_has_firmware_unaligned_store_assist(insn.opcode)) {
+        Ia64UnalignedBaseUpdate base_update =
+            ia64_unaligned_base_update_snapshot(env, &insn);
+        uint64_t value = env->gr[insn.operands.common.source1];
+
         memop = ia64_runtime_data_memop(
             env, ia64_memop_for_opcode(insn.opcode));
         size = ia64_memop_size(memop);
@@ -939,8 +1032,13 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
             return false;
         }
 
-        stm_p(data, memop, env->gr[insn.operands.common.source1]);
-        if (!ia64_firmware_data_access(env, addr, data, size, true)) {
+        if (insn.opcode == IA64_OP_ST8SPILL &&
+            ia64_gr_nat_get(env, insn.operands.common.source1)) {
+            value = 0;
+        }
+        stm_p(data, memop, value);
+        if (!ia64_firmware_data_access(env, addr, data, size, true,
+                                       insn.mem_release)) {
             return false;
         }
         if (env->alat_state.alat_full) {
@@ -950,10 +1048,12 @@ bool ia64_try_emulate_firmware_unaligned(CPUState *cs,
             ia64_system_st_spill_unat(env,
                                       insn.operands.common.source1, addr);
         }
-        ia64_unaligned_base_update(env, &insn, addr);
+        ia64_unaligned_base_update(env, &insn, addr, &base_update);
         ia64_resume_after_instruction(env, env->exception_state.fault_ip,
                                       fault_slot);
-        env->exception_state.exception = IA64_EXCP_NONE;
+        ia64_firmware_complete_instruction(
+            env, env->exception_state.fault_ip, fault_slot,
+            template_info->stop_after[fault_slot]);
         return true;
     }
 

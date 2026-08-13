@@ -72,6 +72,7 @@ pal_proc_entry:
     .equ SAL_PSR_DT,                        (1 << 17)
     .equ SAL_PSR_RT,                        (1 << 27)
     .equ SAL_PSR_IT,                        (1 << 36)
+    .equ SAL_PSR_BN,                        (1 << 44)
     .equ SAL_PSR_TRANSLATION_MASK,          (SAL_PSR_DT | SAL_PSR_RT | SAL_PSR_IT)
     .equ SAL_PSR_PHYSICAL_ENTRY_CLEAR,      (SAL_PSR_I | SAL_PSR_IC | SAL_PSR_TRANSLATION_MASK)
     .equ SAL_RUNTIME_AREA_SHIFT,            15
@@ -120,6 +121,16 @@ sal_proc_entry:
     mov r23 = r1
     mov r24 = r12
     mov r25 = psr
+    ;;
+
+    /*
+     * mov-from-PSR exposes only PSR{36:35} and PSR{31:0}; PSR.bn reads as
+     * zero.  The SAL calling convention requires bank 1 on entry and exit,
+     * so restore that architecturally implicit bit before either RFI.
+     */
+    movl r31 = SAL_PSR_BN
+    ;;
+    or r25 = r25, r31
     ;;
 sal_proc_capture_ip:
     /*

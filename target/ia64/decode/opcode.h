@@ -222,6 +222,7 @@ typedef enum Ia64Opcode {
     IA64_OP_THASH,
     IA64_OP_TTAG,
     IA64_OP_FC,
+    IA64_OP_FC_I,
     IA64_OP_INVALA,
     IA64_OP_BR_WEXIT,
     IA64_OP_BR_WTOP,
@@ -269,6 +270,7 @@ typedef enum Ia64Opcode {
     IA64_OP_MPYUH,
     IA64_OP_HINT_M,
     IA64_OP_LFETCH,
+    IA64_OP_LFETCH_COUNT,
     IA64_OP_LFETCH_FAULT,
     IA64_OP_HINT_I,
     IA64_OP_HINT_B,
@@ -336,6 +338,7 @@ typedef enum Ia64Opcode {
     IA64_OP_MOV_CPUID,
     IA64_OP_MOV_CPUID_INDEXED,
     IA64_OP_MOV_DAHRGR_INDEXED,
+    IA64_OP_MOV_DAHR_IMM,
     IA64_OP_MOV_MSRGR,
     IA64_OP_MOV_GRMSR,
     IA64_OP_MOV_IP,
@@ -433,4 +436,3 @@ typedef enum Ia64Opcode {
 } Ia64Opcode;
 
 #endif /* TARGET_IA64_DECODE_OPCODE_H */
-

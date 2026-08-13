@@ -29,6 +29,10 @@ typedef struct IA64ExceptionState {
     bool ia32_trap;
     /* Trap raised by the IA-32 side of an ISA transition boundary. */
     bool ia32_transition_trap;
+    /* Native completion trap: fault_ip is successor, fault_imm is source. */
+    bool native_completion_trap;
+    /* Trap enables/translation mode as observed before the instruction. */
+    uint64_t psr_before_insn;
 
     /* Transient state spanning one serialization/fault-suppression window. */
     bool psr_ic_inflight;
@@ -125,6 +129,20 @@ typedef struct IA64RSEState {
     int32_t rse_invalid;
     bool rse_cfle;
 
+    /* Transient marker for one mandatory RSE backing-store access. */
+    bool rse_access;
+
+    /*
+     * A br.ret has committed and its target frame is being restored.  Keep
+     * the completion-trap conditions across an interrupted mandatory fill;
+     * the trap becomes eligible only after all target-frame loads complete.
+     */
+    bool rse_completion_pending;
+    bool rse_completion_demoted;
+    uint64_t rse_completion_psr;
+    uint64_t rse_completion_source_ip;
+    uint8_t rse_completion_source_slot;
+
     /*
      * Derived spill- and fill-side NaT collection state.
      *
@@ -166,6 +184,8 @@ typedef struct IA64AlatState {
     IA64AlatEntry alat[IA64_ALAT_ENTRIES];
     uint32_t alat_active_count;
     bool alat_full;
+    /* Transient host RAM-write generation observed by this local ALAT. */
+    uint64_t memory_write_generation;
 } IA64AlatState;
 
 typedef struct IA64FPTransactionState {
@@ -183,6 +203,11 @@ typedef struct IA64FPTransactionState {
     uint64_t backup_fr_mask[2];
     uint64_t backup_pr_mask;
     uint64_t backup_psr_mf;
+    /* ISR.fpa for a scalar completing O/U/I trap. */
+    bool trap_fpa;
+    /* Predecoded lane-specific O/U/I/FPA ISR.code for a packed operation. */
+    uint16_t packed_trap_code;
+    bool packed_trap;
     bool active;
 } IA64FPTransactionState;
 

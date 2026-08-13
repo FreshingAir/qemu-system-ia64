@@ -24,7 +24,6 @@
 #define IA64_PTE_AR_MASK  (7ULL << IA64_PTE_AR_SHIFT)
 #define IA64_PTE_RESERVED_MASK ((1ULL << 1) | (3ULL << 50))
 #define IA64_ITIR_RESERVED_MASK (3ULL | (0xffffffffULL << 32))
-#define IA64_L0_CACHE_LINE_SIZE 64ULL
 
 static uint8_t ia64_pte_ar(uint64_t pte)
 {
@@ -227,23 +226,163 @@ bool ia64_data_address_to_phys(CPUIA64State *env, uint64_t va,
     return ia64_data_address_to_phys_attr(env, va, pa, NULL);
 }
 
+typedef enum IA64NonAccessKind {
+    IA64_NON_ACCESS_TPA,
+    IA64_NON_ACCESS_FC,
+} IA64NonAccessKind;
 
-void ia64_mmu_fc(CPUIA64State *env, uint64_t addr)
+static IA64Exception
+ia64_translate_nonaccess(CPUIA64State *env, uint64_t va,
+                         IA64NonAccessKind kind, uint64_t *pa)
 {
-    uint64_t pa;
+    const bool is_tpa = kind == IA64_NON_ACCESS_TPA;
+    const uint8_t access_level = ia64_psr_cpl(env->psr);
+    const IA64TlbEntry *entry;
+    uint32_t rid = ia64_region_rid(env, va);
+    uint8_t perm = 0;
+    uint8_t vhpt_size;
+    bool vhpt_long_format;
+    bool vhpt_enabled;
+    uint64_t pte = 0;
 
-    if ((env->psr & IA64_PSR_DT) ?
-        !ia64_va_is_implemented(env, addr) :
-        !ia64_pa_is_implemented(env, addr)) {
-        ia64_raise_unimplemented_data_address(
-            env, addr, IA64_ISR_R, true, false, ia64_current_code_tlb_ed(env));
+    if (!(env->psr & IA64_PSR_DT)) {
+        /*
+         * fc/fc.i are physical references while data translation is off.
+         * tpa is deliberately different: it still queries the DTLB, but
+         * never invokes the VHPT walker (SDM Vol. 3, tpa).
+         */
+        if (!is_tpa) {
+            if (!ia64_pa_is_implemented(env, va)) {
+                return IA64_EXCP_UNIMPL_DATA_ADDR;
+            }
+            *pa = ia64_physical_address(va);
+            return IA64_EXCP_NONE;
+        }
+        if (!ia64_va_is_implemented(env, va)) {
+            return IA64_EXCP_UNIMPL_DATA_ADDR;
+        }
+    } else {
+        if (!ia64_va_is_implemented(env, va)) {
+            return IA64_EXCP_UNIMPL_DATA_ADDR;
+        }
+
+        /* Preserve the synthetic firmware identity window used at boot. */
+        if (!is_tpa &&
+            ia64_firmware_identity_pa(env->cr_iva, env->ip, env->psr,
+                                      va, pa)) {
+            return IA64_EXCP_NONE;
+        }
     }
 
-    if (ia64_data_address_to_phys(env, addr, &pa)) {
-        uint64_t start = pa & ~(IA64_L0_CACHE_LINE_SIZE - 1);
+    entry = ia64_tlb_find_cached(env, va, rid, false);
+    if (entry) {
+        ia64_tlb_entry_translate(entry, va, access_level, pa, &perm);
+        pte = entry->pte;
+    } else if (env->psr & IA64_PSR_DT) {
+        const IA64TlbEntry *installed_entry = NULL;
 
-        ia64_exec_invalidate_phys_range(env, start,
-                                        IA64_L0_CACHE_LINE_SIZE);
+        if (ia64_vhpt_walk_full(env, va, rid, false, false, access_level,
+                                pa, &perm, &pte, NULL, &installed_entry)) {
+            if (installed_entry) {
+                pte = installed_entry->pte;
+            }
+        } else {
+            if (ia64_data_nested_tlb_active(env)) {
+                return IA64_EXCP_DATA_NESTED_TLB;
+            }
+
+            vhpt_enabled = ia64_vhpt_walker_enabled(
+                env, va, false, false, &vhpt_size, &vhpt_long_format);
+            if (vhpt_enabled &&
+                !ia64_vhpt_entry_accessible(env, va, false, false,
+                                            &env->cr_iha)) {
+                return IA64_EXCP_VHPT_FAULT;
+            }
+            return vhpt_enabled ? IA64_EXCP_DTLB_FAULT :
+                                  IA64_EXCP_ALT_DTLB;
+        }
+    } else {
+        return ia64_data_nested_tlb_active(env) ?
+               IA64_EXCP_DATA_NESTED_TLB : IA64_EXCP_ALT_DTLB;
+    }
+
+    /*
+     * A non-access translation checks only P, NaTPage, and (for fc/fc.i
+     * above PL0) read access rights.  It never checks protection keys,
+     * dirty/access bits, the memory attribute, or data breakpoints.
+     */
+    if (!(pte & IA64_PTE_PRESENT)) {
+        return IA64_EXCP_PAGE_NOT_PRESENT;
+    }
+    if (ia64_pte_ma(pte) == IA64_PTE_MA_NATPAGE) {
+        return IA64_EXCP_NAT_CONSUMPTION;
+    }
+    if (!is_tpa && access_level != 0 && !(perm & IA64_TLB_R)) {
+        return IA64_EXCP_DATA_ACCESS;
+    }
+    return IA64_EXCP_NONE;
+}
+
+static G_NORETURN void
+ia64_raise_nonaccess_exception(CPUIA64State *env, uint64_t va,
+                               IA64NonAccessKind kind, IA64Exception excp)
+{
+    const bool is_fc = kind == IA64_NON_ACCESS_FC;
+    const uint8_t code = is_fc ? 1 : 0;
+    uint64_t isr = IA64_ISR_NA | code | (is_fc ? IA64_ISR_R : 0);
+
+    if (env->psr & IA64_PSR_IC) {
+        env->cr_ifa = va;
+        if (ia64_exception_initializes_iha(excp)) {
+            env->cr_iha = ia64_vhpt_hash_address(env, va);
+        }
+        env->cr_itir = ia64_region_itir(
+            env, excp == IA64_EXCP_VHPT_FAULT ? env->cr_iha : va);
+    }
+    if (excp != IA64_EXCP_DATA_NESTED_TLB) {
+        if (excp == IA64_EXCP_UNIMPL_DATA_ADDR) {
+            isr |= IA64_GENEX_UNIMPL_DATA_ADDR;
+        } else if (excp == IA64_EXCP_NAT_CONSUMPTION) {
+            isr |= IA64_ISR_CODE_NAT_PAGE;
+        }
+        if (excp != IA64_EXCP_NAT_CONSUMPTION &&
+            ia64_current_code_tlb_ed(env)) {
+            isr |= IA64_ISR_ED;
+        }
+        env->cr_isr = isr;
+    }
+
+    ia64_raise_exception(env, excp, ia64_ip_bundle_addr(env->ip), 0,
+                         (env->psr & IA64_PSR_RI_MASK) >>
+                         IA64_PSR_RI_SHIFT);
+}
+
+
+void ia64_mmu_fc(CPUIA64State *env, uint64_t addr,
+                 bool instruction_cache_coherent)
+{
+    uint64_t line_size = ia64_env_cpu_class(env)->fc_line_size;
+    IA64Exception excp;
+    uint64_t pa;
+
+    excp = ia64_translate_nonaccess(env, addr, IA64_NON_ACCESS_FC, &pa);
+    if (excp != IA64_EXCP_NONE) {
+        ia64_raise_nonaccess_exception(env, addr, IA64_NON_ACCESS_FC, excp);
+    }
+
+    /*
+     * Removing a cache line is an architected ALAT collision event.  fc.i is
+     * permitted to remove the line as part of making the I-cache coherent,
+     * and an implementation may conservatively discard an ALAT entry at any
+     * time, so use the same line invalidation for both forms.
+     */
+    ia64_invalidate_alat_phys_range(
+        env, pa & ~(line_size - 1), line_size);
+
+    if (instruction_cache_coherent) {
+        uint64_t start = pa & ~(line_size - 1);
+
+        ia64_exec_invalidate_phys_range(env, start, line_size);
     }
 }
 
@@ -843,6 +982,17 @@ static bool ia64_cache_replaced_tr(CPUIA64State *env, IA64TlbEntry *tlb,
     return true;
 }
 
+static void ia64_mmu_check_virtualization(CPUIA64State *env,
+                                          uint64_t raw,
+                                          uint32_t fault_slot)
+{
+    if (ia64_env_cpu_class(env)->has_virtualization &&
+        (env->psr & IA64_PSR_VM)) {
+        ia64_raise_exception(env, IA64_EXCP_VIRTUALIZATION,
+                             ia64_ip_bundle_addr(env->ip), raw, fault_slot);
+    }
+}
+
 void ia64_mmu_itr_insert(CPUIA64State *env, uint64_t pte, uint64_t slot_reg,
                        uint32_t is_data, uint64_t raw, uint32_t fault_slot)
 {
@@ -892,6 +1042,7 @@ void ia64_mmu_itr_insert(CPUIA64State *env, uint64_t pte, uint64_t slot_reg,
         ia64_raise_unimplemented_data_address(
             env, env->cr_ifa, 0, true, false, ia64_current_code_tlb_ed(env));
     }
+    ia64_mmu_check_virtualization(env, raw, fault_slot);
 
     if ((pte & IA64_PTE_PRESENT) && perm == 0) {
         return;
@@ -954,7 +1105,7 @@ void ia64_mmu_itr_insert(CPUIA64State *env, uint64_t pte, uint64_t slot_reg,
 }
 
 void ia64_mmu_ptr_purge(CPUIA64State *env, uint64_t ifa, uint64_t size_reg,
-                      uint32_t is_data)
+                      uint32_t is_data, uint64_t raw, uint32_t fault_slot)
 {
     IA64TlbEntry *tlb;
     uint64_t ps = ia64_gr_page_size(size_reg);
@@ -966,6 +1117,7 @@ void ia64_mmu_ptr_purge(CPUIA64State *env, uint64_t ifa, uint64_t size_reg,
         ia64_raise_unimplemented_data_address(
             env, ifa, 0, true, false, ia64_current_code_tlb_ed(env));
     }
+    ia64_mmu_check_virtualization(env, raw, fault_slot);
 
     if (is_data) {
         tlb = env->mmu.tlb_data;
@@ -1039,15 +1191,16 @@ static void ia64_ptc_global_source_work(CPUState *cs, run_on_cpu_data data)
 }
 
 void ia64_mmu_ptc_purge(CPUIA64State *env, uint64_t va, uint64_t size_reg,
-                      uint32_t mode)
+                      uint32_t mode, uint64_t raw, uint32_t fault_slot)
 {
     uint32_t rid = ia64_region_rid(env, va);
     uint64_t ps = ia64_gr_page_size(size_reg);
 
-    if (!ia64_va_is_implemented(env, va)) {
+    if (mode != 2 && !ia64_va_is_implemented(env, va)) {
         ia64_raise_unimplemented_data_address(
             env, va, 0, true, false, ia64_current_code_tlb_ed(env));
     }
+    ia64_mmu_check_virtualization(env, raw, fault_slot);
 
     trace_ia64_mmu_purge(env_cpu(env)->cpu_index, "ptc", va, ps, rid, mode);
     if (mode == 1 || mode == 3) {
@@ -1114,97 +1267,14 @@ void ia64_mmu_invalidate_tc(CPUIA64State *env)
 
 uint64_t ia64_mmu_tpa(CPUIA64State *env, uint64_t va)
 {
-    CPUState *cs = env_cpu(env);
     uint64_t pa;
-    uint8_t perm;
-    uint32_t rid = ia64_region_rid(env, va);
     IA64Exception excp;
-    uint8_t vhpt_size;
-    bool vhpt_long_format;
-    bool vhpt_enabled;
-    uint64_t pte;
-    uint32_t key;
-    const IA64TlbEntry *entry;
 
-    if (env->psr & IA64_PSR_DT) {
-        if (!ia64_va_is_implemented(env, va)) {
-            excp = IA64_EXCP_UNIMPL_DATA_ADDR;
-            goto tpa_fault;
-        }
-
-        entry = ia64_tlb_find_cached(env, va, rid, false);
-        if (entry) {
-            ia64_tlb_entry_translate(entry, va, ia64_psr_cpl(env->psr), &pa,
-                                     &perm);
-            excp = ia64_tlb_exception_for_access(env, entry, perm,
-                                                 IA64_TLB_R, false, false,
-                                                 false);
-            if (excp != IA64_EXCP_NONE) {
-                goto tpa_fault;
-            }
-            return pa;
-        }
-        pte = 0;
-        key = 0;
-        if (ia64_vhpt_walk_full(env, va, rid, false, false,
-                                ia64_psr_cpl(env->psr), &pa, &perm, &pte,
-                                &key, &entry)) {
-            excp = entry ?
-                ia64_tlb_exception_for_access(env, entry, perm, IA64_TLB_R,
-                                              false, false, false) :
-                ia64_translation_exception_for_access(env, pte, key, perm,
-                                                      IA64_TLB_R, false,
-                                                      false, false);
-            if (excp != IA64_EXCP_NONE) {
-                goto tpa_fault;
-            }
-            return pa;
-        }
-        vhpt_enabled = ia64_vhpt_walker_enabled(env, va, false, false,
-                                                &vhpt_size,
-                                                &vhpt_long_format);
-        if (ia64_data_nested_tlb_active(env)) {
-            excp = IA64_EXCP_DATA_NESTED_TLB;
-        } else if (!ia64_vhpt_entry_accessible(env, va, false, false,
-                                               &env->cr_iha)) {
-            excp = IA64_EXCP_VHPT_FAULT;
-        } else if (vhpt_enabled) {
-            excp = IA64_EXCP_DTLB_FAULT;
-        } else {
-            excp = IA64_EXCP_ALT_DTLB;
-        }
-    } else {
-        entry = ia64_tlb_find_cached(env, va, rid, false);
-        if (entry) {
-            ia64_tlb_entry_translate(entry, va, ia64_psr_cpl(env->psr),
-                                     &pa, &perm);
-            excp = ia64_tlb_exception_for_access(
-                env, entry, perm, IA64_TLB_R, false, false, false);
-            if (excp != IA64_EXCP_NONE) {
-                goto tpa_fault;
-            }
-            return pa;
-        }
-        excp = IA64_EXCP_ALT_DTLB;
+    excp = ia64_translate_nonaccess(env, va, IA64_NON_ACCESS_TPA, &pa);
+    if (excp != IA64_EXCP_NONE) {
+        ia64_raise_nonaccess_exception(env, va, IA64_NON_ACCESS_TPA, excp);
     }
-
-tpa_fault:
-    if (env->psr & IA64_PSR_IC) {
-        env->cr_ifa = va;
-        if (ia64_exception_initializes_iha(excp)) {
-            env->cr_iha = ia64_vhpt_hash_address(env, va);
-        }
-        env->cr_itir = ia64_region_itir(
-            env, excp == IA64_EXCP_VHPT_FAULT ? env->cr_iha : va);
-    }
-    if (excp != IA64_EXCP_DATA_NESTED_TLB) {
-        env->cr_isr = IA64_ISR_NA;
-        if (excp == IA64_EXCP_UNIMPL_DATA_ADDR) {
-            env->cr_isr |= IA64_GENEX_UNIMPL_DATA_ADDR;
-        }
-    }
-    cs->exception_index = excp;
-    cpu_loop_exit(cs);
+    return pa;
 }
 
 static uint64_t ia64_probe_address(CPUIA64State *env, uint64_t va,
@@ -1266,10 +1336,128 @@ static void ia64_set_data_reference_result(IA64DataReferenceResult *result,
     }
 }
 
+static bool ia64_debug_plm_match(uint64_t control, uint8_t access_level)
+{
+    return control & (1ULL << (56 + (access_level & 3)));
+}
+
+static bool ia64_debug_address_match(uint64_t reference, uint64_t address,
+                                     uint64_t mask)
+{
+    return (reference & mask) == (address & mask);
+}
+
+static bool ia64_instruction_breakpoint_match(CPUIA64State *env,
+                                              uint64_t address,
+                                              uint8_t access_level)
+{
+    const uint64_t fixed_mask = UINT64_C(0xff00000000000000);
+    unsigned pair;
+
+    for (pair = 0; pair < IA64_IBR_IMPLEMENTED_COUNT / 2; pair++) {
+        uint64_t breakpoint = env->ibr[pair * 2];
+        uint64_t control = env->ibr[pair * 2 + 1];
+        uint64_t mask = fixed_mask |
+                        (control & UINT64_C(0x00ffffffffffffff));
+
+        /* Itanium instruction breakpoints describe whole 16-byte bundles. */
+        mask &= ~UINT64_C(0xf);
+        if ((control & (1ULL << 63)) &&
+            ia64_debug_plm_match(control, access_level) &&
+            ia64_debug_address_match(address, breakpoint, mask)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ia64_data_breakpoint_register_match(CPUIA64State *env,
+                                                uint64_t address,
+                                                uint32_t size,
+                                                uint64_t isr_access,
+                                                uint8_t access_level)
+{
+    const uint64_t fixed_mask = UINT64_C(0xff00000000000000);
+    unsigned pair;
+
+    for (pair = 0; pair < IA64_DBR_IMPLEMENTED_COUNT / 2; pair++) {
+        uint64_t breakpoint = env->dbr[pair * 2];
+        uint64_t control = env->dbr[pair * 2 + 1];
+        uint64_t mask = fixed_mask |
+                        (control & UINT64_C(0x00ffffffffffffff));
+        bool access_match =
+            ((isr_access & IA64_ISR_R) && (control & (1ULL << 63))) ||
+            ((isr_access & IA64_ISR_W) && (control & (1ULL << 62)));
+        uint32_t byte;
+
+        if (!access_match || !ia64_debug_plm_match(control, access_level)) {
+            continue;
+        }
+        for (byte = 0; byte < size; byte++) {
+            if (ia64_debug_address_match(address + byte, breakpoint, mask)) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+static bool ia64_data_breakpoint_match(CPUIA64State *env,
+                                       uint64_t address, uint32_t size,
+                                       uint64_t isr_access,
+                                       uint8_t access_level)
+{
+    /*
+     * Itanium 2 reports a Data Debug fault for every memory datum that
+     * crosses a 16-byte boundary while PSR.db enables breakpoints, even
+     * when no programmed DBR address matches.  PSR.db and PSR.dd are
+     * checked by the callers; this helper supplies the model-specific
+     * match condition to both ordinary and speculative references.
+     */
+    if (ia64_env_cpu_class(env)->data_debug_cross_16byte &&
+        (address & 0xf) + size > 16) {
+        return true;
+    }
+
+    return ia64_data_breakpoint_register_match(
+        env, address, size, isr_access, access_level);
+}
+
+static bool ia64_vhpt_data_breakpoint_match(CPUIA64State *env,
+                                            uint64_t address, uint32_t size,
+                                            bool tak_access)
+{
+    /*
+     * A programmed DBR.r match on a VHPT reference aborts the walk to the
+     * original Instruction/Data TLB Miss.  The walker references at PL0;
+     * tak is the architectural exception.  This is deliberately the exact
+     * programmed-register match, not the Madison unaligned-data extension.
+     */
+    return !tak_access && (env->psr & IA64_PSR_DB) &&
+           !(env->psr & IA64_PSR_DD) &&
+           ia64_data_breakpoint_register_match(
+               env, address, size, IA64_ISR_R, 0);
+}
+
+void ia64_check_instruction_debug(CPUIA64State *env, uint64_t address,
+                                  uint8_t slot)
+{
+    if (!(env->psr & IA64_PSR_DB) || (env->psr & IA64_PSR_ID) ||
+        !ia64_instruction_breakpoint_match(
+            env, address, ia64_psr_cpl(env->psr))) {
+        return;
+    }
+
+    env->cr_ifa = address;
+    env->cr_isr = IA64_ISR_X;
+    ia64_raise_exception(env, IA64_EXCP_DEBUG, address, 0, slot);
+}
+
 static IA64Exception
 ia64_data_reference_exception(CPUIA64State *env, uint64_t va,
                               uint32_t is_write, uint32_t is_rw,
                               uint8_t access_level, bool walk_vhpt,
+                              bool is_rse,
                               IA64DataReferenceResult *result)
 {
     uint64_t pa;
@@ -1288,7 +1476,7 @@ ia64_data_reference_exception(CPUIA64State *env, uint64_t va,
     if (result) {
         result->valid = false;
     }
-    if (!(env->psr & IA64_PSR_DT)) {
+    if (!(env->psr & (is_rse ? IA64_PSR_RT : IA64_PSR_DT))) {
         if (!ia64_pa_is_implemented(env, va)) {
             return IA64_EXCP_UNIMPL_DATA_ADDR;
         }
@@ -1317,7 +1505,7 @@ ia64_data_reference_exception(CPUIA64State *env, uint64_t va,
         pte = entry->pte;
         found = true;
     } else if (walk_vhpt) {
-        found = ia64_vhpt_walk_full(env, va, rid, false, false,
+        found = ia64_vhpt_walk_full(env, va, rid, false, is_rse,
                                     access_level, &pa, &perm, &pte, &key,
                                     &entry);
     }
@@ -1332,22 +1520,22 @@ ia64_data_reference_exception(CPUIA64State *env, uint64_t va,
         if (entry) {
             return ia64_tlb_exception_for_access(env, entry, perm, needed,
                                                 false, is_write || is_rw,
-                                                false);
+                                                is_rse);
         }
         return ia64_translation_exception_for_access(env, pte, key, perm,
                                                      needed, false,
                                                      is_write || is_rw,
-                                                     false);
+                                                     is_rse);
     }
     if (ia64_data_nested_tlb_active(env)) {
         return IA64_EXCP_DATA_NESTED_TLB;
     }
-    if (ia64_vhpt_pte_not_present(env, va, false, false, NULL)) {
+    if (ia64_vhpt_pte_not_present(env, va, false, is_rse, NULL)) {
         return IA64_EXCP_PAGE_NOT_PRESENT;
     }
-    vhpt_enabled = ia64_vhpt_walker_enabled(env, va, false, false,
+    vhpt_enabled = ia64_vhpt_walker_enabled(env, va, false, is_rse,
                                             &vhpt_size, &vhpt_long_format);
-    if (!ia64_vhpt_entry_accessible(env, va, false, false, &pa)) {
+    if (!ia64_vhpt_entry_accessible(env, va, false, is_rse, &pa)) {
         return IA64_EXCP_VHPT_FAULT;
     }
 
@@ -1364,7 +1552,8 @@ bool ia64_translate_data_access(CPUIA64State *env, uint64_t va,
         return false;
     }
     excp = ia64_data_reference_exception(
-        env, va, is_write, false, ia64_psr_cpl(env->psr), true, &result);
+        env, va, is_write, false, ia64_psr_cpl(env->psr), true, false,
+        &result);
     if (excp != IA64_EXCP_NONE || !result.valid) {
         return false;
     }
@@ -1389,6 +1578,8 @@ static uint64_t ia64_speculative_deferral_dcr_mask(IA64Exception excp)
         return IA64_DCR_DR;
     case IA64_EXCP_DATA_ACCESS_BIT:
         return IA64_DCR_DA;
+    case IA64_EXCP_DEBUG:
+        return IA64_DCR_DD;
     case IA64_EXCP_UNIMPL_DATA_ADDR:
         return UINT64_MAX;
     default:
@@ -1425,15 +1616,107 @@ static bool ia64_speculative_exception_deferrable(CPUIA64State *env,
            (env->cr_dcr & dcr_mask);
 }
 
-static bool ia64_speculative_alignment_fault(CPUIA64State *env,
-                                             uint64_t va, uint32_t size)
+static bool ia64_crosses_alignment_window(uint64_t va, uint32_t size,
+                                          uint32_t window)
 {
-    if (size <= 1 || (va & (size - 1)) == 0) {
+    return size > 1 && (va & (window - 1U)) + size - 1U >= window;
+}
+
+static bool ia64_alignment_memory_attribute_requires_fault(
+    uint8_t memory_attribute)
+{
+    return memory_attribute == IA64_PTE_MA_UC ||
+           memory_attribute == IA64_PTE_MA_UCE ||
+           memory_attribute == IA64_PTE_MA_WC;
+}
+
+static bool ia64_alignment_fault(CPUIA64State *env, uint64_t va,
+                                 uint32_t alignment_info,
+                                 bool is_write,
+                                 const IA64DataReferenceResult *translation)
+{
+    const IA64CPUClass *icc;
+    uint32_t size = alignment_info & IA64_ALIGNMENT_DATUM_MASK;
+    uint32_t natural = (alignment_info & IA64_ALIGNMENT_NATURAL_MASK) >>
+                       IA64_ALIGNMENT_NATURAL_SHIFT;
+    IA64AlignmentClass alignment_class =
+        (alignment_info & IA64_ALIGNMENT_CLASS_MASK) >>
+        IA64_ALIGNMENT_CLASS_SHIFT;
+    bool naturally_aligned;
+
+    if (size <= 1 || natural <= 1) {
         return false;
     }
+    naturally_aligned = (va & (natural - 1U)) == 0;
+    if (naturally_aligned) {
+        return false;
+    }
+    icc = ia64_env_cpu_class(env);
 
-    return (env->psr & IA64_PSR_AC) ||
-           ((va & 0xfff) + size - 1 > 0xfff);
+    if (!naturally_aligned &&
+        (alignment_class == IA64_ALIGNMENT_NATURAL_REQUIRED ||
+         (env->psr & IA64_PSR_AC))) {
+        return true;
+    }
+
+    switch (naturally_aligned ? IA64_ALIGNMENT_GENERIC : alignment_class) {
+    case IA64_ALIGNMENT_INTEGER:
+        /*
+         * Merced integer references span one 16-byte block.  Madison
+         * narrows that to 8.  Montecito loads retain the 8-byte window,
+         * while its WB stores may span a 16-byte block.
+         */
+        if (ia64_crosses_alignment_window(
+                va, size,
+                icc->model == IA64_CPU_MODEL_MERCED ||
+                (icc->model == IA64_CPU_MODEL_MONTECITO && is_write) ?
+                16U : 8U)) {
+            return true;
+        }
+        break;
+    case IA64_ALIGNMENT_FP:
+        if (icc->model == IA64_CPU_MODEL_MADISON &&
+            ia64_crosses_alignment_window(va, size, 16U)) {
+            return true;
+        }
+        if (icc->model == IA64_CPU_MODEL_MONTECITO &&
+            ia64_crosses_alignment_window(va, size,
+                                          is_write ? 16U : 8U)) {
+            return true;
+        }
+        break;
+    case IA64_ALIGNMENT_FP_PAIR:
+    case IA64_ALIGNMENT_FP_FILL_SPILL:
+        if (icc->model != IA64_CPU_MODEL_MERCED) {
+            return true;
+        }
+        break;
+    case IA64_ALIGNMENT_GENERIC:
+    case IA64_ALIGNMENT_NATURAL_REQUIRED:
+        break;
+    default:
+        /* A malformed internal descriptor must fail safely. */
+        return true;
+    }
+
+    /*
+     * Itanium 2 UC/UCE/WC references may not cross an 8-byte boundary,
+     * even for an unaligned FP operation that a WB page permits within 16
+     * bytes.  An architecturally aligned reference must never raise an
+     * Unaligned Data Reference fault; opcode-specific memory-attribute
+     * restrictions are reported separately as Unsupported Data Reference.
+     */
+    if (!naturally_aligned &&
+        alignment_class != IA64_ALIGNMENT_NATURAL_REQUIRED &&
+        icc->model != IA64_CPU_MODEL_MERCED && translation &&
+        translation->valid && ia64_crosses_alignment_window(va, size, 8U) &&
+        ia64_alignment_memory_attribute_requires_fault(
+            translation->memory_attribute)) {
+        return true;
+    }
+
+    return !naturally_aligned &&
+           ia64_crosses_alignment_window(va, size, 0x1000U);
 }
 
 static void ia64_raise_data_reference_exception_at(CPUIA64State *env,
@@ -1445,6 +1728,7 @@ static void ia64_raise_data_reference_exception_at(CPUIA64State *env,
                                                    IA64Exception excp,
                                                    bool is_speculative,
                                                    bool itlb_ed,
+                                                   bool is_rse,
                                                    uint64_t fault_ip,
                                                    uint8_t fault_slot)
 {
@@ -1462,6 +1746,7 @@ static void ia64_raise_data_reference_exception_at(CPUIA64State *env,
         if (excp == IA64_EXCP_UNIMPL_DATA_ADDR) {
             env->cr_isr = IA64_GENEX_UNIMPL_DATA_ADDR |
                           (is_non_access ? IA64_ISR_NA : 0) |
+                          (is_non_access ? non_access_code : 0) |
                           (is_rw ? (IA64_ISR_R | IA64_ISR_W) :
                            (is_write ? IA64_ISR_W : IA64_ISR_R));
         } else {
@@ -1482,7 +1767,12 @@ static void ia64_raise_data_reference_exception_at(CPUIA64State *env,
         if (is_speculative && excp != IA64_EXCP_NAT_CONSUMPTION) {
             env->cr_isr |= IA64_ISR_SP;
         }
-        if (itlb_ed && excp != IA64_EXCP_NAT_CONSUMPTION) {
+        if (is_rse) {
+            env->cr_isr |= IA64_ISR_RS;
+            if (env->rse.rse_dirty < 0 || env->rse.rse_dirty_nat < 0) {
+                env->cr_isr |= IA64_ISR_IR;
+            }
+        } else if (itlb_ed && excp != IA64_EXCP_NAT_CONSUMPTION) {
             env->cr_isr |= IA64_ISR_ED;
         }
     }
@@ -1506,8 +1796,63 @@ static void ia64_raise_data_reference_exception(CPUIA64State *env,
 {
     ia64_raise_data_reference_exception_at(
         env, va, is_write, is_rw, is_non_access, non_access_code, excp,
-        is_speculative, itlb_ed, ia64_ip_bundle_addr(env->ip),
+        is_speculative, itlb_ed, false, ia64_ip_bundle_addr(env->ip),
         (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT);
+}
+
+static G_NORETURN void
+ia64_raise_data_debug_at(CPUIA64State *env, uint64_t va,
+                         uint64_t isr_access, bool is_speculative,
+                         bool itlb_ed, bool mandatory_rse,
+                         uint64_t fault_ip, uint8_t fault_slot)
+{
+    env->cr_ifa = va;
+    env->cr_isr = isr_access;
+    if (is_speculative) {
+        env->cr_isr |= IA64_ISR_SP;
+    }
+    if (mandatory_rse) {
+        env->cr_isr |= IA64_ISR_RS;
+        if (env->rse.rse_dirty < 0 || env->rse.rse_dirty_nat < 0) {
+            env->cr_isr |= IA64_ISR_IR;
+        }
+    } else if (itlb_ed) {
+        env->cr_isr |= IA64_ISR_ED;
+    }
+    ia64_raise_exception(env, IA64_EXCP_DEBUG, fault_ip, 0, fault_slot);
+}
+
+void ia64_mmu_check_data_debug(CPUIA64State *env, uint64_t va,
+                               uint32_t size, uint64_t isr_access,
+                               uint8_t access_level, bool mandatory_rse,
+                               uint64_t fault_ip, uint8_t fault_slot)
+{
+    bool is_write;
+    bool is_rw;
+    IA64Exception excp;
+
+    if (!(env->psr & IA64_PSR_DB) || (env->psr & IA64_PSR_DD) ||
+        !ia64_data_breakpoint_match(env, va, size, isr_access,
+                                    access_level)) {
+        return;
+    }
+
+    is_write = isr_access & IA64_ISR_W;
+    is_rw = (isr_access & (IA64_ISR_R | IA64_ISR_W)) ==
+            (IA64_ISR_R | IA64_ISR_W);
+    excp = ia64_data_reference_exception(
+        env, va, is_write, is_rw, access_level, true, mandatory_rse, NULL);
+    if (excp != IA64_EXCP_NONE) {
+        ia64_raise_data_reference_exception_at(
+            env, va, is_write, is_rw, isr_access & IA64_ISR_NA,
+            isr_access & IA64_ISR_CODE_MASK, excp, false,
+            ia64_current_code_tlb_ed(env), mandatory_rse,
+            fault_ip, fault_slot);
+    }
+
+    ia64_raise_data_debug_at(env, va, isr_access, false,
+                             ia64_current_code_tlb_ed(env), mandatory_rse,
+                             fault_ip, fault_slot);
 }
 
 static uint8_t ia64_probe_access_level(CPUIA64State *env,
@@ -1618,7 +1963,7 @@ uint64_t ia64_mmu_probe(CPUIA64State *env, uint64_t va, uint32_t is_write,
     }
 
     excp = ia64_data_reference_exception(env, va, is_write, false,
-                                         effective_pl, true, NULL);
+                                         effective_pl, true, false, NULL);
     return ia64_probe_grant(env, va, is_write, excp);
 }
 
@@ -1631,7 +1976,7 @@ static void ia64_raise_data_reference_fault_if_needed(CPUIA64State *env,
                                                       uint8_t non_access_code)
 {
     IA64Exception excp = ia64_data_reference_exception(
-        env, va, is_write, is_rw, access_level, true, NULL);
+        env, va, is_write, is_rw, access_level, true, false, NULL);
 
     if (excp == IA64_EXCP_NONE) {
         return;
@@ -1650,44 +1995,56 @@ void ia64_raise_pre_unaligned_data_fault(CPUIA64State *env,
                                                 uint8_t fault_slot)
 {
     IA64Exception excp = ia64_data_reference_exception(
-        env, va, is_write, is_rw, ia64_psr_cpl(env->psr), true, NULL);
+        env, va, is_write, is_rw, ia64_psr_cpl(env->psr), true, false,
+        NULL);
 
     if (excp == IA64_EXCP_NONE) {
         return;
     }
     ia64_raise_data_reference_exception_at(
         env, va, is_write, is_rw, false, 0, excp, false,
-        ia64_current_code_tlb_ed(env), fault_ip, fault_slot);
+        ia64_current_code_tlb_ed(env), false, fault_ip, fault_slot);
 }
 
 void ia64_mmu_probe_fault(CPUIA64State *env, uint64_t va, uint32_t is_write,
                         uint32_t is_rw, uint64_t access_level)
 {
     uint8_t effective_pl = ia64_probe_access_level(env, access_level);
+    uint64_t isr_access = IA64_ISR_NA | 5 |
+        (is_rw ? (IA64_ISR_R | IA64_ISR_W) :
+         (is_write ? IA64_ISR_W : IA64_ISR_R));
 
     ia64_raise_data_reference_fault_if_needed(env, va, is_write, is_rw,
                                               effective_pl, true, 5);
+    ia64_mmu_check_data_debug(
+        env, va, 1, isr_access, effective_pl, false,
+        ia64_ip_bundle_addr(env->ip),
+        (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT);
 }
 
 void ia64_mmu_lfetch_fault(CPUIA64State *env, uint64_t va,
                          uint64_t fault_ip, uint32_t fault_slot)
 {
     IA64Exception excp = ia64_data_reference_exception(
-        env, va, false, false, ia64_psr_cpl(env->psr), true, NULL);
+        env, va, false, false, ia64_psr_cpl(env->psr), true, false, NULL);
 
     if (excp == IA64_EXCP_NONE) {
+        ia64_mmu_check_data_debug(
+            env, va, 1, IA64_ISR_NA | IA64_ISR_R | 4,
+            ia64_psr_cpl(env->psr), false, fault_ip, fault_slot);
         return;
     }
     ia64_raise_data_reference_exception_at(
         env, va, false, false, true, 4, excp, false,
-        ia64_current_code_tlb_ed(env), fault_ip, fault_slot);
+        ia64_current_code_tlb_ed(env), false, fault_ip, fault_slot);
 }
 
 void ia64_mmu_check_semaphore_access(CPUIA64State *env, uint64_t va)
 {
     IA64DataReferenceResult translation = { 0 };
     IA64Exception excp = ia64_data_reference_exception(
-        env, va, true, true, ia64_psr_cpl(env->psr), true, &translation);
+        env, va, true, true, ia64_psr_cpl(env->psr), true, false,
+        &translation);
 
     /* A NaTPage translation already reports NaT Page Consumption here. */
     if (excp != IA64_EXCP_NONE) {
@@ -1714,7 +2071,7 @@ void ia64_mmu_check_montecito_16byte_access(CPUIA64State *env, uint64_t va,
     }
 
     excp = ia64_data_reference_exception(
-        env, va, is_write, false, ia64_psr_cpl(env->psr), true,
+        env, va, is_write, false, ia64_psr_cpl(env->psr), true, false,
         &translation);
     /* A NaTPage translation already reports NaT Page Consumption here. */
     if (excp != IA64_EXCP_NONE) {
@@ -1730,22 +2087,81 @@ void ia64_mmu_check_montecito_16byte_access(CPUIA64State *env, uint64_t va,
     }
 }
 
+void ia64_mmu_check_alignment(CPUIA64State *env, uint64_t va,
+                              uint32_t alignment_info,
+                              uint64_t isr_access, uint64_t fault_info)
+{
+    IA64DataReferenceResult translation = { 0 };
+    uint32_t size = alignment_info & IA64_ALIGNMENT_DATUM_MASK;
+    uint32_t natural = (alignment_info & IA64_ALIGNMENT_NATURAL_MASK) >>
+                       IA64_ALIGNMENT_NATURAL_SHIFT;
+    IA64AlignmentClass alignment_class =
+        (alignment_info & IA64_ALIGNMENT_CLASS_MASK) >>
+        IA64_ALIGNMENT_CLASS_SHIFT;
+    bool attribute_may_fault;
+
+    if (size <= 1 || natural <= 1) {
+        return;
+    }
+
+    attribute_may_fault =
+        (va & (natural - 1U)) != 0 &&
+        alignment_class != IA64_ALIGNMENT_NATURAL_REQUIRED &&
+        ia64_env_cpu_class(env)->model != IA64_CPU_MODEL_MERCED &&
+        ia64_crosses_alignment_window(va, size, 8U);
+    if ((va & (natural - 1U)) == 0 && !attribute_may_fault) {
+        return;
+    }
+
+    if (!ia64_alignment_fault(env, va, alignment_info,
+                              (isr_access & IA64_ISR_W) != 0, NULL) &&
+        attribute_may_fault) {
+        /*
+         * The memory attribute only matters for an otherwise-permitted
+         * Itanium 2 FP reference.  A concurrent translation/PTE condition
+         * is intentionally left for ia64_raise_unaligned() to re-evaluate
+         * at its higher architectural priority.
+         */
+        ia64_data_reference_exception(
+            env, va, (isr_access & IA64_ISR_W) != 0,
+            (isr_access & (IA64_ISR_R | IA64_ISR_W)) ==
+                (IA64_ISR_R | IA64_ISR_W),
+            ia64_psr_cpl(env->psr), true, false, &translation);
+    }
+
+    if (ia64_alignment_fault(env, va, alignment_info,
+                             (isr_access & IA64_ISR_W) != 0,
+                             &translation)) {
+        ia64_raise_unaligned(env, va, isr_access, fault_info);
+    }
+}
+
 uint64_t ia64_mmu_speculative_probe(CPUIA64State *env, uint64_t va,
                                   uint32_t is_write, uint32_t is_ifetch,
-                                  uint32_t size)
+                                  uint32_t debug_size,
+                                  uint32_t alignment_info)
 {
-    bool alignment_fault;
-    bool itlb_ed;
+    uint32_t datum_size = alignment_info & IA64_ALIGNMENT_DATUM_MASK;
+    uint32_t natural = (alignment_info & IA64_ALIGNMENT_NATURAL_MASK) >>
+                       IA64_ALIGNMENT_NATURAL_SHIFT;
+    bool alignment_fault = false;
+    bool debug_fault = false;
+    bool itlb_ed = false;
     IA64Exception excp;
-    IA64DataReferenceResult translation;
+    IA64DataReferenceResult translation = { 0 };
 
     if (env->psr & IA64_PSR_ED) {
         return 0;
     }
 
-    itlb_ed = ia64_current_code_tlb_ed(env);
-    alignment_fault = ia64_speculative_alignment_fault(env, va, size);
+    if (debug_size > datum_size && natural > 1 &&
+        (va & (natural - 1U)) != 0) {
+        /* See the aligned-versus-unaligned FP DBR rule in Vol. 2, 7.1.2. */
+        debug_size = datum_size;
+    }
     if (is_ifetch) {
+        alignment_fault = ia64_alignment_fault(
+            env, va, alignment_info, is_write, NULL);
         if (alignment_fault) {
             excp = IA64_EXCP_UNALIGNED;
             goto qualify;
@@ -1756,7 +2172,15 @@ uint64_t ia64_mmu_speculative_probe(CPUIA64State *env, uint64_t va,
         /* PSR.ic controls fault collection, not data VHPT walking. */
         excp = ia64_data_reference_exception(
             env, va, is_write, false, ia64_psr_cpl(env->psr),
-            true, &translation);
+            true, false, &translation);
+        alignment_fault = ia64_alignment_fault(
+            env, va, alignment_info, is_write, &translation);
+        debug_fault = (env->psr & IA64_PSR_DB) &&
+                      !(env->psr & IA64_PSR_DD) &&
+                      ia64_data_breakpoint_match(
+                          env, va, debug_size,
+                          is_write ? IA64_ISR_W : IA64_ISR_R,
+                          ia64_psr_cpl(env->psr));
     }
 
 qualify:
@@ -1768,11 +2192,23 @@ qualify:
      */
     if (excp == IA64_EXCP_UNIMPL_DATA_ADDR) {
         alignment_fault = false;
+        debug_fault = false;
+    }
+    if (excp != IA64_EXCP_NONE || debug_fault || alignment_fault) {
+        itlb_ed = ia64_current_code_tlb_ed(env);
     }
     if (excp != IA64_EXCP_NONE &&
         !ia64_speculative_exception_deferrable(env, excp, itlb_ed)) {
         ia64_raise_data_reference_exception(
             env, va, is_write, false, false, 0, excp, true, itlb_ed);
+    }
+    if (debug_fault &&
+        !ia64_speculative_exception_deferrable(
+            env, IA64_EXCP_DEBUG, itlb_ed)) {
+        ia64_raise_data_debug_at(
+            env, va, is_write ? IA64_ISR_W : IA64_ISR_R, true, itlb_ed,
+            false, ia64_ip_bundle_addr(env->ip),
+            (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT);
     }
     if (alignment_fault &&
         !ia64_speculative_exception_deferrable(
@@ -1781,7 +2217,7 @@ qualify:
             env, va, is_write, false, false, 0, IA64_EXCP_UNALIGNED, true,
             itlb_ed);
     }
-    if (excp != IA64_EXCP_NONE || alignment_fault) {
+    if (excp != IA64_EXCP_NONE || debug_fault || alignment_fault) {
         return 0;
     }
 
@@ -1800,23 +2236,35 @@ uint64_t ia64_mmu_advanced_load_allowed(CPUIA64State *env, uint64_t va)
     return ia64_exec_advanced_load_allowed(env, va, mmu_idx);
 }
 
+static bool ia64_vhpt_walk_full_internal(
+    CPUIA64State *env, uint64_t va, uint32_t rid, bool is_ifetch,
+    bool is_rse, uint8_t access_level, bool tak_access, uint64_t *pa,
+    uint8_t *perm, uint64_t *pte, uint32_t *access_key,
+    const IA64TlbEntry **installed_entry);
+
 uint64_t ia64_mmu_tak(CPUIA64State *env, uint64_t va)
 {
-    uint32_t rid = ia64_region_rid(env, va);
+    uint32_t rid;
     const IA64TlbEntry *entry;
     uint64_t pa;
     uint8_t perm;
     uint64_t pte = 0;
 
+    /* An unimplemented virtual address returns the architected miss value. */
+    if (!ia64_va_is_implemented(env, va)) {
+        return 1;
+    }
+
+    rid = ia64_region_rid(env, va);
     entry = ia64_tlb_find_cached(env, va, rid, false);
     if (entry && ia64_tlb_entry_present(entry)) {
         return entry->key;
     }
 
     if ((env->psr & IA64_PSR_DT) &&
-        ia64_vhpt_walk_full(env, va, rid, false, false,
-                            ia64_psr_cpl(env->psr), &pa, &perm, &pte, NULL,
-                            &entry) &&
+        ia64_vhpt_walk_full_internal(
+            env, va, rid, false, false, ia64_psr_cpl(env->psr), true,
+            &pa, &perm, &pte, NULL, &entry) &&
         (pte & IA64_PTE_PRESENT)) {
         if (entry && ia64_tlb_entry_present(entry)) {
             return entry->key;
@@ -2185,9 +2633,27 @@ bool ia64_vhpt_pte_not_present(CPUIA64State *env, uint64_t va,
 {
     uint64_t local_entry_va;
     uint64_t pte;
+    uint8_t size;
+    bool long_format;
+    bool enabled;
 
     if (!entry_va) {
         entry_va = &local_entry_va;
+    }
+
+    /* A DBR.r abort takes the original TLB Miss, not Page Not Present. */
+    enabled = ia64_vhpt_walker_enabled(env, va, is_ifetch, is_rse,
+                                       &size, &long_format) &&
+              ia64_vhpt_preferred_page_size_supported(env, va);
+    if (enabled) {
+        *entry_va = long_format ?
+            ia64_vhpt_long_hash_address(env, va, size, NULL) :
+            ia64_vhpt_short_hash_address(env, va, size);
+    }
+    if (enabled &&
+        ia64_vhpt_data_breakpoint_match(
+            env, *entry_va, long_format ? 32 : 8, false)) {
+        return false;
     }
 
     return ia64_vhpt_lookup_pte(env, va, is_ifetch, is_rse,
@@ -2259,11 +2725,11 @@ ia64_vhpt_install_tc(CPUIA64State *env, uint64_t va, uint32_t rid,
 
 /* ---- VHPT walker ---- */
 
-bool ia64_vhpt_walk_full(CPUIA64State *env, uint64_t va, uint32_t rid,
-                         bool is_ifetch, bool is_rse, uint8_t access_level,
-                         uint64_t *pa, uint8_t *perm, uint64_t *pte,
-                         uint32_t *access_key,
-                         const IA64TlbEntry **installed_entry)
+static bool ia64_vhpt_walk_full_internal(
+    CPUIA64State *env, uint64_t va, uint32_t rid, bool is_ifetch,
+    bool is_rse, uint8_t access_level, bool tak_access, uint64_t *pa,
+    uint8_t *perm, uint64_t *pte, uint32_t *access_key,
+    const IA64TlbEntry **installed_entry)
 {
     uint64_t vhpt_base;
     uint64_t hash;
@@ -2308,6 +2774,15 @@ bool ia64_vhpt_walk_full(CPUIA64State *env, uint64_t va, uint32_t rid,
             IA64_VHPT_ENTRY_TRANSLATED) {
             qemu_log_mask(CPU_LOG_MMU,
                           "ia64 vhpt short entry miss %c va=0x%016" PRIx64
+                          " rid=0x%06" PRIx32
+                          " entry_va=0x%016" PRIx64 "\n",
+                          is_ifetch ? 'i' : 'd', va, rid, entry_va);
+            return false;
+        }
+        if (ia64_vhpt_data_breakpoint_match(env, entry_va, 8,
+                                            tak_access)) {
+            qemu_log_mask(CPU_LOG_MMU,
+                          "ia64 vhpt short DBR abort %c va=0x%016" PRIx64
                           " rid=0x%06" PRIx32
                           " entry_va=0x%016" PRIx64 "\n",
                           is_ifetch ? 'i' : 'd', va, rid, entry_va);
@@ -2388,6 +2863,15 @@ bool ia64_vhpt_walk_full(CPUIA64State *env, uint64_t va, uint32_t rid,
             IA64_VHPT_ENTRY_TRANSLATED) {
             qemu_log_mask(CPU_LOG_MMU,
                           "ia64 vhpt long entry miss %c va=0x%016" PRIx64
+                          " rid=0x%06" PRIx32
+                          " entry_va=0x%016" PRIx64 "\n",
+                          is_ifetch ? 'i' : 'd', va, rid, entry_va);
+            return false;
+        }
+        if (ia64_vhpt_data_breakpoint_match(env, entry_va, 32,
+                                            tak_access)) {
+            qemu_log_mask(CPU_LOG_MMU,
+                          "ia64 vhpt long DBR abort %c va=0x%016" PRIx64
                           " rid=0x%06" PRIx32
                           " entry_va=0x%016" PRIx64 "\n",
                           is_ifetch ? 'i' : 'd', va, rid, entry_va);
@@ -2487,6 +2971,17 @@ long_miss:
     return false;
 }
 
+bool ia64_vhpt_walk_full(CPUIA64State *env, uint64_t va, uint32_t rid,
+                         bool is_ifetch, bool is_rse, uint8_t access_level,
+                         uint64_t *pa, uint8_t *perm, uint64_t *pte,
+                         uint32_t *access_key,
+                         const IA64TlbEntry **installed_entry)
+{
+    return ia64_vhpt_walk_full_internal(
+        env, va, rid, is_ifetch, is_rse, access_level, false, pa, perm, pte,
+        access_key, installed_entry);
+}
+
 bool ia64_vhpt_walk(CPUIA64State *env, uint64_t va, uint32_t rid,
                     bool is_ifetch, bool is_rse, uint8_t access_level,
                     uint64_t *pa, uint8_t *perm)
@@ -2529,6 +3024,7 @@ void ia64_mmu_itc_insert(CPUIA64State *env, uint64_t pte, uint32_t is_data,
         ia64_raise_unimplemented_data_address(
             env, env->cr_ifa, 0, true, false, ia64_current_code_tlb_ed(env));
     }
+    ia64_mmu_check_virtualization(env, raw, fault_slot);
 
     if ((pte & IA64_PTE_PRESENT) && perm == 0) {
         return;

@@ -123,6 +123,15 @@ static const char *test_saturation(void)
         UINT64_C(0xff807f00ffff0100));
 }
 
+static const char *test_pshladd2_shift_saturation(void)
+{
+    return expect_u64(
+        "pshladd2 shift overflow suppresses add",
+        ia64_simd_pshladd2_value(UINT64_C(0xc0003fffbfff4000),
+                                 UINT64_C(0x000100010001ffff), 1),
+        UINT64_C(0x80017fff80007fff));
+}
+
 static const char *test_count_zero_and_sum(void)
 {
     const char *error;
@@ -153,6 +162,7 @@ int main(void)
         { "multiply and SAD", test_multiply_and_sad },
         { "permutations", test_permutations },
         { "saturation", test_saturation },
+        { "pshladd2 shift saturation", test_pshladd2_shift_saturation },
         { "count-zero and sum", test_count_zero_and_sum },
     };
     int status = 0;

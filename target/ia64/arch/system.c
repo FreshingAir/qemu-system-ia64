@@ -18,6 +18,9 @@
 
 #define IA64_MERCED_PMD_ADDR_IGNORED_MASK 0x1ff8000000000000ULL
 
+/* PAL_PERF_MON_INFO advertises four generic counter pairs, PMD4 through PMD7. */
+#define IA64_LAST_GENERIC_PMD              7
+
 
 static void ia64_swap_banked_gr(CPUIA64State *env);
 
@@ -349,6 +352,17 @@ static bool ia64_reserved_pfs_field(uint64_t value)
            rrb_fr >= 96 || rrb_pr >= 48;
 }
 
+static void ia64_system_check_virtualization(CPUIA64State *env,
+                                             uint64_t fault_ip,
+                                             uint64_t raw, uint32_t slot)
+{
+    if (ia64_env_cpu_class(env)->has_virtualization &&
+        (env->psr & IA64_PSR_VM)) {
+        ia64_raise_exception(env, IA64_EXCP_VIRTUALIZATION,
+                             fault_ip, raw, slot);
+    }
+}
+
 void ia64_system_validate_ar_access(CPUIA64State *env, uint64_t value,
                                uint32_t ar_num, uint32_t write,
                                uint64_t fault_ip, uint64_t raw,
@@ -361,11 +375,16 @@ void ia64_system_validate_ar_access(CPUIA64State *env, uint64_t value,
     }
 
     if (!write) {
-        if (ar_num == 44 && (env->psr & IA64_PSR_SI) &&
+        if ((ar_num == IA64_AR_ITC || ar_num == IA64_AR_RUC) &&
+            (env->psr & IA64_PSR_SI) &&
             ia64_psr_cpl(env->psr) != 0) {
             env->cr_isr = 0x20;
             ia64_raise_exception(env, IA64_EXCP_PRIVILEGED_REG,
                                    fault_ip, raw, slot);
+        }
+        if ((ar_num == IA64_AR_ITC || ar_num == IA64_AR_RUC) &&
+            (env->psr & IA64_PSR_SI)) {
+            ia64_system_check_virtualization(env, fault_ip, raw, slot);
         }
         return;
     }
@@ -382,10 +401,14 @@ void ia64_system_validate_ar_access(CPUIA64State *env, uint64_t value,
         ia64_raise_exception(env, IA64_EXCP_RESERVED_REG_FIELD,
                                fault_ip, raw, slot);
     }
-    if ((ar_num <= 7 || ar_num == 44) && ia64_psr_cpl(env->psr) != 0) {
+    if ((ar_num <= IA64_AR_KR7 || ar_num == IA64_AR_ITC ||
+         ar_num == IA64_AR_RUC) && ia64_psr_cpl(env->psr) != 0) {
         env->cr_isr = 0x20;
         ia64_raise_exception(env, IA64_EXCP_PRIVILEGED_REG,
                                fault_ip, raw, slot);
+    }
+    if (ar_num == IA64_AR_ITC || ar_num == IA64_AR_RUC) {
+        ia64_system_check_virtualization(env, fault_ip, raw, slot);
     }
 }
 
@@ -470,6 +493,7 @@ void ia64_system_write_ar(CPUIA64State *env, uint32_t ar_num, uint64_t value)
         env->rse.rse_invalid += env->rse.rse_clean;
         env->rse.rse_clean = 0;
         env->rse.rse_clean_nat = 0;
+        ia64_system_reset_dahr(env);
         ia64_rse_check(env, "bspstore");
     }
 }
@@ -481,7 +505,8 @@ uint64_t ia64_system_read_cr(CPUIA64State *env, uint32_t cr_num)
     }
     switch (cr_num) {
     case IA64_CR_SAPIC_LID:
-        return qatomic_read(&env->cr[cr_num]);
+        return qatomic_read(&env->cr[cr_num]) &
+               (IA64_SAPIC_LID_ID_MASK | IA64_SAPIC_LID_EID_MASK);
     case IA64_CR_SAPIC_IVR:
         return (uint64_t)ia64_sapic_get_ivr(env) & 0xFF;
     case IA64_CR_SAPIC_IRR0:
@@ -497,9 +522,12 @@ uint64_t ia64_system_read_cr(CPUIA64State *env, uint32_t cr_num)
     }
 }
 
-static bool ia64_reserved_ipsr_field(uint64_t value)
+static bool ia64_reserved_ipsr_field(CPUIA64State *env, uint64_t value)
 {
-    return (value >> 46) != 0 ||
+    uint64_t high_reserved = ia64_env_cpu_class(env)->has_virtualization ?
+                             (value >> 47) : (value >> 46);
+
+    return high_reserved != 0 ||
            ((value >> 41) & 3) == 3 ||
            ((value >> 28) & 0xf) != 0 ||
            ((value >> 16) & 1) != 0 ||
@@ -515,7 +543,8 @@ static bool ia64_reserved_ifs_field(uint64_t value)
     return (value >> 63) && ia64_reserved_pfs_field(value);
 }
 
-static bool ia64_reserved_cr_field(uint32_t cr_num, uint64_t value)
+static bool ia64_reserved_cr_field(CPUIA64State *env, uint32_t cr_num,
+                                   uint64_t value)
 {
     switch (cr_num) {
     case 0:
@@ -527,7 +556,7 @@ static bool ia64_reserved_cr_field(uint32_t cr_num, uint64_t value)
                ps < 15;
     }
     case 16:
-        return ia64_reserved_ipsr_field(value);
+        return ia64_reserved_ipsr_field(env, value);
     case 17:
         return (value >> 44) != 0 ||
                ((value >> 41) & 3) == 3 ||
@@ -568,7 +597,7 @@ uint64_t ia64_system_validate_cr_access(CPUIA64State *env, uint64_t value,
         env->cr_isr = 0;
         ia64_raise_exception(env, IA64_EXCP_ILLEGAL, fault_ip, raw, slot);
     }
-    if (write && ia64_reserved_cr_field(cr_num, value)) {
+    if (write && ia64_reserved_cr_field(env, cr_num, value)) {
         qemu_log_mask(CPU_LOG_INT | LOG_GUEST_ERROR,
                       "ia64 reserved cr write cr%u value=%016" PRIx64
                       " ip=%016" PRIx64 " raw=%016" PRIx64
@@ -578,6 +607,17 @@ uint64_t ia64_system_validate_cr_access(CPUIA64State *env, uint64_t value,
         ia64_raise_exception(env, IA64_EXCP_RESERVED_REG_FIELD,
                                fault_ip, raw, slot);
     }
+    if (write && cr_num == IA64_CR_IFA &&
+        !ia64_va_is_implemented(env, value)) {
+        env->cr_ifa = value;
+        env->cr_isr = IA64_GENEX_UNIMPL_DATA_ADDR | IA64_ISR_NA;
+        if (ia64_current_code_tlb_ed(env)) {
+            env->cr_isr |= IA64_ISR_ED;
+        }
+        ia64_raise_exception(env, IA64_EXCP_UNIMPL_DATA_ADDR,
+                             fault_ip, raw, slot);
+    }
+    ia64_system_check_virtualization(env, fault_ip, raw, slot);
 
     switch (cr_num) {
     case 2:
@@ -625,6 +665,21 @@ uint64_t ia64_system_read_dahr_indexed(CPUIA64State *env, uint64_t index)
     return env->dahr[index & 7] & 0x7ff;
 }
 
+void ia64_system_write_dahr(CPUIA64State *env, uint32_t index,
+                            uint64_t value)
+{
+    env->dahr[index & 7] = value & 0x7ff;
+}
+
+void ia64_system_reset_dahr(CPUIA64State *env)
+{
+    /*
+     * The field values that best implement each generic locality hint are
+     * implementation dependent.  This model's valid default is all zeroes.
+     */
+    memset(env->dahr, 0, sizeof(env->dahr));
+}
+
 uint64_t ia64_system_read_msr(CPUIA64State *env, uint64_t index)
 {
     if (index < IA64_MSR_COUNT) {
@@ -643,7 +698,7 @@ void ia64_system_write_msr(CPUIA64State *env, uint64_t index, uint64_t value)
 uint64_t ia64_system_read_dbr(CPUIA64State *env, uint32_t index)
 {
     index &= 0xff;
-    if (index >= IA64_DBR_COUNT) {
+    if (index >= IA64_DBR_IMPLEMENTED_COUNT) {
         return 0;
     }
     return env->dbr[index];
@@ -652,7 +707,7 @@ uint64_t ia64_system_read_dbr(CPUIA64State *env, uint32_t index)
 void ia64_system_write_dbr(CPUIA64State *env, uint32_t index, uint64_t value)
 {
     index &= 0xff;
-    if (index < IA64_DBR_COUNT) {
+    if (index < IA64_DBR_IMPLEMENTED_COUNT) {
         if (index & 1) {
             value &= ~(3ULL << 60);
         }
@@ -663,7 +718,7 @@ void ia64_system_write_dbr(CPUIA64State *env, uint32_t index, uint64_t value)
 uint64_t ia64_system_read_ibr(CPUIA64State *env, uint32_t index)
 {
     index &= 0xff;
-    if (index >= IA64_IBR_COUNT) {
+    if (index >= IA64_IBR_IMPLEMENTED_COUNT) {
         return 0;
     }
     return env->ibr[index];
@@ -672,7 +727,7 @@ uint64_t ia64_system_read_ibr(CPUIA64State *env, uint32_t index)
 void ia64_system_write_ibr(CPUIA64State *env, uint32_t index, uint64_t value)
 {
     index &= 0xff;
-    if (index < IA64_IBR_COUNT) {
+    if (index < IA64_IBR_IMPLEMENTED_COUNT) {
         if (index & 1) {
             value &= ~(7ULL << 60);
         }
@@ -720,7 +775,9 @@ void ia64_write_cr(CPUIA64State *env, uint32_t cr_num, uint64_t value)
         ia64_sapic_update_interrupt(env);
         break;
     case IA64_CR_SAPIC_LID:
-        qatomic_set(&env->cr[cr_num], value);
+        qatomic_set(&env->cr[cr_num],
+                    value & (IA64_SAPIC_LID_ID_MASK |
+                             IA64_SAPIC_LID_EID_MASK));
         break;
     case IA64_CR_SAPIC_EOI:
         ia64_sapic_eoi(env);
@@ -752,6 +809,26 @@ uint64_t ia64_system_read_pmc(CPUIA64State *env, uint32_t index)
         return 0;
     }
     value = env->pmc[index];
+    if (icc->model == IA64_CPU_MODEL_MADISON) {
+        switch (index) {
+        case 0:
+            return value & 0xf1;
+        case 1 ... 3:
+            return 0;
+        default:
+            return value;
+        }
+    }
+    if (icc->model == IA64_CPU_MODEL_MONTECITO) {
+        switch (index) {
+        case 0:
+            return value & 0xfff1;
+        case 1 ... 3:
+            return 0;
+        default:
+            return value;
+        }
+    }
     if (icc->model != IA64_CPU_MODEL_MERCED) {
         return value;
     }
@@ -788,7 +865,27 @@ void ia64_system_write_pmc(CPUIA64State *env, uint32_t index, uint64_t value)
         !(icc->implemented_pmc_mask & (1ULL << index))) {
         return;
     }
-    if (icc->model == IA64_CPU_MODEL_MERCED) {
+    if (icc->model == IA64_CPU_MODEL_MADISON) {
+        switch (index) {
+        case 0:
+            value &= 0xf1;
+            break;
+        case 1 ... 3:
+            return;
+        default:
+            break;
+        }
+    } else if (icc->model == IA64_CPU_MODEL_MONTECITO) {
+        switch (index) {
+        case 0:
+            value &= 0xfff1;
+            break;
+        case 1 ... 3:
+            return;
+        default:
+            break;
+        }
+    } else if (icc->model == IA64_CPU_MODEL_MERCED) {
         switch (index) {
         case 0:
             value &= 0xf1;
@@ -895,19 +992,25 @@ uint64_t ia64_system_read_pmd_checked(CPUIA64State *env, uint64_t index,
                                  uint32_t slot)
 {
     index &= 0xff;
-    if (index >= IA64_PMD_COUNT) {
-        env->cr_isr = 0x30;
-        ia64_raise_exception(env, IA64_EXCP_RESERVED_REG_FIELD,
-                               fault_ip, raw, slot);
+
+    /*
+     * PMD is the one indirect register file that can be read outside CPL0.
+     * Secured user monitors and generic monitors marked privileged read as
+     * zero; they do not raise a Privileged Operation/Register fault.  An
+     * unimplemented PMD index likewise reads as zero by architectural rule.
+     */
+    if (ia64_psr_cpl(env->psr) != 0 &&
+        ((env->psr & IA64_PSR_SP) ||
+         (index > 3 && index <= IA64_LAST_GENERIC_PMD &&
+          (ia64_system_read_pmc(env, index) & (1ULL << 6))))) {
+        return 0;
     }
-    if ((ia64_system_read_pmc(env, index) & (1ULL << 6)) &&
-        ia64_psr_cpl(env->psr) != 0) {
-        env->cr_isr = 0x20;
-        ia64_raise_exception(env, IA64_EXCP_PRIVILEGED_REG,
-                               fault_ip, raw, slot);
-    }
-    return (env->psr & IA64_PSR_SP) ? 0 :
-           ia64_system_read_pmd(env, index);
+
+    /* Retain fault metadata in the helper ABI for restart/debug consistency. */
+    (void)fault_ip;
+    (void)raw;
+    (void)slot;
+    return ia64_system_read_pmd(env, index);
 }
 
 void ia64_system_write_pmd(CPUIA64State *env, uint32_t index, uint64_t value)

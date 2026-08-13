@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 from .case import (CaseEvidence, CaseMetadata, CaseObservation, bind_cases)
 from .encoding import (
     CHECK_LOAD_DATA,
@@ -14,22 +16,38 @@ from .encoding import (
     IA64_DATA_ACCESS_VECTOR,
     IA64_DATA_KEY_MISS_VECTOR,
     IA64_DATA_NESTED_TLB_VECTOR,
+    IA64_DEBUG_VECTOR,
+    IA64_EXCP_DEBUG,
     IA64_EXCP_ILLEGAL,
     IA64_EXCP_NONE,
     IA64_EXCP_RESERVED_REG_FIELD,
+    IA64_EXCP_TAKEN_BRANCH,
     IA64_FIRMWARE_IVT_BASE,
+    IA64_GENERAL_VECTOR,
+    IA64_GENEX_UNIMPL_DATA_ADDR,
+    IA64_IMPL_PA_BITS,
+    IA64_ISR_CODE_SS,
+    IA64_ISR_CODE_TB,
+    IA64_ISR_EI_SHIFT,
+    IA64_ISR_IR,
     IA64_ISR_NI,
+    IA64_ISR_R,
     IA64_ISR_RS,
     IA64_ISR_W,
     IA64_PSR_CPL3,
+    IA64_PSR_DB,
+    IA64_PSR_DD,
     IA64_PSR_DT,
     IA64_PSR_IC,
     IA64_PSR_PK,
     IA64_PSR_RT,
+    IA64_PSR_SS,
+    IA64_PSR_TB,
     IA64_PKR_RD,
     IA64_PKR_VALID,
     IA64_RSC_BE,
     IA64_RSC_PL3,
+    IA64_TAKEN_BRANCH_VECTOR,
     KERNEL_TR_ITIR,
     KEY_TEST_KEY,
     LOW_VECTOR_ITIR,
@@ -76,6 +94,7 @@ from .encoding import (
     mov_b_gr,
     mov_gr_b,
     mov_gr_psr_full,
+    mov_dbr_indexed_write,
     mov_i_imm_ar,
     mov_lc_gr,
     mov_m_ar_gr,
@@ -110,8 +129,63 @@ from .encoding import (
     st8,
     st8_postinc,
 )
+from .runner import read_stopped_state
 
 # ── RSE tests ──
+
+
+def _require_reset_rse_state(qemu, *, machine, cpu, cfm, partitions):
+    result = read_stopped_state(qemu, machine=machine, cpu=cpu)
+    fields = ("sof", "sol", "sor", "rrb_gr", "rrb_fr", "rrb_pr")
+    observed_cfm = tuple(result.state.cfm[field] for field in fields)
+    if observed_cfm != cfm:
+        raise RuntimeError(
+            f"{machine} reset CFM: expected {cfm!r}, got {observed_cfm!r}\n"
+            f"reset state:\n{result.register_output}")
+
+    match = re.search(
+        r"RSE: bol=(\d+) dirty=(-?\d+)/(-?\d+) "
+        r"clean=(-?\d+)/(-?\d+) invalid=(-?\d+)",
+        result.register_output)
+    if match is None:
+        raise RuntimeError("info registers did not contain RSE partitions:\n" +
+                           result.register_output)
+    observed_partitions = tuple(int(value) for value in match.groups())
+    if observed_partitions != partitions:
+        raise RuntimeError(
+            f"{machine} reset RSE: expected {partitions!r}, "
+            f"got {observed_partitions!r}\n"
+            f"reset state:\n{result.register_output}")
+
+
+def test_rse_architectural_reset_exposes_full_frame(qemu):
+    _require_reset_rse_state(
+        qemu,
+        machine="none",
+        cpu="madison",
+        cfm=(96, 0, 0, 0, 0, 0),
+        partitions=(0, 0, 0, 0, 0, 0),
+    )
+
+
+def test_rse_boot_handoff_preserves_empty_frame(qemu):
+    _require_reset_rse_state(
+        qemu,
+        machine="ia64-vpc",
+        cpu=None,
+        cfm=(0, 0, 0, 0, 0, 0),
+        partitions=(0, 0, 0, 0, 0, 96),
+    )
+
+
+def _empty_frame_prologue(address, target):
+    """Make tests that require an empty caller frame independent of reset."""
+    return [
+        (address, 0x00, alloc_m(2, 0, 0, 0, 0), nop_i(), nop_i()),
+        (address + 0x10, 0x10, nop_m(), nop_i(),
+         br_cond(address + 0x10, target)),
+    ]
+
 
 test_alloc_m34_ignored_bits_decode = require_registers(
     "alloc_m34_ignored_bits_decode", [
@@ -1627,6 +1701,7 @@ test_rsc_write_clips_pl_to_cpl = require_registers(
 
 test_rse_uses_rsc_pl_for_access_rights = require_registers(
     "rse_uses_rsc_pl_for_access_rights", [
+        *_empty_frame_prologue(0x800, 0x10),
         *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000),
         (0x70, 0x00, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
         (0x80, *movl_mlx(3, HIGH_TR_BASE + 0x8000)),
@@ -1636,16 +1711,19 @@ test_rse_uses_rsc_pl_for_access_rights = require_registers(
         (0xc0, 0x18, nop_m(), nop_m(), cover_b()),
         (0xd0, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_DT | IA64_PSR_RT |
                          IA64_PSR_CPL3)),
-        (0xe0, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
-        (0xf0, 0x00, flushrs_enc(), nop_i(), nop_i()),
-        (0x100, 0x10, nop_m(), nop_i(), br_cond(0x100, 0x100)),
+        (0xe0, *movl_mlx(6, 0x130)),
+        # Keep the covered frame dirty while rfi installs CPL3.
+        (0xf0, 0x00, mov_m_gr_cr(0, 23), nop_i(), nop_i()),
+        *rfi_to_gr(0x100, 19, 6),
+        (0x120, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (0x130, 0x10, nop_m(), nop_i(), br_cond(0x130, 0x130)),
         (IA64_DATA_ACCESS_VECTOR, 0x10, nop_m(), adds(31, 0x71, 0),
          br_cond(IA64_DATA_ACCESS_VECTOR, IA64_DATA_ACCESS_VECTOR)),
     ], {
-        "ip": 0x100,
+        "ip": 0x130,
         "exception": IA64_EXCP_NONE,
         "r31": 0,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_rse_rt_enables_protection_key_checks = require_registers(
     "rse_rt_enables_protection_key_checks", [
@@ -1679,6 +1757,53 @@ test_rse_rt_enables_protection_key_checks = require_registers(
         "r30": HIGH_TR_BASE + 0x8000,
         "r31": IA64_ISR_W | IA64_ISR_RS,
     }, entry=0x10)
+
+
+# A matching DBR is below Data Key Miss in the mandatory-RSE priority order.
+# With PSR.dt clear, the pre-debug translation must still gate keys with
+# PSR.rt; otherwise the debug precheck would incorrectly reach 0x5900 first.
+test_rse_key_miss_precedes_mandatory_data_debug_with_dt_clear = require_registers(
+    "rse_key_miss_precedes_mandatory_data_debug_with_dt_clear", [
+        (0x10, *movl_mlx(18, 0x0010000000400661)),
+        (0x20, *movl_mlx(19, HIGH_TR_BASE)),
+        (0x30, *movl_mlx(21, (KEY_TEST_KEY << 8) | (16 << 2))),
+        (0x40, 0x00, mov_m_gr_cr(19, 20), adds(10, 5, 0), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(21, 21), nop_i(), nop_i()),
+        (0x60, 0x00, itr_d(10, 18), nop_i(), nop_i()),
+        (0x70, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x80, *movl_mlx(4, 0)),
+        (0x90, *movl_mlx(5, HIGH_TR_BASE + 0x8000)),
+        (0xa0, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0xb0, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0xc0, *movl_mlx(5, 0x41ffffffffffffff)),
+        (0xd0, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0xe0, 0x00, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0xf0, *movl_mlx(3, HIGH_TR_BASE + 0x8000)),
+        (0x100, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x110, 0x00, nop_m(), alloc(1, 1, 0, 0, 0), nop_i()),
+        (0x120, *movl_mlx(32, 0x123456789abcdef0)),
+        (0x130, 0x18, nop_m(), nop_m(), cover_b()),
+        (0x140, *movl_mlx(
+            19, IA64_PSR_IC | IA64_PSR_RT | IA64_PSR_PK | IA64_PSR_DB)),
+        (0x150, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0x160, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x170, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (IA64_DATA_KEY_MISS_VECTOR, 0x00, mov_m_cr_gr(30, 20),
+         nop_i(), nop_i()),
+        (IA64_DATA_KEY_MISS_VECTOR + 0x10, 0x00, mov_m_cr_gr(31, 17),
+         nop_i(), nop_i()),
+        (IA64_DATA_KEY_MISS_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DATA_KEY_MISS_VECTOR + 0x20,
+                 IA64_DATA_KEY_MISS_VECTOR + 0x20)),
+        (IA64_DEBUG_VECTOR, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR, IA64_DEBUG_VECTOR)),
+    ], {
+        "ip": IA64_DATA_KEY_MISS_VECTOR + 0x20,
+        "exception": IA64_EXCP_NONE,
+        "r30": HIGH_TR_BASE + 0x8000,
+        "r31": IA64_ISR_W | IA64_ISR_RS,
+    }, entry=0x10)
+
 
 """The RSE collection write is permitted by the PKR while ordinary reads are
 disabled.  Preserving the old prefix must therefore use the resolved store
@@ -1812,6 +1937,138 @@ test_rse_spill_fault_sets_isr_rs = require_registers(
         "r29": 0,
         "r30": HIGH_TR_BASE + 0x10000,
         "r31": IA64_ISR_W | IA64_ISR_RS | IA64_ISR_NI,
+    }, entry=0x10)
+
+test_rse_physical_spill_fault_sets_isr_rs = require_registers(
+    "rse_physical_spill_fault_sets_isr_rs", [
+        (0x10, *movl_mlx(3, 1 << IA64_IMPL_PA_BITS)),
+        (0x20, *movl_mlx(19, IA64_PSR_IC)),
+        (0x30, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0x40, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x50, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x60, 0x00, nop_m(), alloc(1, 1, 0, 0, 0), nop_i()),
+        (0x70, *movl_mlx(32, 0x123456789abcdef0)),
+        (0x80, 0x18, nop_m(), nop_m(), cover_b()),
+        (0x90, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR, 0x00, mov_m_cr_gr(31, 17), nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x10, 0x00, mov_m_cr_gr(30, 20),
+         nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_GENERAL_VECTOR + 0x20,
+                 IA64_GENERAL_VECTOR + 0x20)),
+    ], {
+        "ip": IA64_GENERAL_VECTOR + 0x20,
+        "exception": IA64_EXCP_NONE,
+        "r30": 1 << IA64_IMPL_PA_BITS,
+        "r31": IA64_GENEX_UNIMPL_DATA_ADDR | IA64_ISR_W | IA64_ISR_RS,
+    }, entry=0x10)
+
+test_rse_physical_target_fill_fault_sets_isr_rs_ir = require_registers(
+    "rse_physical_target_fill_fault_sets_isr_rs_ir", [
+        (0x10, *movl_mlx(3, (1 << IA64_IMPL_PA_BITS) + 8)),
+        (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x30, *movl_mlx(20, (1 << 63) | 1)),
+        (0x40, 0x00, mov_m_gr_cr(20, 23), nop_i(), nop_i()),
+        (0x50, *movl_mlx(20, 0x200)),
+        (0x60, 0x00, mov_m_gr_cr(20, 19), nop_i(), nop_i()),
+        (0x70, *movl_mlx(20, IA64_PSR_IC)),
+        (0x80, 0x00, mov_m_gr_cr(20, 16), nop_i(), nop_i()),
+        (0x90, 0x10, nop_m(), nop_i(), rfi_b()),
+        (IA64_GENERAL_VECTOR, 0x00, mov_m_cr_gr(31, 17), nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x10, 0x00, mov_m_cr_gr(30, 20),
+         nop_i(), nop_i()),
+        (IA64_GENERAL_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_GENERAL_VECTOR + 0x20,
+                 IA64_GENERAL_VECTOR + 0x20)),
+    ], {
+        "ip": IA64_GENERAL_VECTOR + 0x20,
+        "exception": IA64_EXCP_NONE,
+        "r30": 1 << IA64_IMPL_PA_BITS,
+        "r31": (IA64_GENEX_UNIMPL_DATA_ADDR | IA64_ISR_R |
+                IA64_ISR_RS | IA64_ISR_IR),
+    }, entry=0x10)
+
+
+# PSR.dd suppresses the first matching mandatory backing-store reference.
+# A successful mandatory reference consumes it immediately, so the second
+# spill in the same flushrs faults with ISR.rs and the second backing address.
+test_rse_mandatory_spill_consumes_psr_dd = require_registers(
+    "rse_mandatory_spill_consumes_psr_dd", [
+        *_empty_frame_prologue(0x800, 0x10),
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x100000)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        # Ignore address bit 3 so both adjacent eight-byte spills match.
+        (0x50, *movl_mlx(5, 0x41fffffffffffff7)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x100000)),
+        (0x80, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x90, 0x00, nop_m(), alloc(1, 2, 0, 0, 0), nop_i()),
+        (0xa0, *movl_mlx(32, 0x1122334455667788)),
+        (0xb0, *movl_mlx(33, 0x8877665544332211)),
+        (0xc0, 0x18, nop_m(), nop_m(), cover_b()),
+        (0xd0, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DB | IA64_PSR_DD)),
+        (0xe0, *movl_mlx(6, 0x120)),
+        # cover saved a valid IFS while IC was clear.  Invalidate it so this
+        # rfi only installs PSR.dd and does not reclaim the covered frame.
+        (0xf0, 0x00, mov_m_gr_cr(0, 23), nop_i(), nop_i()),
+        *rfi_to_gr(0x100, 2, 6),
+        (0x120, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0x120,
+        "r9": 0x100008,
+        "r10": IA64_ISR_W | IA64_ISR_RS,
+    }, entry=0x800)
+
+
+# A target-frame fill is a mandatory RSE read.  Its Debug fault is attributed
+# to the restored target instruction and reports both ISR.rs and ISR.ir.
+test_rse_mandatory_target_fill_debug_sets_isr_rs_ir = require_registers(
+    "rse_mandatory_target_fill_debug_sets_isr_rs_ir", [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x100000)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x100008)),
+        (0x80, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x90, *movl_mlx(20, (1 << 63) | 1)),
+        (0xa0, 0x00, mov_m_gr_cr(20, 23), nop_i(), nop_i()),
+        (0xb0, *movl_mlx(20, 0x200)),
+        (0xc0, 0x00, mov_m_gr_cr(20, 19), nop_i(), nop_i()),
+        (0xd0, *movl_mlx(20, IA64_PSR_IC | IA64_PSR_DB)),
+        (0xe0, 0x00, mov_m_gr_cr(20, 16), nop_i(), nop_i()),
+        (0xf0, 0x10, nop_m(), nop_i(), rfi_b()),
+        raw_bundle(0x100000, 0x123456789abcdef0, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 20),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x30,
+                 IA64_DEBUG_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0x200,
+        "r9": 0x100000,
+        "r10": IA64_ISR_R | IA64_ISR_RS | IA64_ISR_IR,
     }, entry=0x10)
 
 test_rse_rfi_bspstore_rebase_preserves_interrupted_call = require_registers(
@@ -1956,7 +2213,8 @@ test_rse_rfi_does_not_spill_dirty_frame_rnat = require_registers(
         (0x40, *movl_mlx(3, 0x100000)),
         (0x50, 0x00, mov_m_gr_ar(3, 18), nop_i(),
          nop_i()),
-        (0x60, *movl_mlx(4, 1)),
+        # PFM.sof=1, PFM.sol=1: returning preserves one unavailable register.
+        (0x60, *movl_mlx(4, 1 | (1 << 7))),
         (0x70, 0x00, mov_m_gr_ar(4, 19), nop_i(),
          nop_i()),
         (0x80, 0x00, nop_m(), alloc(36, 7, 6, 0, 0),
@@ -2239,6 +2497,7 @@ test_rse_rfi_advanced_iip_bspstore_switch_loads_external_frame = \
 
 test_rse_rfi_advanced_iip_preserves_nested_call_locals = require_registers(
     "rse_rfi_advanced_iip_preserves_nested_call_locals", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(2, 1 << 13)),
         (0x20, 0x10, mov_gr_psr_full(2), nop_i(),
          br_cond(0x20, 0x40)),
@@ -2299,10 +2558,11 @@ test_rse_rfi_advanced_iip_preserves_nested_call_locals = require_registers(
         "r8": 0x123456789abcdef0,
         "cfm_sof": 0,
         "cfm_sol": 0,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_rse_rfi_bypassed_call_drops_returned_frame = require_registers(
     "rse_rfi_bypassed_call_drops_returned_frame", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(2, 1 << 13)),
         (0x20, 0x10, mov_gr_psr_full(2), nop_i(),
          br_cond(0x20, 0x40)),
@@ -2351,7 +2611,7 @@ test_rse_rfi_bypassed_call_drops_returned_frame = require_registers(
         "r8": 0x123456789abcdef0,
         "cfm_sof": 0,
         "cfm_sol": 0,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_rse_manual_rfi_loadrs_restores_current_frame_base = require_registers(
     "rse_manual_rfi_loadrs_restores_current_frame_base", [
@@ -3083,6 +3343,103 @@ test_rse_br_ret_fill_dtlb_miss_retries_atomically = require_registers(
         "r29": 0x77,
         "cfm_sof": 62,
         "cfm_sol": 57,
+    }, entry=0x10)
+
+# A br.ret does not become eligible for completion traps until all mandatory
+# target-frame fills succeed.  The miss handler executes several instructions,
+# so this also verifies that the original branch's PSR.tb/ss snapshot survives
+# interruption delivery and the handler's rfi.
+test_rse_br_ret_completion_trap_waits_for_target_fill = require_registers(
+    "rse_br_ret_completion_trap_waits_for_target_fill", [
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE + 0x2000)),
+        (0x20, *movl_mlx(7, EIGHT_K_ITIR)),
+        (0x30, 0x00, mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (0x40, *movl_mlx(3, HIGH_TR_BASE + 0x2008)),
+        (0x50, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        # PFS.sof=1, PFS.sol=1 forces the target register below BOF and
+        # therefore requires a mandatory fill before the completion trap.
+        (0x60, *movl_mlx(4, 0x81)),
+        (0x70, *movl_mlx(5, 0x200)),
+        (0x80, 0x01, nop_m(), mov_m_gr_ar(4, 64), mov_b_gr(7, 5)),
+        (0x90, *movl_mlx(
+            2, IA64_PSR_IC | IA64_PSR_DT | IA64_PSR_RT |
+               IA64_PSR_TB | IA64_PSR_SS | (2 << 41))),
+        (0xa0, *movl_mlx(3, 0x100)),
+        *rfi_to_gr(0xb0, 2, 3),
+        (0x100, 0x10, nop_m(), nop_i(), br_ret(7)),
+        (0x200, 0x10, nop_m(), nop_i(), br_cond(0x200, 0x200)),
+        raw_bundle(0x4002000, 0x123456789abcdef0, 0),
+        (IA64_ALT_DTLB_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+        (IA64_ALT_DTLB_VECTOR + 0x10, 0x00,
+         mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x20, 0x00,
+         itc_d(18), nop_i(), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x30, 0x10, nop_m(), nop_i(), rfi_b()),
+        (IA64_TAKEN_BRANCH_VECTOR, 0x00,
+         mov_m_cr_gr(8, 19), nop_i(), nop_i()),
+        (IA64_TAKEN_BRANCH_VECTOR + 0x10, 0x00,
+         mov_m_cr_gr(9, 22), nop_i(), nop_i()),
+        (IA64_TAKEN_BRANCH_VECTOR + 0x20, 0x00,
+         mov_m_cr_gr(10, 17), nop_i(), nop_i()),
+        (IA64_TAKEN_BRANCH_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_TAKEN_BRANCH_VECTOR + 0x30,
+                 IA64_TAKEN_BRANCH_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_TAKEN_BRANCH_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_TAKEN_BRANCH,
+        "r8": 0x200,
+        "r9": 0x100,
+        "r10": (IA64_ISR_CODE_TB | IA64_ISR_CODE_SS |
+                 (2 << IA64_ISR_EI_SHIFT)),
+    }, entry=0x10)
+
+
+# AR.EC is part of the completed br.ret state, so a mandatory target-frame
+# fill fault handler must already observe PFS.pec.  The handler covers before
+# rfi; the resumed fill and completed return must retain the same EC value.
+test_rse_br_ret_ec_restored_before_target_fill_fault = require_registers(
+    "rse_br_ret_ec_restored_before_target_fill_fault", [
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE + 0x2000)),
+        (0x20, *movl_mlx(7, EIGHT_K_ITIR)),
+        (0x30, 0x00, mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (0x40, *movl_mlx(3, HIGH_TR_BASE + 0x2008)),
+        (0x50, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x60, *movl_mlx(4, 0x81 | (0x2d << 52))),
+        (0x70, *movl_mlx(5, 0x200)),
+        (0x80, 0x01, nop_m(), mov_m_gr_ar(4, 64), mov_b_gr(7, 5)),
+        (0x90, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT | IA64_PSR_RT)),
+        (0xa0, *movl_mlx(3, 0x100)),
+        *rfi_to_gr(0xb0, 2, 3),
+        (0x100, 0x00, nop_m(), mov_i_imm_ar(66, 7), nop_i()),
+        (0x110, 0x10, nop_m(), nop_i(), br_ret(7)),
+        (0x200, 0x00, nop_m(), mov_m_ar_gr(9, 66),
+         adds(11, 0, 32)),
+        (0x210, 0x10, nop_m(), nop_i(), br_cond(0x210, 0x210)),
+        raw_bundle(0x4002000, 0x123456789abcdef0, 0),
+        (IA64_ALT_DTLB_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+        (IA64_ALT_DTLB_VECTOR + 0x10, 0x00, nop_m(),
+         mov_m_ar_gr(8, 66), adds(10, 1, 10)),
+        (IA64_ALT_DTLB_VECTOR + 0x20, 0x08,
+         mov_m_cr_gr(12, 19), mov_m_cr_gr(13, 22), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x30, 0x00,
+         mov_m_cr_gr(14, 17), nop_i(), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x40, 0x00,
+         mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x50, 0x00,
+         itc_d(18), nop_i(), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x60, 0x10,
+         nop_m(), nop_i(), rfi_b()),
+    ], {
+        "ip": 0x210,
+        "exception": IA64_EXCP_NONE,
+        "r8": 0x2d,
+        "r9": 0x2d,
+        "r10": 1,
+        "r11": 0x123456789abcdef0,
+        "r12": 0x200,
+        "r13": 0x110,
+        "r14": IA64_ISR_R | IA64_ISR_RS | IA64_ISR_IR,
     }, entry=0x10)
 
 SAL_DIRECT_RSE_BASE = 0xe000000080400000
@@ -3900,7 +4257,8 @@ test_rse_loadrs_clamps_stacked_grs = require_registers(
     ], {
         "ip": HIGH_TR_BASE + 0x84a0,
         "exception": IA64_EXCP_NONE,
-        "r31": HIGH_TR_PSR,
+        # mov r=psr.l does not return the separately banked PSR.bn bit.
+        "r31": HIGH_TR_PSR & ~(1 << 44),
     }, entry=0x10)
 
 test_rse_loadrs_sets_tear_point = require_registers(
@@ -3939,6 +4297,7 @@ test_rse_loadrs_sets_tear_point = require_registers(
 
 test_rse_loadrs_preserves_clean_partial_rnat_collection = require_registers(
     "rse_loadrs_preserves_clean_partial_rnat_collection", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(3, 0x1001d8)),
         (0x20, *movl_mlx(4, 0xe000000012345678)),
         (0x30, 0x00, st8(3, 4), nop_i(),
@@ -3978,10 +4337,11 @@ test_rse_loadrs_preserves_clean_partial_rnat_collection = require_registers(
         "r40_nat": 0,
         "cfm_sof": 16,
         "cfm_sol": 16,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_rse_loadrs_reloads_same_collection_rnat = require_registers(
     "rse_loadrs_reloads_same_collection_rnat", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(3, 0x100120)),
         (0x20, *movl_mlx(4, 0xe000000087654321)),
         (0x30, 0x00, st8(3, 4), nop_i(),
@@ -4021,7 +4381,7 @@ test_rse_loadrs_reloads_same_collection_rnat = require_registers(
         "r35_nat": 0,
         "cfm_sof": 16,
         "cfm_sol": 16,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_rse_return_growth_keeps_dirty_bsp_distance = require_registers(
     "rse_return_growth_keeps_dirty_bsp_distance", [
@@ -4257,7 +4617,7 @@ test_cover_b_ignored_fields_decode = require_registers(
     "cover_b_ignored_fields_decode", [
         (0x10, 0x00, nop_m(), alloc(5, 8, 4, 0, 0), nop_i()),
         (0x20, 0x18, nop_m(), nop_m(),
-         cover_b_ignored_fields(qp=1)),
+         cover_b_ignored_fields()),
         (0x30, 0x10, nop_m(), nop_i(),
          br_cond(0x30, 0x30)),
     ], {
@@ -4537,6 +4897,7 @@ test_clrrrb_rebases_rotating_floating_registers = require_registers(
 
 test_rse_rfi_selects_matching_outer_exception_frame = require_registers(
     "rse_rfi_selects_matching_outer_exception_frame", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(2, IA64_PSR_IC)),
         (0x20, *movl_mlx(3, 0x100000)),
         (0x30, 0x00, mov_ar(3, 18), nop_i(),
@@ -4603,7 +4964,7 @@ test_rse_rfi_selects_matching_outer_exception_frame = require_registers(
         "r10": 0,
         "cfm_sof": 0,
         "cfm_sol": 0,
-    }, entry=0x10)
+    }, entry=0x800)
 
 test_cover_requires_group_stop = require_exception(
     "cover_requires_group_stop", [
@@ -4623,6 +4984,34 @@ test_loadrs_rejects_nonzero_rsc_mode = require_exception(
         (0x30, 0x01, loadrs_enc(), nop_i(), nop_i()),
     ], IA64_EXCP_ILLEGAL, fault_ip=0x30)
 
+test_loadrs_capacity_illegal_precedes_backing_store_uda = require_exception(
+    "loadrs_capacity_illegal_precedes_backing_store_uda", [
+        # BSP-0x318..BSP contains 97 register words and two RNAT words.
+        (0x10, *movl_mlx(3, 1 << (IA64_IMPL_PA_BITS + 1))),
+        (0x20, 0x00, mov_m_gr_ar(3, 18), nop_i(), nop_i()),
+        (0x30, *movl_mlx(3, 0x318 << 16)),
+        (0x40, 0x00, mov_m_gr_ar(3, 16), nop_i(), nop_i()),
+        (0x50, 0x01, loadrs_enc(), nop_i(), nop_i()),
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x50)
+
+test_mov_bspstore_rsc_mode_precedes_source_nat = require_exception(
+    "mov_bspstore_rsc_mode_precedes_source_nat", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0), nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(16, 6, 0), nop_i(), nop_i()),
+        (0x30, 0x00, mov_m_imm_ar(16, 1), nop_i(), nop_i()),
+        (0x40, 0x00, mov_m_gr_ar(16, 18), nop_i(), nop_i()),
+        (0x200, 0x00, 0, 0, 0),
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x40)
+
+test_mov_rnat_rsc_mode_precedes_source_nat = require_exception(
+    "mov_rnat_rsc_mode_precedes_source_nat", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0), nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(16, 6, 0), nop_i(), nop_i()),
+        (0x30, 0x00, mov_m_imm_ar(16, 1), nop_i(), nop_i()),
+        (0x40, 0x00, mov_m_gr_ar(16, 19), nop_i(), nop_i()),
+        (0x200, 0x00, 0, 0, 0),
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x40)
+
 test_rsc_reserved_field_fault = require_exception(
     "rsc_reserved_field_fault", [
         (0x10, *movl_mlx(3, 1 << 63)),
@@ -4631,8 +5020,9 @@ test_rsc_reserved_field_fault = require_exception(
 
 test_stacked_gr_destination_out_of_frame = require_exception(
     "stacked_gr_destination_out_of_frame", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, 0x00, nop_m(), adds(32, 1, 0), nop_i()),
-    ], IA64_EXCP_ILLEGAL, fault_ip=0x10)
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x10, entry=0x800)
 
 test_predicated_off_stacked_gr_destination_does_not_fault = require_registers(
     "predicated_off_stacked_gr_destination_does_not_fault", [
@@ -4664,8 +5054,9 @@ test_predicated_off_stacked_write_keeps_following_write_valid = \
 
 test_postincrement_base_out_of_frame = require_exception(
     "postincrement_base_out_of_frame", [
+        *_empty_frame_prologue(0x800, 0x10),
         (0x10, 0x08, lfetch_postinc(32, 8), nop_m(), nop_i()),
-    ], IA64_EXCP_ILLEGAL, fault_ip=0x10)
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x10, entry=0x800)
 
 test_br_ia_bspstore_mismatch_illegal = require_exception(
     "br_ia_bspstore_mismatch_illegal", [
@@ -4687,7 +5078,8 @@ test_br_ctop_strcpy_pipeline_survives_cover_rfi = require_registers(
         (0x80, *movl_mlx(19, HIGH_TR_BASE + 0xc000)),
         (0x90, *movl_mlx(21, HIGH_TR_BASE + 0xc000 + 1000)),
         (0xa0, *movl_mlx(5, -1)),
-        (0xb0, *movl_mlx(17, (1 << 13) | (1 << 17) | (1 << 44))),
+        # mov psr.l updates only the low half and preserves PSR.bn.
+        (0xb0, *movl_mlx(17, (1 << 13) | (1 << 17))),
         (0xc0, 0x08, mov_gr_psr_full(17), srlz_d(), nop_i()),
         (0xd0, 0x00, alloc(2, 32, 2, 4, 0), mov_lc_gr(5), nop_i()),
         (0xe0, 0x00, nop_m(), mov_pr_rot_imm(0x10000), nop_i()),
@@ -4761,6 +5153,8 @@ test_rse_partial_group_fill_ignores_unwritten_collection = require_registers(
 
 CASE_NAMES = (
 
+    'rse_architectural_reset_exposes_full_frame',
+    'rse_boot_handoff_preserves_empty_frame',
     'alloc_m34_ignored_bits_decode',
     'alloc_predicated_illegal',
     'alloc_rejects_frame_larger_than_register_stack',
@@ -4777,8 +5171,11 @@ CASE_NAMES = (
     'cover_rfi_rebases_rotating_general_registers',
     'cover_rfi_restores_rotating_predicates_by_physical_number',
     'gcc_alloc_and_ar_lc',
+    'loadrs_capacity_illegal_precedes_backing_store_uda',
     'loadrs_rejects_nonzero_rsc_mode',
+    'mov_bspstore_rsc_mode_precedes_source_nat',
     'mov_pr_rot_with_nonzero_rrb_tracks_logical_predicates',
+    'mov_rnat_rsc_mode_precedes_source_nat',
     'postincrement_base_out_of_frame',
     'predicated_off_stacked_gr_destination_does_not_fault',
     'predicated_off_stacked_write_keeps_following_write_valid',
@@ -4789,6 +5186,8 @@ CASE_NAMES = (
     'rse_big_endian_backing_store',
     'rse_big_endian_partial_rnat_store_preserves_backed_prefix',
     'rse_big_endian_rnat_collection',
+    'rse_br_ret_completion_trap_waits_for_target_fill',
+    'rse_br_ret_ec_restored_before_target_fill_fault',
     'rse_br_ret_fill_dtlb_miss_retries_atomically',
     'rse_br_ret_fill_ignores_rsc_mode',
     'rse_bsp_is_current_frame_base',
@@ -4839,6 +5238,8 @@ CASE_NAMES = (
     'rse_loadrs_writeback_yields_to_bspstore_edit',
     'rse_loadrs_zero_current_frame_invalidates_parents',
     'rse_loadrs_zero_sol_return_keeps_bsp_without_cover',
+    'rse_mandatory_spill_consumes_psr_dd',
+    'rse_mandatory_target_fill_debug_sets_isr_rs_ir',
     'rse_merced_flushrs_invalidates_spilled_frame',
     'rse_merced_partial_rnat_store_preserves_backed_prefix',
     'rse_merced_respill_preserves_filled_rnat_prefix',
@@ -4885,8 +5286,11 @@ CASE_NAMES = (
     'rse_rfi_unmatched_context_keeps_guest_interruption_resources',
     'rse_rfi_user_context_preserves_loadrs_dirty_partition',
     'rse_rt_enables_protection_key_checks',
+    'rse_key_miss_precedes_mandatory_data_debug_with_dt_clear',
     'rse_sal_alt_dtlb_resumes_br_ret_fill',
     'rse_rt_translates_with_dt_disabled',
+    'rse_physical_spill_fault_sets_isr_rs',
+    'rse_physical_target_fill_fault_sets_isr_rs_ir',
     'rse_spill_fault_sets_isr_rs',
     'rse_tracked_return_redirties_reused_frame',
     'rse_untracked_return_redirties_restored_frame',
@@ -4900,6 +5304,12 @@ CASE_NAMES = (
 )
 
 CASE_METADATA = {
+    'rse_architectural_reset_exposes_full_frame': CaseMetadata(
+        tags=frozenset({'processor-reset'}),
+        required_features=frozenset({'machine:none', 'cpu-model:madison'})),
+    'rse_boot_handoff_preserves_empty_frame': CaseMetadata(
+        tags=frozenset({'firmware-handoff'}),
+        required_features=frozenset({'machine:ia64-vpc'})),
     'rse_sal_alt_dtlb_resumes_br_ret_fill': CaseMetadata(
         expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
         tags=frozenset({'firmware-sal'}),
@@ -4913,6 +5323,10 @@ CASE_METADATA = {
             'machine:itanium-vpc',
         }),
     ),
+    'rse_physical_spill_fault_sets_isr_rs': CaseMetadata(
+        nonterminal_effect_loop=True),
+    'rse_physical_target_fill_fault_sets_isr_rs_ir': CaseMetadata(
+        nonterminal_effect_loop=True),
     'rse_spill_fault_sets_isr_rs': CaseMetadata(nonterminal_effect_loop=True),
     'rse_uses_rsc_pl_for_access_rights': CaseMetadata(nonterminal_effect_loop=True),
 }

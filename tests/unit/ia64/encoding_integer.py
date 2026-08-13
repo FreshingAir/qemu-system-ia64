@@ -34,9 +34,10 @@ def addl(r1, imm, r3, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def alu_reg(x4, x2b, r1, r2, r3, qp=0):
+def alu_reg(x4, x2b, r1, r2, r3, qp=0, ignored=0):
     return (
         op(8)
+        | bitfield(ignored, 36, 1)
         | bitfield(x4, 29, 4)
         | bitfield(x2b, 27, 2)
         | bitfield(r3, 20, 7)
@@ -45,8 +46,8 @@ def alu_reg(x4, x2b, r1, r2, r3, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def add(r1, r2, r3, qp=0):
-    return alu_reg(0x0, 0x0, r1, r2, r3, qp)
+def add(r1, r2, r3, qp=0, ignored=0):
+    return alu_reg(0x0, 0x0, r1, r2, r3, qp, ignored)
 
 def add_one(r1, r2, r3, qp=0):
     return alu_reg(0x0, 0x1, r1, r2, r3, qp)
@@ -129,20 +130,22 @@ def tnat_nz_and(p1, p2, r2, ignored=0, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def popcnt(r1, r3, qp=0):
+def popcnt(r1, r3, qp=0, ignored=0):
     return (
         op(7)
         | bitfield(0x12, 27, 6)
+        | bitfield(ignored, 27, 1)
         | bitfield(3, 33, 3)
         | bitfield(r3, 20, 7)
         | bitfield(r1, 6, 7)
         | bitfield(qp, 0, 6)
     )
 
-def clz(r1, r3, qp=0):
+def clz(r1, r3, qp=0, ignored=0):
     return (
         op(7)
         | bitfield(0x1a, 27, 6)
+        | bitfield(ignored, 27, 1)
         | bitfield(3, 33, 3)
         | bitfield(r3, 20, 7)
         | bitfield(r1, 6, 7)
@@ -364,35 +367,32 @@ def cmp_ne_and(p1, p2, r2, r3, qp=0):
 def cmp4_eq_and(p1, p2, r2, r3, qp=0):
     return cmp_eq_and(p1, p2, r2, r3, qp) | bitfield(1, 34, 2)
 
-def cmp_ge_and(p1, p2, r3, ignored=0, qp=0):
+def cmp_ge_and(p1, p2, r3, qp=0):
     return (
         op(0xc)
         | bitfield(1, 33, 1)
         | bitfield(1, 36, 1)
-        | bitfield(ignored, 13, 7)
         | bitfield(r3, 20, 7)
         | bitfield(p2, 27, 6)
         | bitfield(p1, 6, 6)
         | bitfield(qp, 0, 6)
     )
 
-def cmp_gt_and(p1, p2, r3, ignored=0, qp=0):
+def cmp_gt_and(p1, p2, r3, qp=0):
     return (
         op(0xc)
         | bitfield(1, 36, 1)
-        | bitfield(ignored, 13, 7)
         | bitfield(r3, 20, 7)
         | bitfield(p2, 27, 6)
         | bitfield(p1, 6, 6)
         | bitfield(qp, 0, 6)
     )
 
-def cmp_le_or(p1, p2, r3, ignored=0, qp=0):
+def cmp_le_or(p1, p2, r3, qp=0):
     return (
         op(0xd)
         | bitfield(1, 12, 1)
         | bitfield(1, 36, 1)
-        | bitfield(ignored, 13, 7)
         | bitfield(r3, 20, 7)
         | bitfield(p2, 27, 6)
         | bitfield(p1, 6, 6)
@@ -422,15 +422,17 @@ def cmp_ge_or(p1, p2, r3, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def cmp_ge_or_issue_raw(p1, p2, r3, ignored, qp=0):
-    return cmp_ge_or(p1, p2, r3, qp) | bitfield(ignored, 13, 7)
+def cmp_ge_or_issue_raw(p1, p2, r3, zero=0, qp=0):
+    # A7 bits 19:13 are a literal-zero field.  Keep the raw argument only so
+    # negative decoder tests can construct a constant-zero violation.
+    return cmp_ge_or(p1, p2, r3, qp) | bitfield(zero, 13, 7)
 
-def cmp_ge_or_andcm_issue_raw(p1, p2, r3, ignored, qp=0):
+def cmp_ge_or_andcm_issue_raw(p1, p2, r3, zero=0, qp=0):
     return (
         op(0xe)
         | bitfield(1, 33, 1)
         | bitfield(1, 36, 1)
-        | bitfield(ignored, 13, 7)
+        | bitfield(zero, 13, 7)
         | bitfield(r3, 20, 7)
         | bitfield(p2, 27, 6)
         | bitfield(p1, 6, 6)
@@ -618,9 +620,10 @@ def reserved_a1_x4_5_x2b_1(r1, r2, r3, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def shladd(r1, r2, shift, r3, qp=0):
+def shladd(r1, r2, shift, r3, qp=0, ignored=0):
     return (
         op(8)
+        | bitfield(ignored, 36, 1)
         | bitfield(4, 29, 4)
         | bitfield(shift - 1, 27, 2)
         | bitfield(r3, 20, 7)

@@ -10,9 +10,11 @@ from .encoding import (
     CHECK_LOAD_DATA,
     DTR_PTE_NATPAGE,
     DTR_PTE_UC,
+    ExpectedFP,
     HIGH_TR_BASE,
     IA64_ALT_DTLB_VECTOR,
     IA64_BREAK_VECTOR,
+    IA64_EXCP_SINGLE_STEP,
     IA64_EXCP_ILLEGAL,
     IA64_EXCP_NAT_CONSUMPTION,
     IA64_EXCP_NONE,
@@ -23,6 +25,7 @@ from .encoding import (
     IA64_GENEX_UNIMPL_DATA_ADDR,
     IA64_IMPL_PA_BITS,
     IA64_ISR_CODE_REG_NAT,
+    IA64_ISR_CODE_SS,
     IA64_ISR_ED,
     IA64_ISR_EI_SHIFT,
     IA64_ISR_NA,
@@ -37,6 +40,8 @@ from .encoding import (
     IA64_PSR_ED,
     IA64_PSR_IC,
     IA64_PSR_IT,
+    IA64_PSR_SS,
+    IA64_SINGLE_STEP_VECTOR,
     IA64_UNALIGNED_VECTOR,
     IA64_UNSUPPORTED_DATA_REFERENCE_VECTOR,
     LOW_VECTOR_ITIR,
@@ -66,12 +71,13 @@ from .encoding import (
     cmp8xchg16_rel,
     cmp_eq_and,
     cmp_ge_or,
-    cmpxchg4,
     cmpxchg4_acq,
     cmpxchg_rel,
     cover_b,
     czx1_r,
     dtr_setup_bundles,
+    extr_u,
+    fc,
     fc_i,
     fetchadd4_acq,
     fetchadd4_rel,
@@ -107,7 +113,14 @@ from .encoding import (
     ld8_s_hint,
     ld8_s_postinc,
     ld8_sa,
+    ldf8_a,
+    ldf8_s,
+    ldf_fill_postinc,
+    ldfd,
+    ldfe,
+    ldfps,
     lfetch,
+    lfetch_count,
     lfetch_postinc,
     lfetch_reg_postinc,
     loadrs_enc,
@@ -149,6 +162,8 @@ from .encoding import (
     register_nat_consumption_test,
     require_exception,
     require_registers,
+    reserved_m_major2,
+    reserved_memory_selector,
     rfi_b,
     rfi_to_gr,
     rum,
@@ -166,6 +181,8 @@ from .encoding import (
     st8_postinc,
     st8_rel,
     st8_spill_postinc,
+    stfd,
+    stf_spill_postinc,
     store_mem,
     store_mem_postinc,
     sum_um,
@@ -388,6 +405,21 @@ test_ld8_a_uc_zeroes_target_and_skips_alat = require_registers(
     ], {"ip": 0xd0, "r4": ADV_UC_LOAD_DATA, "r5": 0,
         "exception": IA64_EXCP_NONE}, entry=0x10)
 
+test_ld8_c_nc_uc_miss_does_not_allocate_alat = require_registers(
+    "ld8_c_nc_uc_miss_does_not_allocate_alat", [
+        *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
+                           pte_flags=DTR_PTE_UC),
+        (0x70, *movl_mlx(2, ADV_UC_LOAD_VA)),
+        (0x80, *movl_mlx(19, (1 << 13) | (1 << 17))),
+        (0x90, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
+        (0xa0, 0x00, ld8_c_nc(4, 2), nop_i(), nop_i()),
+        (0xb0, 0x00, chk_a_nc_m(4, 0xb0, 0xd0), adds(5, 1, 0), nop_i()),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0xd0)),
+        ADV_UC_LOAD_BUNDLE,
+    ], {"ip": 0xd0, "r4": ADV_UC_LOAD_DATA, "r5": 0,
+        "exception": IA64_EXCP_NONE}, entry=0x10)
+
 test_ld8_s_uc_defers = require_registers(
     "ld8_s_uc_defers", [
         *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
@@ -405,6 +437,49 @@ test_ld8_s_uc_defers = require_registers(
         ADV_UC_LOAD_BUNDLE,
     ], {"ip": 0xd0, "r4_nat": 1,
         "exception": IA64_EXCP_NONE}, entry=0x10)
+
+test_non_speculative_attribute_returns_failure_values = \
+    require_registers(
+        "non_speculative_attribute_returns_failure_values", [
+            *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
+                               pte_flags=DTR_PTE_UC),
+            (0x70, *movl_mlx(2, ADV_UC_LOAD_VA)),
+            (0x80, *movl_mlx(19, (1 << 13) | (1 << 17))),
+            (0x90, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
+            # A UC/non-speculative attribute forces advanced loads to return
+            # zero and control-speculative loads to defer.  The address is
+            # aligned because fault qualification precedes that response.
+            (0xa0, 0x00, ld8_a(4, 2), nop_i(), nop_i()),
+            (0xb0, 0x00, ldf8_a(7, 2), nop_i(), nop_i()),
+            (0xc0, 0x00, ld8_s(5, 2), nop_i(), nop_i()),
+            (0xd0, 0x00, ldf8_s(8, 2), nop_i(), nop_i()),
+            (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xe0)),
+            ADV_UC_LOAD_BUNDLE,
+        ], {
+            "ip": 0xe0,
+            "r4": 0,
+            "r4_nat": 0,
+            "r5_nat": 1,
+            "f7": ExpectedFP(0, 0x1003e),
+            "f8": ExpectedFP(0, 0x1fffe, nat=True),
+            "exception": IA64_EXCP_NONE,
+        }, entry=0x10)
+
+test_integer_advanced_non_speculative_unaligned_faults = require_exception(
+    "integer_advanced_non_speculative_unaligned_faults", [
+        (0x10, *movl_mlx(2, IA64_PHYS_UC_BIT | 0x101)),
+        (0x20, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_AC)),
+        (0x30, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0x40, 0x00, ld8_a(4, 2), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x40)
+
+test_fp_advanced_non_speculative_unaligned_faults = require_exception(
+    "fp_advanced_non_speculative_unaligned_faults", [
+        (0x10, *movl_mlx(2, IA64_PHYS_UC_BIT | 0x101)),
+        (0x20, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_AC)),
+        (0x30, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0x40, 0x00, ldf8_a(7, 2), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x40)
 
 test_ld8_c_nc_address_mismatch_reloads = require_registers(
     "ld8_c_nc_address_mismatch_reloads", [
@@ -441,7 +516,7 @@ test_ld8_c_clr_address_mismatch_reloads = require_registers(
     ], {"ip": 0x50, "r4": CHECK_LOAD_MISMATCH_DATA}, entry=0x10)
 
 test_ld16_loads_gr_and_csd = require_registers("ld16_loads_gr_and_csd", [
-    (0x10, 0x00, addl(3, 0x104, 0), addl(4, 0x10c, 0),
+    (0x10, 0x00, addl(3, 0x100, 0), addl(4, 0x108, 0),
      nop_i()),
     (0x20, *movl_mlx(16, 0x0123456789abcdef)),
     (0x30, *movl_mlx(17, 0xfedcba9876543210)),
@@ -485,7 +560,7 @@ test_ld16_acq_hint_decode = require_registers("ld16_acq_hint_decode", [
 }, entry=0x10)
 
 test_st16_stores_gr_and_csd = require_registers("st16_stores_gr_and_csd", [
-    (0x10, 0x00, addl(3, 0x204, 0), addl(4, 0x20c, 0),
+    (0x10, 0x00, addl(3, 0x200, 0), addl(4, 0x208, 0),
      nop_i()),
     (0x20, *movl_mlx(15, 0x0123456789abcdef)),
     (0x30, *movl_mlx(5, 0xfedcba9876543210)),
@@ -528,6 +603,154 @@ test_st16_rel_stores_gr_and_csd = require_registers(
         "r30": 0x8877665544332211,
         "exception": IA64_EXCP_NONE,
     }, entry=0x10)
+
+# ld16/st16 are architecturally 16-byte aligned even when PSR.ac is clear.
+test_ld16_unaligned_always_faults = require_exception(
+    "ld16_unaligned_always_faults", [
+        (0x10, 0x00, addl(3, 0x108, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ld16(8, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+test_st16_unaligned_always_faults = require_exception(
+    "st16_unaligned_always_faults", [
+        (0x10, 0x00, addl(3, 0x208, 0), nop_i(), nop_i()),
+        (0x20, *movl_mlx(4, 0x1122334455667788)),
+        (0x30, 0x00, st16(3, 4), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x30, cpu="montecito")
+
+# Product-specific windows differ: Merced permits an integer reference
+# within one 16-byte block, whereas Madison restricts it to an 8-byte block.
+test_merced_integer_load_within_16byte_window = require_registers(
+    "merced_integer_load_within_16byte_window", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ld4(4, 3), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {"ip": 0x30, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="merced")
+
+test_madison_integer_load_crossing_8byte_window_faults = require_exception(
+    "madison_integer_load_crossing_8byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ld4(4, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+# A write-back Montecito store may span the 8-byte half-block but not the
+# containing 16-byte block; loads retain the narrower 8-byte window.
+test_montecito_store_within_16byte_window = require_registers(
+    "montecito_store_within_16byte_window", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, *movl_mlx(4, 0x11223344)),
+        (0x30, 0x00, st4(3, 4), nop_i(), nop_i()),
+        (0x40, 0x10, nop_m(), nop_i(), br_cond(0x40, 0x40)),
+    ], {"ip": 0x40, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="montecito")
+
+test_montecito_load_crossing_8byte_window_faults = require_exception(
+    "montecito_load_crossing_8byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ld4(4, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+test_montecito_store_crossing_16byte_window_faults = require_exception(
+    "montecito_store_crossing_16byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x10e, 0), addl(4, 0x55, 0), nop_i()),
+        (0x20, 0x00, st4(3, 4), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+# Floating-point model rules use their architected datum size rather than
+# the host helper width.  In particular ldfe transfers ten bytes but is
+# naturally aligned on 16 bytes.
+test_madison_fp_load_within_16byte_window = require_registers(
+    "madison_fp_load_within_16byte_window", [
+        (0x10, 0x00, addl(3, 0x102, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfd(6, 3), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {"ip": 0x30, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="madison")
+
+test_madison_fp_load_crossing_16byte_window_faults = require_exception(
+    "madison_fp_load_crossing_16byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x10c, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfd(6, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+test_montecito_fp_load_crossing_8byte_window_faults = require_exception(
+    "montecito_fp_load_crossing_8byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x102, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfd(6, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+test_montecito_fp_store_within_16byte_window = require_registers(
+    "montecito_fp_store_within_16byte_window", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, stfd(3, 1), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {"ip": 0x30, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="montecito")
+
+test_montecito_fp_store_crossing_16byte_window_faults = require_exception(
+    "montecito_fp_store_crossing_16byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x10c, 0), nop_i(), nop_i()),
+        (0x20, 0x00, stfd(3, 1), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+test_madison_fp_pair_requires_natural_alignment = require_exception(
+    "madison_fp_pair_requires_natural_alignment", [
+        (0x10, 0x00, addl(3, 0x104, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfps(6, 7, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+test_madison_fp_fill_requires_natural_alignment = require_exception(
+    "madison_fp_fill_requires_natural_alignment", [
+        (0x10, 0x00, addl(3, 0x108, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldf_fill_postinc(6, 3, 0), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+test_madison_fp_spill_requires_natural_alignment = require_exception(
+    "madison_fp_spill_requires_natural_alignment", [
+        (0x10, 0x00, addl(3, 0x108, 0), nop_i(), nop_i()),
+        (0x20, 0x00, stf_spill_postinc(3, 1, 0), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+test_madison_ldfe_within_16byte_window = require_registers(
+    "madison_ldfe_within_16byte_window", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfe(6, 3), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {"ip": 0x30, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="madison")
+
+test_madison_ldfe_crossing_16byte_window_faults = require_exception(
+    "madison_ldfe_crossing_16byte_window_faults", [
+        (0x10, 0x00, addl(3, 0x107, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldfe(6, 3), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="madison")
+
+test_montecito_uc_fp_store_crossing_8byte_window_faults = require_exception(
+    "montecito_uc_fp_store_crossing_8byte_window_faults", [
+        (0x10, *movl_mlx(3, IA64_PHYS_UC_BIT | 0x106)),
+        (0x20, 0x00, stfd(3, 1), nop_i(), nop_i()),
+    ], IA64_EXCP_UNALIGNED, fault_ip=0x20, cpu="montecito")
+
+test_madison_speculative_model_unaligned_defers = require_registers(
+    "madison_speculative_model_unaligned_defers", [
+        (0x10, 0x00, addl(3, 0x106, 0), nop_i(), nop_i()),
+        (0x20, 0x00, load_mem(0x06, 4, 3), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {"ip": 0x30, "r4_nat": 1, "exception": IA64_EXCP_NONE},
+    entry=0x10, cpu="madison")
+
+test_montecito_speculative_fp_model_unaligned_defers = require_registers(
+    "montecito_speculative_fp_model_unaligned_defers", [
+        (0x10, 0x00, addl(3, 0x102, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ldf8_s(6, 3), nop_i(), nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x30)),
+    ], {
+        "ip": 0x30,
+        "f6": ExpectedFP(0, 0x1fffe, nat=True),
+        "exception": IA64_EXCP_NONE,
+    },
+    entry=0x10, cpu="montecito")
 
 
 def montecito_uc_memory_fault_test(name, fault_bundle, address,
@@ -947,8 +1170,7 @@ test_fetchadd4_nat_base_sets_read_write_isr = require_registers(
         "ip": 0x5620,
         "exception": IA64_EXCP_NONE,
         "r14": 0,
-        "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_NA |
-               IA64_ISR_R | IA64_ISR_W,
+        "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_R | IA64_ISR_W,
     }, entry=0x10)
 
 NORMAL_LOAD_DATA = bundle_words(0x00, 0xdead, 0, 0)[0]
@@ -1091,7 +1313,7 @@ test_nat_consumption_sets_ifa_isr = require_registers(
         (0x200, 0x00, 0, 0,
          0),
     ], {"ip": 0x5620, "exception": IA64_EXCP_NONE, "r14": 0,
-        "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_NA | IA64_ISR_R},
+        "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_R},
     entry=0x10)
 
 test_nat_store_data_consumption_is_access = require_registers(
@@ -1105,6 +1327,29 @@ test_nat_store_data_consumption_is_access = require_registers(
         (0x40, 0x00, srlz_d(), nop_i(),
          nop_i()),
         (0x50, 0x00, st8(7, 5), nop_i(),
+         nop_i()),
+        (0x5600, 0x00, mov_m_cr_gr(14, 20), nop_i(),
+         nop_i()),
+        (0x5610, 0x00, mov_m_cr_gr(15, 17), nop_i(),
+         nop_i()),
+        (0x5620, 0x10, nop_m(), nop_i(),
+         br_cond(0x5620, 0x5620)),
+        (0x200, 0x00, 0, 0,
+         0),
+    ], {"ip": 0x5620, "exception": IA64_EXCP_NONE, "r14": 0,
+        "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_W}, entry=0x10)
+
+test_nat_store_base_consumption_is_access = require_registers(
+    "nat_store_base_consumption_is_access", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0),
+         nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(3, 6, 0), addl(5, 0x55, 0),
+         nop_i()),
+        (0x30, 0x00, ssm(1 << 13), nop_i(),
+         nop_i()),
+        (0x40, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x50, 0x00, st8(3, 5), nop_i(),
          nop_i()),
         (0x5600, 0x00, mov_m_cr_gr(14, 20), nop_i(),
          nop_i()),
@@ -1415,7 +1660,7 @@ test_speculative_recovery_unaligned_defers = require_registers(
         (0x30, *movl_mlx(19, (1 << 13) | (1 << 36) | (1 << 3))),
         (0x40, 0x00, adds(7, LOW_VECTOR_ITIR, 0), adds(5, 5, 0),
          nop_i()),
-        (0x50, 0x00, mov_m_gr_cr(7, 21), mov_m_gr_cr(0, 20),
+        (0x50, 0x08, mov_m_gr_cr(7, 21), mov_m_gr_cr(0, 20),
          nop_i()),
         (0x60, 0x00, itr_i(5, 18), nop_i(),
          nop_i()),
@@ -1442,7 +1687,7 @@ test_ws2003_cmd646_unaligned_check_load_sets_ed = require_registers(
         (0x30, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_IT | IA64_PSR_AC)),
         (0x40, 0x00, adds(7, 16 << 2, 0), adds(5, 5, 0),
          nop_i()),
-        (0x50, 0x00, mov_m_gr_cr(7, 21), mov_m_gr_cr(0, 20),
+        (0x50, 0x08, mov_m_gr_cr(7, 21), mov_m_gr_cr(0, 20),
          nop_i()),
         (0x60, 0x00, itr_i(5, 18), nop_i(),
          nop_i()),
@@ -1691,6 +1936,32 @@ test_st8_spill_updates_unat_bit = require_registers(
          br_cond(0x50, 0x50)),
     ], {"ip": 0x50, "ar_unat": 0}, entry=0x10)
 
+test_st8_spill_nated_source_writes_zero = require_registers(
+    "st8_spill_nated_source_writes_zero", [
+        (0x10, *movl_mlx(9, 1 << 32)),
+        (0x20, 0x00, mov_m_gr_ar(9, 36), addl(3, 0x100, 0),
+         nop_i()),
+        (0x30, *movl_mlx(16, 0x123456789abcdef0)),
+        (0x40, 0x00, st8(3, 16), nop_i(),
+         nop_i()),
+        (0x50, 0x00, ld8_fill_postinc(16, 3, 8), nop_i(),
+         nop_i()),
+        (0x60, 0x00, st8_spill_postinc(3, 16, 8), nop_i(),
+         nop_i()),
+        (0x70, 0x00, addl(3, 0x108, 0), nop_i(),
+         nop_i()),
+        (0x80, 0x00, ld8(17, 3), nop_i(),
+         nop_i()),
+        (0x90, 0x10, nop_m(), nop_i(),
+         br_cond(0x90, 0x90)),
+    ], {
+        "ip": 0x90,
+        "r16": 0x123456789abcdef0,
+        "r16_nat": 1,
+        "r17": 0,
+        "ar_unat": (1 << 32) | (1 << 33),
+    }, entry=0x10)
+
 test_integer_postinc_imm9_decode = require_registers(
     "integer_postinc_imm9_decode", [
         (0x10, 0x00, addl(3, 0x300, 0), nop_i(),
@@ -1746,7 +2017,7 @@ test_cmpxchg4_uses_ar_ccv = require_registers("cmpxchg4_uses_ar_ccv", [
      nop_i()),
     (0x30, 0x00, mov_m_gr_ar(4, 32), nop_i(),
      nop_i()),
-    (0x40, 0x00, cmpxchg4(5, 3, 6), nop_i(),
+    (0x40, 0x00, cmpxchg4_acq(5, 3, 6), nop_i(),
      nop_i()),
     (0x50, 0x00, load_mem(0x02, 7, 3), nop_i(),
      nop_i()),
@@ -1783,15 +2054,15 @@ test_cmpxchg4_repeated_word_updates = require_registers(
          nop_i()),
         (0x70, 0x00, mov_m_gr_ar(4, 32), nop_i(),
          nop_i()),
-        (0x80, 0x00, cmpxchg4(5, 3, 6), nop_i(),
+        (0x80, 0x00, cmpxchg4_acq(5, 3, 6), nop_i(),
          nop_i()),
         (0x90, 0x00, mov_m_gr_ar(6, 32), nop_i(),
          nop_i()),
-        (0xa0, 0x00, cmpxchg4(9, 3, 7), nop_i(),
+        (0xa0, 0x00, cmpxchg4_acq(9, 3, 7), nop_i(),
          nop_i()),
         (0xb0, 0x00, mov_m_gr_ar(7, 32), nop_i(),
          nop_i()),
-        (0xc0, 0x00, cmpxchg4(10, 3, 8), nop_i(),
+        (0xc0, 0x00, cmpxchg4_acq(10, 3, 8), nop_i(),
          nop_i()),
         (0xd0, 0x00, load_mem(0x02, 11, 3), nop_i(),
          nop_i()),
@@ -1901,9 +2172,25 @@ test_lfetch_decode = require_registers("lfetch_decode", [
      nop_i()),
     (0x40, 0x08, adds(5, 0x20, 0), lfetch_reg_postinc(3, 5, 0x2e, 2),
      nop_i()),
-    (0x50, 0x10, nop_m(), nop_i(),
-    br_cond(0x50, 0x50)),
-], {"ip": 0x50, "r3": 0x160, "r4": 0x200}, entry=0x10)
+    (0x50, 0x08, lfetch_count(3, 64, -1024, hint=3, h=1),
+     nop_m(), nop_i()),
+    (0x60, 0x10, nop_m(), nop_i(),
+    br_cond(0x60, 0x60)),
+], {"ip": 0x60, "r3": 0x160, "r4": 0x200}, entry=0x10)
+
+test_reserved_m_major2_predicate_semantics = require_registers(
+    "reserved_m_major2_predicate_semantics", [
+        (0x10, 0x00, reserved_m_major2(qp=1), nop_i(), nop_i()),
+        (0x20, 0x10, nop_m(), nop_i(), br_cond(0x20, 0x20)),
+    ], {
+        "ip": 0x20,
+        "exception": IA64_EXCP_NONE,
+    }, entry=0x10)
+
+test_reserved_m_major2_true_illegal = require_exception(
+    "reserved_m_major2_true_illegal", [
+        (0x10, 0x00, reserved_m_major2(), nop_i(), nop_i()),
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x10)
 
 test_tnat_unc_same_pred_pred_false_illegal = require_exception(
     "tnat_unc_same_pred_pred_false_illegal",
@@ -2305,6 +2592,24 @@ test_invala_clears_all_alat_entries = require_registers(
     ], {"ip": 0xb0, "r4": 0, "r5": 0, "r6": 0, "r7": 0},
     entry=0x10)
 
+test_fc_invalidates_overlapping_alat_cache_line = require_registers(
+    "fc_invalidates_overlapping_alat_cache_line", [
+        (0x10, 0x00, addl(3, 0x100, 0), addl(5, 0x140, 0),
+         nop_i()),
+        (0x20, 0x00, ld8_a(22, 3), nop_i(), nop_i()),
+        (0x30, 0x00, ld8_a(23, 5), nop_i(), nop_i()),
+        (0x40, 0x00, fc(3), nop_i(), nop_i()),
+        (0x50, 0x00, chk_a_nc_m(22, 0x50, 0x90), adds(4, 1, 0),
+         nop_i()),
+        (0x60, 0x10, nop_m(), nop_i(), br_cond(0x60, 0x60)),
+        (0x90, 0x00, chk_a_nc_m(23, 0x90, 0xd0), adds(6, 1, 0),
+         nop_i()),
+        (0xa0, 0x10, nop_m(), nop_i(), br_cond(0xa0, 0xa0)),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0xd0)),
+        (0x100, 0x00, 0x123456789abcdef0, 0, 0),
+        (0x140, 0x00, 0xfedcba9876543210, 0, 0),
+    ], {"ip": 0xd0, "r4": 0, "r6": 0}, entry=0x10, cpu="madison")
+
 
 test_st4_variants_preserve_adjacent_halfword = require_registers(
     "st4_variants_preserve_adjacent_halfword", [
@@ -2334,11 +2639,12 @@ test_st4_variants_preserve_adjacent_halfword = require_registers(
     }, entry=0x10)
 
 
-# SDM Vol 3, Table 4-29 (integer load/store x6 opcode extensions): spill and
+# SDM Vol 3, Table 4-30 (integer load/store x6 opcode extensions): spill and
 # fill exist only as the 8-byte forms (ld8.fill x6=0x1b, st8.spill x6=0x3b).
-# The x6 values 0x18-0x1a and 0x38-0x3a are blank in the table, so every
+# The x6 values 0x18-0x1a and 0x38-0x3a are purple blanks in the table, so an
 # instruction format that shares the integer load/store x6 space must raise
-# an Illegal Operation fault for them.  The no-update (M1/M4) and
+# Illegal Operation when its qualifying predicate is true and execute as a
+# nop when it is false.  The no-update (M1/M4) and
 # imm-base-update (M3/M5) forms are covered separately so a future decoder
 # split per format keeps faulting on the reserved values.
 def reserved_memory_x6_test(name, slot0):
@@ -2404,6 +2710,57 @@ test_store_postinc_x6_39_reserved_illegal_operation = reserved_memory_x6_test(
 test_store_postinc_x6_3a_reserved_illegal_operation = reserved_memory_x6_test(
     "store_postinc_x6_3a_reserved_illegal_operation",
     store_mem_postinc(0x3a, 3, 4, 8))
+
+
+# One representative purple cell from each integer-memory selector space in
+# SDM Vol. 3 Tables 4-28 and 4-30 through 4-33.  PR1 is reset-clear, so the
+# five exact qp=1 encodings below must all be nullified.
+_reserved_memory_selector_representatives = (
+    reserved_memory_selector(4, 0, 0, 0x18, qp=1),  # 0x8600000001
+    reserved_memory_selector(4, 1, 0, 0x18, qp=1),  # 0x9600000001
+    reserved_memory_selector(5, 0, 0, 0x18, qp=1),  # 0xa600000001
+    reserved_memory_selector(4, 0, 1, 0x0c, qp=1),  # 0x8308000001
+    reserved_memory_selector(4, 1, 1, 0x00, qp=1),  # 0x9008000001
+)
+
+test_reserved_memory_selectors_predicated_off_are_nops = require_registers(
+    "reserved_memory_selectors_predicated_off_are_nops", [
+        (0x10 + index * 0x10, 0x00, raw, nop_i(), nop_i())
+        for index, raw in enumerate(_reserved_memory_selector_representatives)
+    ] + [
+        (0x60, 0x10, nop_m(), nop_i(), br_cond(0x60, 0x60)),
+    ], {
+        "ip": 0x60,
+        "exception": IA64_EXCP_NONE,
+    }, entry=0x10)
+
+
+def reserved_memory_selector_true_test(name, raw):
+    return require_exception(name, [
+        (0x10, 0x00, raw & ~0x3f, nop_i(), nop_i()),
+    ], IA64_EXCP_ILLEGAL, fault_ip=0x10)
+
+
+test_reserved_memory_selector_m4_m0_x0_true_illegal = \
+    reserved_memory_selector_true_test(
+        "reserved_memory_selector_m4_m0_x0_true_illegal",
+        _reserved_memory_selector_representatives[0])
+test_reserved_memory_selector_m4_m1_x0_true_illegal = \
+    reserved_memory_selector_true_test(
+        "reserved_memory_selector_m4_m1_x0_true_illegal",
+        _reserved_memory_selector_representatives[1])
+test_reserved_memory_selector_m5_true_illegal = \
+    reserved_memory_selector_true_test(
+        "reserved_memory_selector_m5_true_illegal",
+        _reserved_memory_selector_representatives[2])
+test_reserved_memory_selector_m4_m0_x1_true_illegal = \
+    reserved_memory_selector_true_test(
+        "reserved_memory_selector_m4_m0_x1_true_illegal",
+        _reserved_memory_selector_representatives[3])
+test_reserved_memory_selector_m4_m1_x1_true_illegal = \
+    reserved_memory_selector_true_test(
+        "reserved_memory_selector_m4_m1_x1_true_illegal",
+        _reserved_memory_selector_representatives[4])
 
 test_bsw_restores_banked_nat = require_registers(
     "bsw_restores_banked_nat", [
@@ -2531,8 +2888,10 @@ test_mov_br_nat_source_consumes = register_nat_consumption_test(
 test_mov_pr_nat_source_consumes = register_nat_consumption_test(
     "mov_pr_nat_source_consumes",
     (0x00,
+     nop_m(),
      bitfield(3, 33, 3) | bitfield(16, 13, 7) | bitfield(0x7f, 6, 7),
-     nop_i(), nop_i()))
+     nop_i()),
+    1 << IA64_ISR_EI_SHIFT)
 
 test_mov_cr_nat_source_consumes = register_nat_consumption_test(
     "mov_cr_nat_source_consumes",
@@ -2652,6 +3011,73 @@ test_firmware_unaligned_load_assist = require_registers(
         "exception": IA64_EXCP_NONE,
         "r22": 0xddeeff0011223344,
         "r23": 1,
+    },
+)
+
+test_firmware_unaligned_reg_postinc_uses_old_increment = require_registers(
+    "firmware_unaligned_reg_postinc_uses_old_increment",
+    [
+        (0x10, *movl_mlx(20, 0x1122334455667788)),
+        (0x20, *movl_mlx(21, 0x99aabbccddeeff00)),
+        (0x30, 0x00, addl(3, 0x100, 0), addl(5, 0x20, 0), nop_i()),
+        (0x40, 0x0a, st8(3, 20), adds(3, 8, 3), nop_i()),
+        (0x50, 0x0a, st8(3, 21), adds(3, -4, 3), nop_i()),
+        (0x60, 0x00, addl(2, 0x10000, 0), nop_i(), nop_i()),
+        (0x70, 0x00, mov_m_gr_cr(2, 2), nop_i(), nop_i()),
+        (0x80, 0x00, ssm((1 << 13) | (1 << 3)), nop_i(), nop_i()),
+        (0x90, 0x0a, load_mem_reg_postinc(0x03, 5, 3, 5),
+         adds(23, 1, 0), nop_i()),
+        (0xa0, 0x10, nop_m(), nop_i(), br_cond(0xa0, 0xa0)),
+    ],
+    {
+        "ip": 0xa0,
+        "exception": IA64_EXCP_NONE,
+        "r3": 0x124,
+        "r5": 0xddeeff0011223344,
+        "r23": 1,
+    },
+)
+
+test_firmware_unaligned_assist_retires_single_step = require_registers(
+    "firmware_unaligned_assist_retires_single_step",
+    [
+        (0x10, *movl_mlx(20, 0x1122334455667788)),
+        (0x20, 0x00, addl(3, 0x300, 0), nop_i(), nop_i()),
+        (0x30, 0x00, st8(3, 20), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(3, 4, 3), nop_i()),
+        (0x50, *movl_mlx(2, IA64_FIRMWARE_IVT_BASE)),
+        (0x60, 0x00, mov_m_gr_cr(2, 2), nop_i(), nop_i()),
+        (0x70, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_AC | IA64_PSR_SS)),
+        (0x80, *movl_mlx(4, 0x110)),
+        *rfi_to_gr(0x90, 2, 4),
+        # A firmware-assisted instruction still completes in slot 0.  The
+        # single-step trap must therefore name slot 1 as its target; trapping
+        # only after the following nop would incorrectly report slot 2.
+        (0x110, 0x00, ld8(22, 3), nop_i(), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR, 0x00,
+         mov_m_cr_gr(24, 19), nop_i(), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x10, 0x00,
+         mov_m_cr_gr(25, 22), nop_i(), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x20, 0x00,
+         mov_m_cr_gr(26, 17), nop_i(), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x30, 0x00,
+         mov_m_cr_gr(27, 16), nop_i(), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x40, 0x02,
+         nop_m(), extr_u(28, 27, 41, 2), nop_i()),
+        (IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x50, 0x10,
+         nop_m(), nop_i(),
+         br_cond(IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x50,
+                 IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x50)),
+    ],
+    {
+        "ip": IA64_FIRMWARE_IVT_BASE + IA64_SINGLE_STEP_VECTOR + 0x50,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_SINGLE_STEP,
+        "r22": 0x11223344,
+        "r24": 0x110,
+        "r25": 0x110,
+        "r26": IA64_ISR_CODE_SS,
+        "r28": 1,
     },
 )
 
@@ -2816,6 +3242,7 @@ CASE_NAMES = (
     'cmpxchg4_uses_ar_ccv',
     'data_big_endian_cmpxchg4',
     'data_big_endian_load_store',
+    'fc_invalidates_overlapping_alat_cache_line',
     'fc_nat_source_consumes_non_access',
     'fetchadd4_nat_base_sets_read_write_isr',
     'fetchadd4_result_base_alias_invalidates_alat',
@@ -2824,9 +3251,13 @@ CASE_NAMES = (
     'firmware_alt_dtlb_nonspeculative_load_faults',
     'firmware_alt_dtlb_speculative_load_defers',
     'firmware_unaligned_load_assist',
+    'firmware_unaligned_assist_retires_single_step',
+    'firmware_unaligned_reg_postinc_uses_old_increment',
     'firmware_unaligned_speculative_load_assist',
     'firmware_unaligned_store_assist',
     'firmware_unaligned_virtual_load_assist',
+    'fp_advanced_non_speculative_unaligned_faults',
+    'integer_advanced_non_speculative_unaligned_faults',
     'integer_compare_nat_source_rules',
     'integer_nat_propagates_and_clears',
     'integer_postinc_imm9_decode',
@@ -2836,6 +3267,7 @@ CASE_NAMES = (
     'ld16_loads_gr_and_csd',
     'ld16_madison_illegal_operation',
     'ld16_uc_unsupported_data_reference',
+    'ld16_unaligned_always_faults',
     'ld1_acq_decode',
     'ld1_postinc_decode',
     'ld1_reg_postinc_decode',
@@ -2850,6 +3282,7 @@ CASE_NAMES = (
     'ld8_c_nc_address_mismatch_reloads',
     'ld8_c_nc_hit_consumes_nat_base',
     'ld8_c_nc_hit_preserves_target',
+    'ld8_c_nc_uc_miss_does_not_allocate_alat',
     'ld8_fill_restores_unat_bit',
     'ld8_fill_st8_spill_postinc_decode',
     'ld8_nt1_postinc_decode',
@@ -2860,6 +3293,14 @@ CASE_NAMES = (
     'ld_postinc_same_target_predicated_false',
     'ld_reg_postinc_same_target_illegal',
     'lfetch_decode',
+    'reserved_m_major2_predicate_semantics',
+    'reserved_m_major2_true_illegal',
+    'reserved_memory_selector_m4_m0_x0_true_illegal',
+    'reserved_memory_selector_m4_m0_x1_true_illegal',
+    'reserved_memory_selector_m4_m1_x0_true_illegal',
+    'reserved_memory_selector_m4_m1_x1_true_illegal',
+    'reserved_memory_selector_m5_true_illegal',
+    'reserved_memory_selectors_predicated_off_are_nops',
     'load_postinc_x6_18_reserved_illegal_operation',
     'load_postinc_x6_19_reserved_illegal_operation',
     'load_postinc_x6_1a_reserved_illegal_operation',
@@ -2871,6 +3312,16 @@ CASE_NAMES = (
     'load_x6_1a_reserved_illegal_operation',
     'memory_cache_hints_decode',
     'memory_order_completers_decode',
+    'madison_fp_fill_requires_natural_alignment',
+    'madison_fp_load_crossing_16byte_window_faults',
+    'madison_fp_load_within_16byte_window',
+    'madison_fp_pair_requires_natural_alignment',
+    'madison_fp_spill_requires_natural_alignment',
+    'madison_integer_load_crossing_8byte_window_faults',
+    'madison_ldfe_crossing_16byte_window_faults',
+    'madison_ldfe_within_16byte_window',
+    'madison_speculative_model_unaligned_defers',
+    'merced_integer_load_within_16byte_window',
     'mlx_chk_a_clr_nop_x_decode',
     'mov_ar_nat_source_consumes',
     'mov_br_nat_source_consumes',
@@ -2883,10 +3334,20 @@ CASE_NAMES = (
     'mov_psr_nat_source_consumes',
     'mov_rr_nat_index_consumes',
     'mov_um_nat_source_consumes',
+    'montecito_fp_load_crossing_8byte_window_faults',
+    'montecito_fp_store_crossing_16byte_window_faults',
+    'montecito_fp_store_within_16byte_window',
+    'montecito_load_crossing_8byte_window_faults',
+    'montecito_speculative_fp_model_unaligned_defers',
+    'montecito_store_crossing_16byte_window_faults',
+    'montecito_store_within_16byte_window',
+    'montecito_uc_fp_store_crossing_8byte_window_faults',
     'nat_consumption_sets_ifa_isr',
+    'nat_store_base_consumption_is_access',
     'nat_store_data_consumption_is_access',
     'normal_load_clears_stale_nat',
     'normal_load_consumes_nat_base',
+    'non_speculative_attribute_returns_failure_values',
     'pshl_nat_propagates',
     'pshr_nat_propagates',
     'semaphore_ops_clear_result_nat',
@@ -2907,9 +3368,11 @@ CASE_NAMES = (
     'st16_rel_stores_gr_and_csd',
     'st16_stores_gr_and_csd',
     'st16_uc_unsupported_data_reference',
+    'st16_unaligned_always_faults',
     'st1_postinc_decode',
     'st4_variants_preserve_adjacent_halfword',
     'st8_postinc_same_base_value_uses_old_base',
+    'st8_spill_nated_source_writes_zero',
     'st8_spill_updates_unat_bit',
     'store_invalidates_advanced_load',
     'store_postinc_x6_38_reserved_illegal_operation',

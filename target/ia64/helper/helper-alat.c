@@ -15,16 +15,21 @@ void helper_invala(CPUIA64State *env)
     ia64_alat_invala(env);
 }
 
-void helper_set_alat(CPUIA64State *env, uint32_t reg, uint64_t addr,
-                     uint32_t size)
+uint64_t helper_alat_load_begin(CPUIA64State *env)
 {
-    ia64_alat_set(env, reg, addr, size);
+    return ia64_alat_load_begin(env);
+}
+
+void helper_set_alat(CPUIA64State *env, uint32_t reg, uint64_t addr,
+                     uint32_t size, uint64_t generation)
+{
+    ia64_alat_set(env, reg, addr, size, generation);
 }
 
 void helper_set_alat_fp(CPUIA64State *env, uint32_t reg, uint64_t addr,
-                        uint32_t size)
+                        uint32_t size, uint64_t generation)
 {
-    ia64_alat_set_fp(env, reg, addr, size);
+    ia64_alat_set_fp(env, reg, addr, size, generation);
 }
 
 void helper_invalidate_alat_reg(CPUIA64State *env, uint32_t reg)

@@ -53,9 +53,10 @@ void helper_merced_dtlb1_touch(CPUIA64State *env, uint64_t va, uint32_t size)
     ia64_mmu_data_access(env, va, size, true);
 }
 
-void helper_fc(CPUIA64State *env, uint64_t addr)
+void helper_fc(CPUIA64State *env, uint64_t addr,
+               uint32_t instruction_cache_coherent)
 {
-    ia64_mmu_fc(env, addr);
+    ia64_mmu_fc(env, addr, instruction_cache_coherent);
 }
 
 void helper_itr_insert(CPUIA64State *env, uint64_t pte, uint64_t slot_reg,
@@ -65,15 +66,15 @@ void helper_itr_insert(CPUIA64State *env, uint64_t pte, uint64_t slot_reg,
 }
 
 void helper_ptr_purge(CPUIA64State *env, uint64_t ifa, uint64_t size_reg,
-                      uint32_t is_data)
+                      uint32_t is_data, uint64_t raw, uint32_t fault_slot)
 {
-    ia64_mmu_ptr_purge(env, ifa, size_reg, is_data);
+    ia64_mmu_ptr_purge(env, ifa, size_reg, is_data, raw, fault_slot);
 }
 
 void helper_ptc_purge(CPUIA64State *env, uint64_t va, uint64_t size_reg,
-                      uint32_t mode)
+                      uint32_t mode, uint64_t raw, uint32_t fault_slot)
 {
-    ia64_mmu_ptc_purge(env, va, size_reg, mode);
+    ia64_mmu_ptc_purge(env, va, size_reg, mode, raw, fault_slot);
 }
 
 uint64_t helper_tpa(CPUIA64State *env, uint64_t va)
@@ -99,6 +100,20 @@ void helper_lfetch_fault(CPUIA64State *env, uint64_t va,
     ia64_mmu_lfetch_fault(env, va, fault_info, hint);
 }
 
+void helper_data_debug(CPUIA64State *env, uint64_t va, uint32_t size,
+                       uint64_t isr_access, uint64_t fault_info)
+{
+    ia64_mmu_check_data_debug(
+        env, va, size, isr_access, ia64_psr_cpl(env->psr), false,
+        fault_info & ~3ULL, fault_info & 3);
+}
+
+void helper_instruction_debug(CPUIA64State *env, uint64_t address,
+                              uint32_t slot)
+{
+    ia64_check_instruction_debug(env, address, slot);
+}
+
 void helper_check_semaphore_access(CPUIA64State *env, uint64_t va)
 {
     ia64_mmu_check_semaphore_access(env, va);
@@ -110,16 +125,25 @@ void helper_check_montecito_16byte_access(CPUIA64State *env, uint64_t va,
     ia64_mmu_check_montecito_16byte_access(env, va, is_write);
 }
 
+void helper_check_alignment(CPUIA64State *env, uint64_t va,
+                            uint32_t alignment_info, uint64_t isr_access,
+                            uint64_t fault_info)
+{
+    ia64_mmu_check_alignment(env, va, alignment_info, isr_access, fault_info);
+}
+
 uint64_t helper_speculative_probe(CPUIA64State *env, uint64_t va,
                                   uint32_t is_write, uint32_t is_ifetch,
-                                  uint32_t size)
+                                  uint32_t debug_size,
+                                  uint32_t alignment_info)
 {
-    uint64_t result =
-        ia64_mmu_speculative_probe(env, va, is_write, is_ifetch, size);
+    uint64_t result = ia64_mmu_speculative_probe(
+        env, va, is_write, is_ifetch, debug_size, alignment_info);
 
     if (!result) {
         trace_ia64_speculative_probe_defer(
-            env_cpu(env)->cpu_index, env->ip, va, size);
+            env_cpu(env)->cpu_index, env->ip, va,
+            alignment_info & IA64_ALIGNMENT_DATUM_MASK);
     }
     return result;
 }

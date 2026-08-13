@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from .case import (CaseMetadata, CaseObservation, bind_cases)
 from .encoding import (
+    IA64_DBR_IMPLEMENTED_COUNT,
+    IA64_IBR_IMPLEMENTED_COUNT,
     IA64_CR_ITM,
     IA64_CR_ITV,
     IA64_EXCP_NONE,
@@ -1219,7 +1221,8 @@ test_pal_brand_info_merced_unimplemented = require_registers(
 test_pal_debug_info = require_registers("pal_debug_info",
     pal_call_program(PAL_DEBUG_INFO),
     {"ip": 0x30, "r28": PAL_DEBUG_INFO, "r8": 0,
-     "r9": 4, "r10": 4, "r11": 0}, entry=0x10)
+     "r9": IA64_IBR_IMPLEMENTED_COUNT // 2,
+     "r10": IA64_DBR_IMPLEMENTED_COUNT // 2, "r11": 0}, entry=0x10)
 
 test_pal_debug_info_reserved_arg = require_registers(
     "pal_debug_info_reserved_arg",

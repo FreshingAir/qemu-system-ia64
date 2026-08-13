@@ -1645,8 +1645,8 @@ static void pal_debug_info(CPUIA64State *env)
 {
     if (pal_reserved_args_are_zero(env)) {
         env->gr[IA64_PAL_GR_STATUS] = PAL_STATUS_SUCCESS;
-        env->gr[IA64_PAL_GR_RESULT1] = 4;
-        env->gr[IA64_PAL_GR_RESULT2] = 4;
+        env->gr[IA64_PAL_GR_RESULT1] = IA64_IBR_IMPLEMENTED_COUNT / 2;
+        env->gr[IA64_PAL_GR_RESULT2] = IA64_DBR_IMPLEMENTED_COUNT / 2;
     } else {
         env->gr[IA64_PAL_GR_STATUS] = PAL_STATUS_INVALID_ARGUMENT;
         env->gr[IA64_PAL_GR_RESULT1] = 0;

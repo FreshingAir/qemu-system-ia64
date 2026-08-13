@@ -29,8 +29,8 @@ typedef enum IA64IntegerLoadKind {
     IA64_INTEGER_LOAD_CHECK,
 } IA64IntegerLoadKind;
 
-static void ia64_gen_check_nat_non_access(const Ia64Instruction *insn,
-                                          uint8_t reg, bool is_write);
+static void ia64_gen_check_nat_access(const Ia64Instruction *insn,
+                                      uint8_t reg, bool is_write);
 static void ia64_gen_load_reg_base_update_inputs(
     const Ia64Instruction *insn, TCGv_i64 *increment,
     TCGv_i64 *base_nat, TCGv_i64 *increment_nat);
@@ -41,6 +41,34 @@ static void ia64_gen_load_reg_base_update(const Ia64Instruction *insn,
                                           TCGv_i64 increment_nat);
 static void ia64_gen_ld_fill_nat(const Ia64Instruction *insn, uint8_t reg,
                                  TCGv_i64 addr);
+
+static TCGv_i64 ia64_gen_alat_load_begin(void)
+{
+    TCGv_i64 generation = tcg_temp_new_i64();
+
+    gen_helper_alat_load_begin(generation, tcg_env);
+    return generation;
+}
+
+static void ia64_gen_set_check_load_alat(TCGv_i64 addr, uint32_t reg,
+                                         uint32_t size, bool fp,
+                                         TCGv_i64 generation)
+{
+    TCGv_i64 allowed = tcg_temp_new_i64();
+    TCGLabel *done = gen_new_label();
+
+    /* A c.nc miss reloads sequential memory and may allocate an ALAT entry. */
+    gen_helper_advanced_load_allowed(allowed, tcg_env, addr);
+    tcg_gen_brcondi_i64(TCG_COND_EQ, allowed, 0, done);
+    if (fp) {
+        gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(reg), addr,
+                               tcg_constant_i32(size), generation);
+    } else {
+        gen_helper_set_alat(tcg_env, tcg_constant_i32(reg), addr,
+                            tcg_constant_i32(size), generation);
+    }
+    gen_set_label(done);
+}
 
 static IA64MemoryPlan ia64_memory_plan(DisasContext *ctx,
                                        const Ia64Instruction *insn,
@@ -88,11 +116,12 @@ static void ia64_gen_integer_load(DisasContext *ctx,
         return;
     }
 
-    ia64_gen_check_nat_non_access(insn, op->base, false);
+    ia64_gen_check_nat_access(insn, op->base, false);
 
     if (kind == IA64_INTEGER_LOAD_CHECK) {
         const bool clear = insn->opcode >= IA64_OP_LD1C_CLR &&
                            insn->opcode <= IA64_OP_LD8C_CLR;
+        TCGv_i64 alat_generation = NULL;
         TCGLabel *done = NULL;
 
         if (ctx->memory.full_alat) {
@@ -105,32 +134,49 @@ static void ia64_gen_integer_load(DisasContext *ctx,
             tcg_gen_brcondi_i64(TCG_COND_NE, hit, 0, done);
         }
 
-        ia64_gen_check_alignment(insn, plan.address, plan.size, false, false);
+        ia64_gen_check_alignment(ctx, insn, plan.address, plan.size, false,
+                                 false);
+        if (!clear && ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_qemu_ld_i64(ctx, cpu_gr[op->destination], plan.address,
                              ctx->memory.mmu_idx, plan.memop);
         ia64_gen_gr_nat_clear(insn, op->destination);
-        ia64_gen_memory_acquire(insn);
         if (!clear && ctx->memory.full_alat) {
-            gen_helper_set_alat(tcg_env, tcg_constant_i32(op->destination),
-                                plan.address, tcg_constant_i32(plan.size));
+            ia64_gen_set_check_load_alat(plan.address, op->destination,
+                                         plan.size, false, alat_generation);
         }
         if (done) {
             gen_set_label(done);
         }
+        /* ld.c.clr.acq orders the ALAT lookup even when it hits. */
+        ia64_gen_memory_acquire(insn);
     } else if (kind == IA64_INTEGER_LOAD_ADVANCED) {
         TCGv_i64 allowed = tcg_temp_new_i64();
+        TCGv_i64 alat_generation = NULL;
         TCGLabel *fail = gen_new_label();
         TCGLabel *done = gen_new_label();
 
-        ia64_gen_check_alignment(insn, plan.address, plan.size, false, false);
+        /*
+         * Fault qualification precedes the memory-attribute response.  A
+         * non-speculative page can force the advanced load to return zero,
+         * but does not suppress a matching Data Debug or Unaligned fault.
+         */
+        ia64_gen_check_alignment(ctx, insn, plan.address, plan.size, false,
+                                 false);
         gen_helper_advanced_load_allowed(allowed, tcg_env, plan.address);
         tcg_gen_brcondi_i64(TCG_COND_EQ, allowed, 0, fail);
+        if (ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
+
         ia64_gen_qemu_ld_i64(ctx, cpu_gr[op->destination], plan.address,
                              ctx->memory.mmu_idx, plan.memop);
         ia64_gen_gr_nat_clear(insn, op->destination);
         if (ctx->memory.full_alat) {
             gen_helper_set_alat(tcg_env, tcg_constant_i32(op->destination),
-                                plan.address, tcg_constant_i32(plan.size));
+                                plan.address, tcg_constant_i32(plan.size),
+                                alat_generation);
         }
         tcg_gen_br(done);
 
@@ -143,7 +189,8 @@ static void ia64_gen_integer_load(DisasContext *ctx,
         ia64_gen_gr_nat_clear(insn, op->destination);
         gen_set_label(done);
     } else {
-        ia64_gen_check_alignment(insn, plan.address, plan.size, false, false);
+        ia64_gen_check_alignment(ctx, insn, plan.address, plan.size, false,
+                                 false);
         ia64_gen_qemu_ld_i64(ctx, cpu_gr[op->destination], plan.address,
                              ctx->memory.mmu_idx, plan.memop);
         if (kind == IA64_INTEGER_LOAD_FILL) {
@@ -163,14 +210,6 @@ static void ia64_gen_check_nat_access(const Ia64Instruction *insn,
     ia64_gen_check_nat_consumption(insn, reg,
                                    is_write ? IA64_ISR_W : IA64_ISR_R,
                                    IA64_NAT_ACCESS);
-}
-
-static void ia64_gen_check_nat_non_access(const Ia64Instruction *insn,
-                                          uint8_t reg, bool is_write)
-{
-    ia64_gen_check_nat_consumption(insn, reg,
-                                   is_write ? IA64_ISR_W : IA64_ISR_R,
-                                   IA64_NAT_NON_ACCESS);
 }
 
 static void ia64_gen_check_nat_semaphore(const Ia64Instruction *insn,
@@ -281,6 +320,7 @@ static void ia64_gen_speculative_load(DisasContext *ctx,
     TCGv_i64 increment = NULL;
     TCGv_i64 base_nat = NULL;
     TCGv_i64 increment_nat = NULL;
+    TCGv_i64 alat_generation = NULL;
     TCGv_i64 ok;
     TCGLabel *l_fail;
     TCGLabel *l_done;
@@ -311,16 +351,23 @@ static void ia64_gen_speculative_load(DisasContext *ctx,
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_speculative_probe(ok, tcg_env, addr, tcg_constant_i32(0),
                                      tcg_constant_i32(0),
-                                     tcg_constant_i32(ia64_memop_size(mop)));
+                                     tcg_constant_i32(ia64_memop_size(mop)),
+                                     tcg_constant_i32(IA64_ALIGNMENT_INFO(
+                                         ia64_memop_size(mop),
+                                         ia64_memop_size(mop),
+                                         IA64_ALIGNMENT_INTEGER)));
         tcg_gen_brcondi_i64(TCG_COND_EQ, ok, 0, l_fail);
 
+        if (advanced && ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_qemu_ld_i64(ctx, cpu_gr[op->destination], addr,
                              ctx->memory.mmu_idx, mop);
         ia64_gen_gr_nat_clear(insn, op->destination);
         if (advanced && ctx->memory.full_alat) {
             gen_helper_set_alat(
                 tcg_env, tcg_constant_i32(op->destination), addr,
-                tcg_constant_i32(ia64_memop_size(mop)));
+                tcg_constant_i32(ia64_memop_size(mop)), alat_generation);
         }
         tcg_gen_br(l_done);
         gen_set_label(l_fail);
@@ -353,11 +400,46 @@ static uint32_t ia64_fp_load_size(Ia64Opcode opcode)
     case IA64_OP_LDF8:
         return 8;
     case IA64_OP_LDFE:
+        return 10;
     case IA64_OP_LDF_FILL:
         return 16;
     default:
         g_assert_not_reached();
     }
+}
+
+static uint32_t ia64_fp_load_alat_size(Ia64Opcode opcode)
+{
+    return ia64_fp_load_size(opcode);
+}
+
+static uint32_t ia64_fp_load_debug_size(Ia64Opcode opcode)
+{
+    /* Extended and spill/fill operands are 16-byte data-debug datums. */
+    return opcode == IA64_OP_LDFE || opcode == IA64_OP_LDF_FILL ?
+           16 : ia64_fp_load_size(opcode);
+}
+
+static uint32_t ia64_fp_load_natural_alignment(Ia64Opcode opcode)
+{
+    return opcode == IA64_OP_LDFE || opcode == IA64_OP_LDF_FILL ?
+           16 : ia64_fp_load_size(opcode);
+}
+
+static IA64AlignmentClass ia64_fp_load_alignment_class(Ia64Opcode opcode)
+{
+    return opcode == IA64_OP_LDF_FILL ?
+           IA64_ALIGNMENT_FP_FILL_SPILL : IA64_ALIGNMENT_FP;
+}
+
+static void ia64_gen_check_fp_load_alignment(
+    DisasContext *ctx, const Ia64Instruction *insn, TCGv_i64 addr)
+{
+    ia64_gen_check_alignment_model(
+        ctx, insn, addr, ia64_fp_load_debug_size(insn->opcode),
+        ia64_fp_load_size(insn->opcode),
+        ia64_fp_load_natural_alignment(insn->opcode),
+        ia64_fp_load_alignment_class(insn->opcode), IA64_ISR_R);
 }
 
 static void ia64_gen_fp_load_value(DisasContext *ctx,
@@ -428,10 +510,12 @@ static void ia64_gen_fp_load(DisasContext *ctx, const Ia64Instruction *insn)
 {
     const IA64MemoryOperands *op = &insn->operands.memory;
     const uint32_t size = ia64_fp_load_size(insn->opcode);
+    const uint32_t alat_size = ia64_fp_load_alat_size(insn->opcode);
     TCGv_i64 addr = tcg_temp_new_i64();
     TCGv_i64 increment = NULL;
     TCGv_i64 base_nat = NULL;
     TCGv_i64 increment_nat = NULL;
+    TCGv_i64 alat_generation = NULL;
 
     tcg_gen_mov_i64(addr, ia64_gr_src(op->base));
     ia64_gen_load_reg_base_update_inputs(insn, &increment, &base_nat,
@@ -441,19 +525,22 @@ static void ia64_gen_fp_load(DisasContext *ctx, const Ia64Instruction *insn)
         TCGv_i64 hit = tcg_temp_new_i64();
         TCGLabel *l_done = gen_new_label();
 
-        ia64_gen_check_nat_non_access(insn, op->base, false);
+        ia64_gen_check_nat_access(insn, op->base, false);
         gen_helper_check_load_alat_fp_addr(hit, tcg_env,
                                            tcg_constant_i32(op->destination),
-                                           addr, tcg_constant_i32(size),
+                                           addr, tcg_constant_i32(alat_size),
                                            tcg_constant_i32(
                                                insn->fp_load_check_clear));
         tcg_gen_brcondi_i64(TCG_COND_NE, hit, 0, l_done);
 
-        ia64_gen_check_alignment(insn, addr, size, false, false);
+        ia64_gen_check_fp_load_alignment(ctx, insn, addr);
+        if (!insn->fp_load_check_clear) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_value(ctx, insn, addr);
         if (!insn->fp_load_check_clear) {
-            gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+            ia64_gen_set_check_load_alat(addr, op->destination, alat_size,
+                                         true, alat_generation);
         }
 
         gen_set_label(l_done);
@@ -475,13 +562,25 @@ static void ia64_gen_fp_load(DisasContext *ctx, const Ia64Instruction *insn)
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_speculative_probe(ok, tcg_env, addr, tcg_constant_i32(0),
                                      tcg_constant_i32(0),
-                                     tcg_constant_i32(size));
+                                     tcg_constant_i32(
+                                         ia64_fp_load_debug_size(
+                                             insn->opcode)),
+                                     tcg_constant_i32(IA64_ALIGNMENT_INFO(
+                                         size,
+                                         ia64_fp_load_natural_alignment(
+                                             insn->opcode),
+                                         ia64_fp_load_alignment_class(
+                                             insn->opcode))));
         tcg_gen_brcondi_i64(TCG_COND_EQ, ok, 0, l_fail);
 
+        if (insn->fp_load_advanced && ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_value(ctx, insn, addr);
         if (insn->fp_load_advanced && ctx->memory.full_alat) {
             gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+                                   addr, tcg_constant_i32(alat_size),
+                                   alat_generation);
         }
         tcg_gen_br(l_done);
 
@@ -498,19 +597,23 @@ static void ia64_gen_fp_load(DisasContext *ctx, const Ia64Instruction *insn)
         return;
     }
 
-    ia64_gen_check_nat_non_access(insn, op->base, false);
-    ia64_gen_check_alignment(insn, addr, size, false, false);
+    ia64_gen_check_nat_access(insn, op->base, false);
     if (insn->fp_load_advanced) {
         TCGv_i64 allowed = tcg_temp_new_i64();
         TCGLabel *l_fail = gen_new_label();
         TCGLabel *l_done = gen_new_label();
 
+        ia64_gen_check_fp_load_alignment(ctx, insn, addr);
         gen_helper_advanced_load_allowed(allowed, tcg_env, addr);
         tcg_gen_brcondi_i64(TCG_COND_EQ, allowed, 0, l_fail);
+        if (ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_value(ctx, insn, addr);
         if (ctx->memory.full_alat) {
             gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+                                   addr, tcg_constant_i32(alat_size),
+                                   alat_generation);
         }
         tcg_gen_br(l_done);
 
@@ -526,6 +629,7 @@ static void ia64_gen_fp_load(DisasContext *ctx, const Ia64Instruction *insn)
                                      increment_nat);
         return;
     }
+    ia64_gen_check_fp_load_alignment(ctx, insn, addr);
     ia64_gen_fp_load_value(ctx, insn, addr);
     ia64_gen_fp_load_base_update(insn, addr, increment, base_nat,
                                  increment_nat);
@@ -542,6 +646,15 @@ static uint32_t ia64_fp_load_pair_size(Ia64Opcode opcode)
     default:
         g_assert_not_reached();
     }
+}
+
+static void ia64_gen_check_fp_load_pair_alignment(
+    DisasContext *ctx, const Ia64Instruction *insn, TCGv_i64 addr,
+    uint32_t size)
+{
+    ia64_gen_check_alignment_model(
+        ctx, insn, addr, size, size, size, IA64_ALIGNMENT_FP_PAIR,
+        IA64_ISR_R);
 }
 
 static void ia64_gen_fp_load_pair_value(DisasContext *ctx,
@@ -634,6 +747,7 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
     const IA64MemoryOperands *op = &insn->operands.memory;
     const uint32_t size = ia64_fp_load_pair_size(insn->opcode);
     TCGv_i64 addr = tcg_temp_new_i64();
+    TCGv_i64 alat_generation = NULL;
 
     tcg_gen_mov_i64(addr, ia64_gr_src(op->base));
 
@@ -641,7 +755,7 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
         TCGv_i64 hit = tcg_temp_new_i64();
         TCGLabel *l_done = gen_new_label();
 
-        ia64_gen_check_nat_non_access(insn, op->base, false);
+        ia64_gen_check_nat_access(insn, op->base, false);
         gen_helper_check_load_alat_fp_addr(hit, tcg_env,
                                            tcg_constant_i32(op->destination),
                                            addr, tcg_constant_i32(size),
@@ -649,11 +763,14 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
                                                insn->fp_load_check_clear));
         tcg_gen_brcondi_i64(TCG_COND_NE, hit, 0, l_done);
 
-        ia64_gen_check_alignment(insn, addr, size, false, false);
+        ia64_gen_check_fp_load_pair_alignment(ctx, insn, addr, size);
+        if (!insn->fp_load_check_clear) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_pair_value(ctx, insn, addr);
         if (!insn->fp_load_check_clear) {
-            gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+            ia64_gen_set_check_load_alat(addr, op->destination, size, true,
+                                         alat_generation);
         }
 
         gen_set_label(l_done);
@@ -674,13 +791,20 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_speculative_probe(ok, tcg_env, addr, tcg_constant_i32(0),
                                      tcg_constant_i32(0),
-                                     tcg_constant_i32(size));
+                                     tcg_constant_i32(size),
+                                     tcg_constant_i32(IA64_ALIGNMENT_INFO(
+                                         size, size,
+                                         IA64_ALIGNMENT_FP_PAIR)));
         tcg_gen_brcondi_i64(TCG_COND_EQ, ok, 0, l_fail);
 
+        if (insn->fp_load_advanced && ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_pair_value(ctx, insn, addr);
         if (insn->fp_load_advanced && ctx->memory.full_alat) {
             gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+                                   addr, tcg_constant_i32(size),
+                                   alat_generation);
         }
         tcg_gen_br(l_done);
 
@@ -696,19 +820,23 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
         return;
     }
 
-    ia64_gen_check_nat_non_access(insn, op->base, false);
-    ia64_gen_check_alignment(insn, addr, size, false, false);
+    ia64_gen_check_nat_access(insn, op->base, false);
     if (insn->fp_load_advanced) {
         TCGv_i64 allowed = tcg_temp_new_i64();
         TCGLabel *l_fail = gen_new_label();
         TCGLabel *l_done = gen_new_label();
 
+        ia64_gen_check_fp_load_pair_alignment(ctx, insn, addr, size);
         gen_helper_advanced_load_allowed(allowed, tcg_env, addr);
         tcg_gen_brcondi_i64(TCG_COND_EQ, allowed, 0, l_fail);
+        if (ctx->memory.full_alat) {
+            alat_generation = ia64_gen_alat_load_begin();
+        }
         ia64_gen_fp_load_pair_value(ctx, insn, addr);
         if (ctx->memory.full_alat) {
             gen_helper_set_alat_fp(tcg_env, tcg_constant_i32(op->destination),
-                                   addr, tcg_constant_i32(size));
+                                   addr, tcg_constant_i32(size),
+                                   alat_generation);
         }
         tcg_gen_br(l_done);
 
@@ -723,6 +851,7 @@ static void ia64_gen_fp_load_pair(DisasContext *ctx,
         ia64_gen_fp_load_pair_base_update(insn, addr);
         return;
     }
+    ia64_gen_check_fp_load_pair_alignment(ctx, insn, addr, size);
     ia64_gen_fp_load_pair_value(ctx, insn, addr);
     ia64_gen_fp_load_pair_base_update(insn, addr);
 }
@@ -736,7 +865,9 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
 
     switch (insn->opcode) {
     case IA64_OP_LFETCH:
+    case IA64_OP_LFETCH_COUNT:
     case IA64_OP_LFETCH_FAULT:
+        /* Models without counted-prefetch support execute M52 as lfetch. */
         ia64_gen_lfetch(insn);
         break;
     case IA64_OP_LD1:
@@ -783,12 +914,15 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             TCGv_i64 low = op->destination != 0 ? cpu_gr[op->destination] :
                            tcg_temp_new_i64();
 
-            ia64_gen_check_nat_non_access(insn, op->base, false);
-            ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 16, false,
-                                     false);
-            ia64_gen_sync_ip_for_helper(insn);
-            gen_helper_check_montecito_16byte_access(
-                tcg_env, ia64_gr_src(op->base), tcg_constant_i32(0));
+            ia64_gen_check_nat_access(insn, op->base, false);
+            ia64_gen_check_alignment(ctx, insn, ia64_gr_src(op->base), 16,
+                                     true, false);
+            if (ia64_env_cpu_class(ctx->env)->model ==
+                IA64_CPU_MODEL_MONTECITO) {
+                ia64_gen_sync_ip_for_helper(insn);
+                gen_helper_check_montecito_16byte_access(
+                    tcg_env, ia64_gr_src(op->base), tcg_constant_i32(0));
+            }
             ia64_gen_qemu_ld_i128(
                 ctx, pair, ia64_gr_src(op->base), ctx->memory.mmu_idx,
                 ia64_data_memop(ctx, MO_UO));
@@ -809,13 +943,16 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             TCGv_i128 pair = tcg_temp_new_i128();
             TCGv_i64 high = tcg_temp_new_i64();
 
-            ia64_gen_check_nat_non_access(insn, op->base, true);
+            ia64_gen_check_nat_access(insn, op->base, true);
             ia64_gen_check_nat_access(insn, op->source, true);
-            ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 16, false,
-                                     true);
-            ia64_gen_sync_ip_for_helper(insn);
-            gen_helper_check_montecito_16byte_access(
-                tcg_env, ia64_gr_src(op->base), tcg_constant_i32(1));
+            ia64_gen_check_alignment(ctx, insn, ia64_gr_src(op->base), 16,
+                                     true, true);
+            if (ia64_env_cpu_class(ctx->env)->model ==
+                IA64_CPU_MODEL_MONTECITO) {
+                ia64_gen_sync_ip_for_helper(insn);
+                gen_helper_check_montecito_16byte_access(
+                    tcg_env, ia64_gr_src(op->base), tcg_constant_i32(1));
+            }
             ia64_gen_memory_release(insn);
             gen_helper_read_ar(high, tcg_env, tcg_constant_i32(25));
             if (ctx->memory.be_data) {
@@ -844,12 +981,29 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         bool spill = insn->opcode == IA64_OP_ST8SPILL;
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_non_access(insn, op->base, true);
+        ia64_gen_check_nat_access(insn, op->base, true);
         if (!spill) {
             ia64_gen_check_nat_access(insn, op->source, true);
         }
-        tcg_gen_mov_i64(value, ia64_gr_src(op->source));
-        ia64_gen_check_alignment(insn, plan.address, plan.size,
+        if (spill) {
+            TCGv_i64 nat = ia64_gen_gr_nat_read(op->source);
+
+            /*
+             * A NaTed GR has no software-visible data portion.  The SDM
+             * permits st8.spill either to write zero or, under additional
+             * implementation-wide constraints, to write that data portion.
+             * Choose the unconditional zero behavior so this instruction
+             * does not depend on how every NaT-propagating operation models
+             * its otherwise undefined data bits.
+             */
+            tcg_gen_movcond_i64(TCG_COND_EQ, value, nat,
+                                tcg_constant_i64(0),
+                                ia64_gr_src(op->source),
+                                tcg_constant_i64(0));
+        } else {
+            tcg_gen_mov_i64(value, ia64_gr_src(op->source));
+        }
+        ia64_gen_check_alignment(ctx, insn, plan.address, plan.size,
                                  false, true);
         ia64_gen_memory_release(insn);
         ia64_gen_qemu_st_i64(ctx, value, plan.address, ctx->memory.mmu_idx,
@@ -880,10 +1034,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
     case IA64_OP_STFD: {
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_non_access(insn, op->base, true);
+        ia64_gen_check_nat_access(insn, op->base, true);
         ia64_gen_check_fr_nat_consumption(insn, op->source, IA64_ISR_W);
-        ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 8, false,
-                                 true);
+        ia64_gen_check_alignment_model(
+            ctx, insn, ia64_gr_src(op->base), 8, 8, 8, IA64_ALIGNMENT_FP,
+            IA64_ISR_W);
         gen_helper_getf(value, tcg_env, tcg_constant_i32(op->source),
                         tcg_constant_i32(0));
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
@@ -899,10 +1054,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
     case IA64_OP_STFS: {
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_non_access(insn, op->base, true);
+        ia64_gen_check_nat_access(insn, op->base, true);
         ia64_gen_check_fr_nat_consumption(insn, op->source, IA64_ISR_W);
-        ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 4, false,
-                                 true);
+        ia64_gen_check_alignment_model(
+            ctx, insn, ia64_gr_src(op->base), 4, 4, 4, IA64_ALIGNMENT_FP,
+            IA64_ISR_W);
         gen_helper_getf(value, tcg_env, tcg_constant_i32(op->source),
                         tcg_constant_i32(1));
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
@@ -916,9 +1072,10 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         break;
     }
     case IA64_OP_STF_SPILL: {
-        ia64_gen_check_nat_non_access(insn, op->base, true);
-        ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 16, false,
-                                 true);
+        ia64_gen_check_nat_access(insn, op->base, true);
+        ia64_gen_check_alignment_model(
+            ctx, insn, ia64_gr_src(op->base), 16, 16, 16,
+            IA64_ALIGNMENT_FP_FILL_SPILL, IA64_ISR_W);
         gen_helper_stf_spill(tcg_env, ia64_gr_src(op->base),
                              tcg_constant_i32(op->source));
         ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 16);
@@ -931,10 +1088,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
     case IA64_OP_STF8: {
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_non_access(insn, op->base, true);
+        ia64_gen_check_nat_access(insn, op->base, true);
         ia64_gen_check_fr_nat_consumption(insn, op->source, IA64_ISR_W);
-        ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 8, false,
-                                 true);
+        ia64_gen_check_alignment_model(
+            ctx, insn, ia64_gr_src(op->base), 8, 8, 8, IA64_ALIGNMENT_FP,
+            IA64_ISR_W);
         gen_helper_getf(value, tcg_env, tcg_constant_i32(op->source),
                         tcg_constant_i32(2));
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
@@ -948,10 +1106,12 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         break;
     }
     case IA64_OP_STFE:
-        ia64_gen_check_nat_non_access(insn, op->base, true);
+        ia64_gen_check_nat_access(insn, op->base, true);
         ia64_gen_check_fr_nat_consumption(insn, op->source, IA64_ISR_W);
-        ia64_gen_check_alignment(insn, ia64_gr_src(op->base), 16, false,
-                                 true);
+        ia64_gen_check_alignment_model(
+            ctx, insn, ia64_gr_src(op->base), 16, 10, 16,
+            IA64_ALIGNMENT_FP,
+            IA64_ISR_W);
         gen_helper_stfe(tcg_env, ia64_gr_src(op->base),
                         tcg_constant_i32(op->source));
         ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 10);
@@ -967,11 +1127,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         IA64MemoryPlan plan = ia64_memory_plan(ctx, insn, false);
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_NON_ACCESS);
+        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_ACCESS);
         ia64_gen_check_nat_semaphore(insn, op->source, IA64_NAT_ACCESS);
         tcg_gen_mov_i64(value, ia64_gr_src(op->source));
-        ia64_gen_check_alignment_access(insn, plan.address, plan.size, true,
-                                        IA64_ISR_R | IA64_ISR_W);
+        ia64_gen_check_alignment_access(ctx, insn, plan.address, plan.size,
+                                        true, IA64_ISR_R | IA64_ISR_W);
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_check_semaphore_access(tcg_env, plan.address);
         ia64_gen_memory_release(insn);
@@ -990,11 +1150,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         TCGv_i64 value = tcg_temp_new_i64();
         TCGv_i64 ccv = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_NON_ACCESS);
+        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_ACCESS);
         ia64_gen_check_nat_semaphore(insn, op->source, IA64_NAT_ACCESS);
         tcg_gen_mov_i64(value, ia64_gr_src(op->source));
-        ia64_gen_check_alignment_access(insn, plan.address, plan.size, true,
-                                        IA64_ISR_R | IA64_ISR_W);
+        ia64_gen_check_alignment_access(ctx, insn, plan.address, plan.size,
+                                        true, IA64_ISR_R | IA64_ISR_W);
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_check_semaphore_access(tcg_env, plan.address);
         ia64_gen_read_simple_ar(ccv, 32);
@@ -1008,11 +1168,21 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
     case IA64_OP_CMP8XCHG16: {
         TCGv_i64 ccv = tcg_temp_new_i64();
         TCGv_i64 csd = tcg_temp_new_i64();
+        TCGv_i64 debug_addr = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_NON_ACCESS);
+        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_ACCESS);
         ia64_gen_check_nat_semaphore(insn, op->source, IA64_NAT_ACCESS);
-        ia64_gen_check_alignment_access(insn, ia64_gr_src(op->base), 8, true,
-                                        IA64_ISR_R | IA64_ISR_W);
+        /*
+         * The compare address may select either 8-byte half, but the atomic
+         * write and both DBR match datums are the containing 16-byte block.
+         */
+        tcg_gen_andi_i64(debug_addr, ia64_gr_src(op->base),
+                         ~UINT64_C(8));
+        ia64_gen_check_data_debug(ctx, insn, debug_addr, 16,
+                                  IA64_ISR_R | IA64_ISR_W);
+        ia64_gen_check_alignment_only(
+            insn, ia64_gr_src(op->base), 8, 8,
+            IA64_ALIGNMENT_NATURAL_REQUIRED, IA64_ISR_R | IA64_ISR_W);
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_check_semaphore_access(tcg_env, ia64_gr_src(op->base));
         ia64_gen_read_simple_ar(ccv, 32);
@@ -1033,13 +1203,13 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
                            ia64_gr_src(op->source);
         TCGv_i64 value = tcg_temp_new_i64();
 
-        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_NON_ACCESS);
+        ia64_gen_check_nat_semaphore(insn, op->base, IA64_NAT_ACCESS);
         if (!op->immediate) {
             ia64_gen_check_nat_semaphore(insn, op->source, IA64_NAT_ACCESS);
         }
         tcg_gen_mov_i64(value, addend);
-        ia64_gen_check_alignment_access(insn, plan.address, plan.size, true,
-                                        IA64_ISR_R | IA64_ISR_W);
+        ia64_gen_check_alignment_access(ctx, insn, plan.address, plan.size,
+                                        true, IA64_ISR_R | IA64_ISR_W);
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_check_semaphore_access(tcg_env, plan.address);
         ia64_gen_memory_release(insn);
@@ -1144,9 +1314,11 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         break;
     }
     case IA64_OP_FC:
+    case IA64_OP_FC_I:
         ia64_gen_check_nat_consumption(insn, op->base, IA64_ISR_R | 1,
                                        IA64_NAT_NON_ACCESS);
-        gen_helper_fc(tcg_env, ia64_gr_src(op->base));
+        gen_helper_fc(tcg_env, ia64_gr_src(op->base),
+                      tcg_constant_i32(insn->opcode == IA64_OP_FC_I));
         break;
     case IA64_OP_INVALA:
         if (ctx->memory.full_alat) {

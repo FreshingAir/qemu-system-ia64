@@ -3098,6 +3098,19 @@ static void tcg_commit(MemoryListener *listener)
     }
 }
 
+static uint64_t memory_write_generation;
+
+uint64_t physical_memory_write_generation(void)
+{
+    return qatomic_load_acquire(&memory_write_generation);
+}
+
+bool physical_memory_write_generation_changed(uint64_t generation)
+{
+    smp_rmb();
+    return qatomic_load_acquire(&memory_write_generation) != generation;
+}
+
 static void memory_map_init(void)
 {
     system_memory = g_malloc(sizeof(*system_memory));
@@ -3129,6 +3142,7 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
 
     /* We know we're only called for RAM MemoryRegions */
     assert(ramaddr != RAM_ADDR_INVALID);
+    qatomic_inc(&memory_write_generation);
     addr += ramaddr;
 
     /* No early return if dirty_log_mask is or becomes 0, because

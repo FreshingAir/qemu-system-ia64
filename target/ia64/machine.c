@@ -6,8 +6,10 @@
 
 #include "qemu/osdep.h"
 #include "cpu.h"
+#include "rse-migration.h"
 #include "exec/cputlb.h"
 #include "migration/vmstate.h"
+#include "system/physmem.h"
 
 static const VMStateDescription vmstate_ia64_tlb_entry = {
     .name = "ia64-tlb-entry",
@@ -109,7 +111,7 @@ static const VMStateDescription vmstate_ia64_ia32_xmm = {
 
 static const VMStateDescription vmstate_ia64_firmware_debug_rse = {
     .name = "ia64-firmware-debug-rse",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT64_ARRAY(pgr, IA64FirmwareDebugRseState,
@@ -143,6 +145,13 @@ static const VMStateDescription vmstate_ia64_firmware_debug_rse = {
         VMSTATE_UINT8(cfm_rrb_fr, IA64FirmwareDebugRseState),
         VMSTATE_UINT8(cfm_rrb_pr, IA64FirmwareDebugRseState),
         VMSTATE_BOOL(cfle, IA64FirmwareDebugRseState),
+        VMSTATE_BOOL_V(completion_pending, IA64FirmwareDebugRseState, 2),
+        VMSTATE_BOOL_V(completion_demoted, IA64FirmwareDebugRseState, 2),
+        VMSTATE_UINT64_V(completion_psr, IA64FirmwareDebugRseState, 2),
+        VMSTATE_UINT64_V(completion_source_ip,
+                         IA64FirmwareDebugRseState, 2),
+        VMSTATE_UINT8_V(completion_source_slot,
+                        IA64FirmwareDebugRseState, 2),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -154,9 +163,10 @@ static void ia64_migration_reset_fp_status(CPUIA64State *env)
     memset(&env->fp.fp_status, 0, sizeof(env->fp.fp_status));
     set_float_2nan_prop_rule(float_2nan_prop_ab, &env->fp.fp_status);
     set_float_3nan_prop_rule(float_3nan_prop_abc, &env->fp.fp_status);
-    set_float_infzeronan_rule(float_infzeronan_dnan_never,
+    set_float_infzeronan_rule(float_infzeronan_dnan_never |
+                              float_infzeronan_suppress_invalid,
                               &env->fp.fp_status);
-    set_float_default_nan_pattern(0b01000000, &env->fp.fp_status);
+    set_float_default_nan_pattern(0b11000000, &env->fp.fp_status);
     set_float_rounding_mode(float_round_nearest_even, &env->fp.fp_status);
 
     memset(&xenv->fp_status, 0, sizeof(xenv->fp_status));
@@ -175,45 +185,27 @@ static int ia64_cpu_pre_save(void *opaque)
     return 0;
 }
 
-static bool
-ia64_rnat_writeback_image_invalid(const IA64RnatWritebackImage *image)
-{
-    if (!image->valid) {
-        return image->value != 0 || image->addr != 0 ||
-               image->defined != 0;
-    }
-
-    return image->defined == 0 ||
-           ((image->value | image->defined) & ~INT64_MAX) != 0 ||
-           (image->value & ~image->defined) != 0 ||
-           (image->addr & 0x1ff) != 0x1f8;
-}
-
 static int ia64_cpu_post_load(void *opaque, int version_id)
 {
     IA64CPU *cpu = opaque;
     CPUIA64State *env = &cpu->env;
+    bool has_clean_partition =
+        IA64_CPU_GET_CLASS(cpu)->rse_has_clean_partition;
     uint32_t active_alat = 0;
     unsigned int i;
 
-    if (version_id < 2) {
-        memset(&env->rse.rse_writeback_rnat, 0,
-               sizeof(env->rse.rse_writeback_rnat));
-        memset(&cpu->firmware_debug.rse.writeback_rnat, 0,
-               sizeof(cpu->firmware_debug.rse.writeback_rnat));
-    }
+    (void)version_id;
+
+    /* Migration stops vCPUs only at instruction boundaries. */
+    env->rse.rse_access = false;
 
     if (env->mmu.tlb_data_count > IA64_TLB_MAX ||
         env->mmu.tlb_inst_count > IA64_TLB_MAX ||
         env->mmu.tlb_data_l1_count > IA64_DTLB1_MAX ||
-        env->rse.rse_bol >= IA64_STACKED_GR_COUNT ||
-        env->rse.rse_rnat_shadow_count > IA64_RSE_RNAT_SHADOW_COUNT ||
-        cpu->firmware_debug.rse.rnat_shadow_count >
-            IA64_RSE_RNAT_SHADOW_COUNT ||
-        ia64_rnat_writeback_image_invalid(
-            &env->rse.rse_writeback_rnat) ||
-        ia64_rnat_writeback_image_invalid(
-            &cpu->firmware_debug.rse.writeback_rnat)) {
+        !ia64_rse_migration_state_valid(env, has_clean_partition) ||
+        (cpu->firmware_debug.rse_valid &&
+         !ia64_firmware_debug_rse_migration_state_valid(
+             &cpu->firmware_debug.rse, has_clean_partition))) {
         return -EINVAL;
     }
 
@@ -261,8 +253,9 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
     }
     env->alat_state.alat_active_count = active_alat;
     env->alat_state.alat_full = cpu->alat_full;
+    env->alat_state.memory_write_generation =
+        physical_memory_write_generation();
 
-    /* Migration stops vCPUs only at instruction boundaries. */
     env->fp.transaction.active = false;
     env->ia32_sse_instruction_active = false;
     ia64_migration_reset_fp_status(env);
@@ -274,8 +267,8 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
 
 const VMStateDescription vmstate_ia64_cpu = {
     .name = "cpu",
-    .version_id = 2,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .pre_save = ia64_cpu_pre_save,
     .post_load = ia64_cpu_post_load,
     .fields = (const VMStateField[]) {
@@ -301,6 +294,9 @@ const VMStateDescription vmstate_ia64_cpu = {
         VMSTATE_UINT32(env.exception_state.fault_slot, IA64CPU),
         VMSTATE_BOOL(env.exception_state.ia32_trap, IA64CPU),
         VMSTATE_BOOL(env.exception_state.ia32_transition_trap, IA64CPU),
+        VMSTATE_BOOL_V(env.exception_state.native_completion_trap, IA64CPU,
+                       3),
+        VMSTATE_UINT64_V(env.exception_state.psr_before_insn, IA64CPU, 3),
         VMSTATE_BOOL(env.exception_state.psr_ic_inflight, IA64CPU),
         VMSTATE_UINT64(env.exception_state.psr_suppression_before_insn,
                        IA64CPU),
@@ -377,6 +373,11 @@ const VMStateDescription vmstate_ia64_cpu = {
         VMSTATE_INT32(env.rse.rse_clean_nat, IA64CPU),
         VMSTATE_INT32(env.rse.rse_invalid, IA64CPU),
         VMSTATE_BOOL(env.rse.rse_cfle, IA64CPU),
+        VMSTATE_BOOL_V(env.rse.rse_completion_pending, IA64CPU, 3),
+        VMSTATE_BOOL_V(env.rse.rse_completion_demoted, IA64CPU, 3),
+        VMSTATE_UINT64_V(env.rse.rse_completion_psr, IA64CPU, 3),
+        VMSTATE_UINT64_V(env.rse.rse_completion_source_ip, IA64CPU, 3),
+        VMSTATE_UINT8_V(env.rse.rse_completion_source_slot, IA64CPU, 3),
         VMSTATE_UINT64(env.rse.rse_rnat_addr, IA64CPU),
         VMSTATE_UINT64(env.rse.rse_rnat_defined, IA64CPU),
         VMSTATE_UINT64(env.rse.rse_load_rnat, IA64CPU),

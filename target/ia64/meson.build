@@ -29,6 +29,7 @@ ia64_ss.add(files(
   'ia32/system_helper.c',
   'ia32/transition_helper.c',
   'machine.c',
+  'rse-migration.c',
   'translate/gen-branch.c',
   'translate/gen-fp.c',
   'translate/gen-integer.c',

@@ -70,6 +70,11 @@ uint64_t helper_read_dahr_indexed(CPUIA64State *env, uint64_t index)
     return ia64_system_read_dahr_indexed(env, index);
 }
 
+void helper_write_dahr(CPUIA64State *env, uint32_t index, uint64_t value)
+{
+    ia64_system_write_dahr(env, index, value);
+}
+
 uint64_t helper_read_msr(CPUIA64State *env, uint64_t index)
 {
     return ia64_system_read_msr(env, index);

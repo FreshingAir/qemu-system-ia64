@@ -18,6 +18,15 @@ bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client);
 
 bool physical_memory_is_clean(ram_addr_t addr);
 
+/*
+ * Monotonic notification for RAM writes performed through the system memory
+ * APIs.  Readers use the generation to bracket a RAM read: the first sample
+ * has acquire semantics, and changed() orders the preceding RAM read before
+ * its closing sample.
+ */
+uint64_t physical_memory_write_generation(void);
+bool physical_memory_write_generation_changed(uint64_t generation);
+
 uint8_t physical_memory_range_includes_clean(ram_addr_t start,
                                              ram_addr_t length,
                                              uint8_t mask);

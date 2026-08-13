@@ -12,6 +12,15 @@ void helper_raise_exception(CPUIA64State *env, uint32_t exception,
     ia64_raise_exception(env, exception, fault_ip, fault_imm, fault_slot);
 }
 
+void helper_check_native_traps(CPUIA64State *env, uint64_t target_ip,
+                               uint64_t source_ip, uint32_t slots,
+                               uint32_t conditions, uint64_t base_isr,
+                               uint64_t trap_psr)
+{
+    ia64_check_native_traps(env, target_ip, source_ip, slots, conditions,
+                            base_isr, trap_psr);
+}
+
 void helper_ia32_unsupported(CPUIA64State *env)
 {
     ia64_ia32_unsupported(env);

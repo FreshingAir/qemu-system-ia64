@@ -84,6 +84,9 @@ static TCGTBCPUState ia64_get_tb_cpu_state(CPUState *cs)
 
     flags |= (psr & IA64_PSR_FAULT_SUPPRESS_MASK) != 0 ?
              IA64_TB_FLAG_PSR_SUPPRESS : 0;
+    flags |= (psr & IA64_PSR_TB) ? IA64_TB_FLAG_PSR_TB : 0;
+    flags |= (psr & IA64_PSR_SS) ? IA64_TB_FLAG_PSR_SS : 0;
+    flags |= (psr & IA64_PSR_DB) ? IA64_TB_FLAG_PSR_DB : 0;
 
     return (TCGTBCPUState) {
         .pc = cpu->env.ip,
@@ -413,7 +416,7 @@ static bool ia64_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
     uint8_t perm;
     uint32_t rid;
     IA64Exception excp;
-    bool is_rse = !is_ifetch && mmu_idx == MMU_IDX_RSE;
+    bool is_rse = !is_ifetch && cpu->env.rse.rse_access;
     uint8_t access_level;
     bool virt_translation_enabled;
 
@@ -732,6 +735,9 @@ raise_exception:
                   (uint64_t)addr, rid, cpu->env.cr_itir,
                   cpu->env.cr_iha, cpu->env.cr_pta, cpu->env.cr_isr);
     cs->exception_index = excp;
+    if (is_rse) {
+        cpu->env.rse.rse_access = false;
+    }
     if (cpu->env.psr & IA64_PSR_IS) {
         cpu_loop_exit(cs);
     }
@@ -754,6 +760,49 @@ void ia64_cpu_reset_to_boot_info(IA64CPU *cpu)
     cpu_reset(CPU(cpu));
 }
 
+static void ia64_cpu_set_architectural_reset_rse(CPUIA64State *env)
+{
+    /*
+     * SDM Vol.2 6.12: reset exposes all 96 stacked registers in one frame,
+     * with BOF at physical GR32.  rse_bol is zero-based within the physical
+     * stacked-register file, so zero denotes physical GR32.
+     */
+    env->cfm_sof = IA64_STACKED_GR_COUNT;
+    env->cfm_sol = 0;
+    env->cfm_sor = 0;
+    env->cfm_rrb_gr = 0;
+    env->cfm_rrb_fr = 0;
+    env->cfm_rrb_pr = 0;
+    env->rse.rse_bol = 0;
+    env->rse.rse_dirty = 0;
+    env->rse.rse_dirty_nat = 0;
+    env->rse.rse_clean = 0;
+    env->rse.rse_clean_nat = 0;
+    env->rse.rse_invalid = 0;
+}
+
+static void ia64_cpu_set_boot_handoff_rse(CPUIA64State *env)
+{
+    /*
+     * IA64BootInfo is a synthetic post-reset firmware handoff, not the
+     * architectural processor-reset state.  Preserve its historical empty
+     * frame so the firmware and loader microprogram ABI starts with all 96
+     * physical stacked registers in the invalid partition.
+     */
+    env->cfm_sof = 0;
+    env->cfm_sol = 0;
+    env->cfm_sor = 0;
+    env->cfm_rrb_gr = 0;
+    env->cfm_rrb_fr = 0;
+    env->cfm_rrb_pr = 0;
+    env->rse.rse_bol = 0;
+    env->rse.rse_dirty = 0;
+    env->rse.rse_dirty_nat = 0;
+    env->rse.rse_clean = 0;
+    env->rse.rse_clean_nat = 0;
+    env->rse.rse_invalid = IA64_STACKED_GR_COUNT;
+}
+
 static void ia64_cpu_apply_boot_info(IA64CPU *cpu)
 {
     CPUIA64State *env = &cpu->env;
@@ -764,6 +813,7 @@ static void ia64_cpu_apply_boot_info(IA64CPU *cpu)
     }
     cpu->boot_info_pending = false;
 
+    ia64_cpu_set_boot_handoff_rse(env);
     env->psr = 0;
     env->ip = info->firmware_entry;
     env->br[IA64_BR_RETURN_LINK] = info->firmware_entry;
@@ -810,17 +860,18 @@ static void ia64_cpu_reset_hold(Object *obj, ResetType type)
     cpu->env.pr[IA64_PR_TRUE] = 1;
     cpu->env.psr = 0;
     cpu->env.ar_rsc = 0;
-    /* Empty frame: every stacked physical register is invalid. */
-    cpu->env.rse.rse_invalid = IA64_STACKED_GR_COUNT;
+    ia64_cpu_set_architectural_reset_rse(&cpu->env);
+    ia64_rse_rnat_undefined(&cpu->env, "processor reset");
     cpu->env.ar_fpsr = IA64_FPSR_DEFAULT;
     cpu->env.cr_iva = 0;
     cpu->env.instruction_group_start = true;
     ia64_itc_write(&cpu->env, 0);
     set_float_2nan_prop_rule(float_2nan_prop_ab, &cpu->env.fp.fp_status);
     set_float_3nan_prop_rule(float_3nan_prop_abc, &cpu->env.fp.fp_status);
-    set_float_infzeronan_rule(float_infzeronan_dnan_never,
+    set_float_infzeronan_rule(float_infzeronan_dnan_never |
+                              float_infzeronan_suppress_invalid,
                               &cpu->env.fp.fp_status);
-    set_float_default_nan_pattern(0b01000000, &cpu->env.fp.fp_status);
+    set_float_default_nan_pattern(0b11000000, &cpu->env.fp.fp_status);
     cpu->env.cr[IA64_CR_SAPIC_LID] =
         ia64_sapic_lid(MAX(CPU(cpu)->cpu_index, 0), 0);
     cpu->env.cr[IA64_CR_SAPIC_TPR] = 0;
@@ -974,6 +1025,7 @@ static void ia64_cpu_class_init(ObjectClass *oc, const void *data)
      * and unsupported-operation rules remain distinct from WB.
      */
     icc->memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK;
+    icc->fc_line_size = 128;
     icc->implemented_pmc_mask = 0x3fffULL;
     icc->implemented_pmd_mask = 0x3ffffULL;
     icc->perf_cycles_mask = 0xf0ULL;
@@ -1011,11 +1063,13 @@ typedef struct IA64CPUModelDef {
     uint8_t tc_levels;
     uint8_t perf_counter_width;
     uint8_t memory_attribute_mask;
+    uint16_t fc_line_size;
     uint64_t implemented_pmc_mask;
     uint64_t implemented_pmd_mask;
     uint64_t perf_cycles_mask;
     uint64_t perf_retired_mask;
     bool rse_has_clean_partition;
+    bool data_debug_cross_16byte;
     bool has_native_ia32;
     bool has_virtualization;
     bool is_montecito;
@@ -1053,11 +1107,13 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
     icc->tc_levels = model->tc_levels;
     icc->perf_counter_width = model->perf_counter_width;
     icc->memory_attribute_mask = model->memory_attribute_mask;
+    icc->fc_line_size = model->fc_line_size;
     icc->implemented_pmc_mask = model->implemented_pmc_mask;
     icc->implemented_pmd_mask = model->implemented_pmd_mask;
     icc->perf_cycles_mask = model->perf_cycles_mask;
     icc->perf_retired_mask = model->perf_retired_mask;
     icc->rse_has_clean_partition = model->rse_has_clean_partition;
+    icc->data_debug_cross_16byte = model->data_debug_cross_16byte;
     icc->has_native_ia32 = model->has_native_ia32;
     icc->has_virtualization = model->has_virtualization;
     icc->is_montecito = model->is_montecito;
@@ -1076,6 +1132,8 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
              (model->itc_frequency_ratio >> 32) /
              (uint32_t)model->itc_frequency_ratio ==
              model->itc_frequency_hz);
+    g_assert(model->fc_line_size >= 32 &&
+             is_power_of_2(model->fc_line_size));
 }
 
 static const IA64CPUModelDef ia64_cpu_model_merced = {
@@ -1140,6 +1198,8 @@ static const IA64CPUModelDef ia64_cpu_model_merced = {
                              (1U << IA64_PTE_MA_UC) |
                              (1U << IA64_PTE_MA_WC) |
                              (1U << IA64_PTE_MA_NATPAGE),
+    /* The first-generation L2/L3 cache line is 64 bytes. */
+    .fc_line_size = 64,
     .implemented_pmc_mask = 0x3fffULL,
     .implemented_pmd_mask = 0x3ffffULL,
     .perf_cycles_mask = 0xf0ULL,
@@ -1189,11 +1249,15 @@ static const IA64CPUModelDef ia64_cpu_model_madison = {
     .tc_levels = 2,
     .perf_counter_width = 48,
     .memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK,
+    /* Intel order 251110-003, section 5.8: each fc invalidates 128 bytes. */
+    .fc_line_size = 128,
     .implemented_pmc_mask = 0x3fffULL,
     .implemented_pmd_mask = 0x3ffffULL,
     .perf_cycles_mask = 0xf0ULL,
     .perf_retired_mask = 0xf0ULL,
     .rse_has_clean_partition = true,
+    /* Intel order 251110-003, section 12.3. */
+    .data_debug_cross_16byte = true,
     .has_native_ia32 = true,
     .has_virtualization = false,
 };
@@ -1238,6 +1302,8 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
      * 16-byte operations.
      */
     .memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK,
+    /* Montecito's L2 and L3 cache lines are 128 bytes. */
+    .fc_line_size = 128,
     .implemented_pmc_mask = 0x3fffULL,
     .implemented_pmd_mask = 0x3ffffULL,
     .perf_cycles_mask = 0xf0ULL,

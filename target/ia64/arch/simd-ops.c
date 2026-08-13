@@ -171,6 +171,31 @@ uint64_t ia64_simd_psad1_value(uint64_t a, uint64_t b)
     return sum;
 }
 
+uint64_t ia64_simd_pshladd2_value(uint64_t a, uint64_t b, uint32_t count)
+{
+    uint64_t result = 0;
+
+    g_assert(count >= 1 && count <= 3);
+    for (int i = 0; i < 4; i++) {
+        int64_t left = simd_signed_lane(a, i, 16);
+        int64_t right = simd_signed_lane(b, i, 16);
+        int64_t shifted = left * (INT64_C(1) << count);
+        int64_t lane;
+
+        if (shifted > INT16_MAX) {
+            lane = INT16_MAX;
+        } else if (shifted < INT16_MIN) {
+            lane = INT16_MIN;
+        } else {
+            lane = shifted + right;
+            lane = MIN(lane, INT16_MAX);
+            lane = MAX(lane, INT16_MIN);
+        }
+        result |= ((uint64_t)lane & UINT16_MAX) << (i * 16);
+    }
+    return result;
+}
+
 uint64_t ia64_simd_mux_value(uint32_t op_sel, uint64_t value, uint32_t imm)
 {
     static const uint8_t mux1_perms[16][8] = {

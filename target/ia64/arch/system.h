@@ -23,6 +23,9 @@ uint64_t ia64_system_validate_cr_access(CPUIA64State *env, uint64_t value,
                                         uint32_t slot);
 uint64_t ia64_system_read_cpuid(CPUIA64State *env, uint64_t index);
 uint64_t ia64_system_read_dahr_indexed(CPUIA64State *env, uint64_t index);
+void ia64_system_write_dahr(CPUIA64State *env, uint32_t index,
+                            uint64_t value);
+void ia64_system_reset_dahr(CPUIA64State *env);
 uint64_t ia64_system_read_msr(CPUIA64State *env, uint64_t index);
 void ia64_system_write_msr(CPUIA64State *env, uint64_t index,
                            uint64_t value);

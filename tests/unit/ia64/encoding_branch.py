@@ -128,17 +128,16 @@ def brl_cond_mlx(source, target, qp=0, many=False, wh=0, clear=False,
     )
     return (template, nop_m(), l_slot, x_slot)
 
-def br_cloop(source, target, qp=0):
+def br_cloop(source, target):
     field = branch_target_field(source, target)
     return (
         op(4)
         | bitfield(5, 6, 3)
         | bitfield(field & 0xfffff, 13, 20)
         | bitfield((field >> 20) & 1, 36, 1)
-        | bitfield(qp, 0, 6)
     )
 
-def br_ctop_many(source, target, qp=0):
+def br_ctop_many(source, target):
     field = branch_target_field(source, target)
     return (
         op(4)
@@ -146,17 +145,15 @@ def br_ctop_many(source, target, qp=0):
         | bitfield((field >> 20) & 1, 36, 1)
         | bitfield(1, 12, 1)
         | bitfield(7, 6, 3)
-        | bitfield(qp, 0, 6)
     )
 
-def br_ctop_few(source, target, qp=0):
+def br_ctop_few(source, target):
     field = branch_target_field(source, target)
     return (
         op(4)
         | bitfield(field & 0xfffff, 13, 20)
         | bitfield((field >> 20) & 1, 36, 1)
         | bitfield(7, 6, 3)
-        | bitfield(qp, 0, 6)
     )
 
 __all__ = (

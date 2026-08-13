@@ -101,7 +101,7 @@ def _loader_args(program: MicroProgram) -> list[str]:
     return args
 
 
-def _command(qemu: str, program: MicroProgram) -> list[str]:
+def _command(qemu: str, program: MicroProgram, *, load: bool = True) -> list[str]:
     machine = program.machine
     if program.machine_args:
         machine += "," + ",".join(program.machine_args)
@@ -119,7 +119,67 @@ def _command(qemu: str, program: MicroProgram) -> list[str]:
         command += ["-m", program.memory]
     if program.cpu is not None:
         command += ["-cpu", program.cpu]
-    return command + _loader_args(program)
+    return command + (_loader_args(program) if load else [])
+
+
+def read_stopped_state(qemu: str, *, machine: str, cpu: str | None = None,
+                       machine_args: tuple[str, ...] = (), smp: str = "1",
+                       memory: str | None = None) -> RunResult:
+    """Read one CPU immediately after reset, before guest execution."""
+    program = MicroProgram(
+        name="ia64-stopped-reset-state",
+        bundles=(),
+        entry=0,
+        expected=StateExpectation(),
+        completion=Completion(terminal_ip=None),
+        machine=machine,
+        machine_args=machine_args,
+        cpu=cpu,
+        smp=smp,
+        memory=memory,
+    )
+    started = time.monotonic()
+    register_output = ""
+    stderr_text = ""
+
+    with tempfile.TemporaryFile(mode="w+t", encoding="utf-8") as stderr:
+        proc = subprocess.Popen(
+            _command(qemu, program, load=False),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr,
+            text=True,
+            bufsize=1,
+        )
+        if proc.stdin is None or proc.stdout is None:
+            kill_process(proc)
+            raise RuntimeError("QEMU QMP pipes were not created")
+
+        qmp: QmpClient | None = None
+        try:
+            qmp = QmpClient(proc.stdout, proc.stdin)
+            register_output = qmp.hmp("info registers")
+            state = parse_state(register_output)
+        finally:
+            if proc.poll() is None:
+                if qmp is not None:
+                    try:
+                        qmp.execute("quit", timeout_s=1.0)
+                    except (QmpError, BrokenPipeError):
+                        pass
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    terminate_process(proc)
+            stderr.seek(0)
+            stderr_text = stderr.read()
+
+    if proc.returncode != 0:
+        raise RuntimeError(
+            "QEMU reset-state inspection exited with "
+            f"{proc.returncode}\n{stderr_text}")
+    return RunResult(state, register_output, {}, stderr_text, 0,
+                     time.monotonic() - started)
 
 
 def run_microprogram(qemu: str, program: MicroProgram,

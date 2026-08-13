@@ -75,6 +75,14 @@ static void ia64_gen_cr_read(TCGv_i64 value, uint32_t cr_num)
 static void ia64_gen_cr_write(uint32_t cr_num, TCGv_i64 value)
 {
     switch (cr_num) {
+    case IA64_CR_IIPA:
+        tcg_gen_st_i64(value, tcg_env,
+                       offsetof(CPUIA64State, cr) +
+                       cr_num * sizeof(uint64_t));
+        /* mov to IIPA also establishes the architected last_IP value. */
+        tcg_gen_st_i64(value, tcg_env,
+                       offsetof(CPUIA64State, last_successful_bundle));
+        break;
     case IA64_CR_ITM:
     case IA64_CR_IVA:
     case IA64_CR_PTA:
@@ -133,14 +141,15 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
                             tcg_constant_i64(0xffffffffffff0000ULL));
         break;
     case IA64_OP_MOV_ARGR:
+        if (!ia64_ar_is_simple(op->source)) {
+            ia64_gen_validate_ar_access(insn, tcg_constant_i64(0), false);
+        }
         if (op->destination != 0) {
             TCGv_i64 val = tcg_temp_new_i64();
 
             if (ia64_ar_is_simple(op->source)) {
                 ia64_gen_read_simple_ar(val, op->source);
             } else {
-                ia64_gen_validate_ar_access(insn, tcg_constant_i64(0),
-                                            false);
                 if (ia64_ar_access_reads_clock(op->source) &&
                     ia64_clock_access_needs_io(ctx)) {
                     translator_io_start(&ctx->base);
@@ -156,6 +165,16 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         }
         break;
     case IA64_OP_MOV_GRAR:
+        /*
+         * mov-to-BSPSTORE/RNAT checks RSC.mode before consuming a NaT
+         * source (SDM Vol. 3, mov ar operation).  Other application-register
+         * access checks follow Register NaT Consumption in the instruction's
+         * priority order.
+         */
+        if (op->source == IA64_AR_BSPSTORE || op->source == IA64_AR_RNAT) {
+            ia64_gen_validate_ar_access(insn,
+                                        ia64_gr_src(op->destination), true);
+        }
         ia64_gen_check_nat_register(insn, op->destination);
         if (ia64_ar_is_simple(op->source)) {
             if (op->source == 40 || op->source == 64) {
@@ -164,8 +183,11 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
             }
             ia64_gen_write_simple_ar(op->source, ia64_gr_src(op->destination));
         } else {
-            ia64_gen_validate_ar_access(insn,
-                                        ia64_gr_src(op->destination), true);
+            if (op->source != IA64_AR_BSPSTORE &&
+                op->source != IA64_AR_RNAT) {
+                ia64_gen_validate_ar_access(
+                    insn, ia64_gr_src(op->destination), true);
+            }
             if (ia64_ar_access_reads_clock(op->source)) {
                 translator_io_start(&ctx->base);
                 ia64_request_exit_after_bundle(ctx);
@@ -194,16 +216,19 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         }
         break;
     case IA64_OP_MOV_CRGR:
+    {
+        TCGv_i64 checked = tcg_temp_new_i64();
+
+        ia64_gen_validate_cr_access(checked, insn,
+                                    tcg_constant_i64(0), false);
         if (op->destination != 0) {
             TCGv_i64 val = tcg_temp_new_i64();
-            TCGv_i64 checked = tcg_temp_new_i64();
 
-            ia64_gen_validate_cr_access(checked, insn,
-                                        tcg_constant_i64(0), false);
             ia64_gen_cr_read(val, op->source);
             ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         }
         break;
+    }
     case IA64_OP_MOV_GRCR:
     {
         TCGv_i64 checked = tcg_temp_new_i64();
@@ -231,6 +256,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     case IA64_OP_MOV_RRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
         ia64_gen_check_nat_register(insn, op->source);
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_rrgr_read(val, tcg_env, ia64_gr_src(op->source));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
@@ -246,6 +272,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
             tcg_constant_i64(insn->address),
             tcg_constant_i64(insn->raw),
             tcg_constant_i32(insn->slot));
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_grrr_write(tcg_env, ia64_gr_src(op->source),
                                   checked);
         ia64_request_exit_after_bundle(ctx);
@@ -253,6 +280,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     }
     case IA64_OP_MOV_PKRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_pkrgr_read(val, tcg_env, tcg_constant_i32(op->source));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
@@ -262,6 +290,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index),
                                       IA64_PKR_COUNT);
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_pkrgr_indexed_read(
             val, tcg_env, ia64_gr_src(op->register_index));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
@@ -271,6 +300,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_check_nat_register(insn, op->destination);
         ia64_gen_check_reserved_bits(insn, ia64_gr_src(op->destination),
                                      ia64_pkr_mask(ctx->env));
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_grpkr_write(tcg_env, tcg_constant_i32(op->source),
                                    ia64_gr_src(op->destination));
         ia64_request_exit_after_bundle(ctx);
@@ -282,6 +312,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
                                       IA64_PKR_COUNT);
         ia64_gen_check_reserved_bits(insn, ia64_gr_src(op->destination),
                                      ia64_pkr_mask(ctx->env));
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_grpkr_indexed_write(
             tcg_env, ia64_gr_src(op->register_index),
             ia64_gr_src(op->destination));
@@ -303,12 +334,14 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     }
     case IA64_OP_MOV_IBRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
+        ia64_gen_check_virtualization(insn);
         gen_helper_read_ibr(val, tcg_env, tcg_constant_i32(op->source - 12));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
     }
     case IA64_OP_MOV_GRIBR:
         ia64_gen_check_nat_register(insn, op->destination);
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_ibr(tcg_env, tcg_constant_i32(op->source - 12),
                              ia64_gr_src(op->destination));
         break;
@@ -322,7 +355,8 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_check_register_index(
             insn, ia64_gr_src(op->register_index),
             insn->opcode == IA64_OP_MOV_IBRGR_INDEXED ?
-            IA64_IBR_COUNT : IA64_DBR_COUNT);
+            IA64_IBR_IMPLEMENTED_COUNT : IA64_DBR_IMPLEMENTED_COUNT);
+        ia64_gen_check_virtualization(insn);
         tcg_gen_mov_i64(index64, ia64_gr_src(op->register_index));
         tcg_gen_extrl_i64_i32(index, index64);
         if (insn->opcode == IA64_OP_MOV_IBRGR_INDEXED) {
@@ -343,7 +377,8 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_check_register_index(
             insn, ia64_gr_src(op->register_index),
             insn->opcode == IA64_OP_MOV_GRIBR_INDEXED ?
-            IA64_IBR_COUNT : IA64_DBR_COUNT);
+            IA64_IBR_IMPLEMENTED_COUNT : IA64_DBR_IMPLEMENTED_COUNT);
+        ia64_gen_check_virtualization(insn);
         tcg_gen_mov_i64(index64, ia64_gr_src(op->register_index));
         tcg_gen_extrl_i64_i32(index, index64);
         if (insn->opcode == IA64_OP_MOV_GRIBR_INDEXED) {
@@ -355,31 +390,35 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     }
     case IA64_OP_MOV_DBRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
+        ia64_gen_check_virtualization(insn);
         gen_helper_read_dbr(val, tcg_env, tcg_constant_i32(op->source - 8));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
     }
     case IA64_OP_MOV_GRDBR:
         ia64_gen_check_nat_register(insn, op->destination);
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_dbr(tcg_env, tcg_constant_i32(op->source - 8),
                              ia64_gr_src(op->destination));
         break;
     case IA64_OP_MOV_PMCGR: {
         TCGv_i64 val = tcg_temp_new_i64();
+        ia64_gen_check_virtualization(insn);
         gen_helper_read_pmc(val, tcg_env, tcg_constant_i32(op->source - 32));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
     }
     case IA64_OP_MOV_GRPMC:
         ia64_gen_check_nat_register(insn, op->destination);
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_pmc(tcg_env, tcg_constant_i32(op->source - 32),
                             ia64_gr_src(op->destination));
         break;
     case IA64_OP_MOV_PMCGR_INDEXED: {
         TCGv_i64 val = tcg_temp_new_i64();
         ia64_gen_check_nat_register(insn, op->register_index);
-        ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index),
-                                      IA64_PMC_COUNT);
+        /* Unimplemented PMC indices read as zero rather than faulting. */
+        ia64_gen_check_virtualization(insn);
         gen_helper_read_pmc_indexed(
             val, tcg_env, ia64_gr_src(op->register_index));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
@@ -388,8 +427,8 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     case IA64_OP_MOV_GRPMC_INDEXED:
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_nat_register(insn, op->destination);
-        ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index),
-                                      IA64_PMC_COUNT);
+        /* Writes to unimplemented PMC indices are ignored. */
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_pmc_indexed(tcg_env, ia64_gr_src(op->register_index),
                                      ia64_gr_src(op->destination));
         break;
@@ -405,14 +444,13 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     }
     case IA64_OP_MOV_GRPMD:
         ia64_gen_check_nat_register(insn, op->destination);
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_pmd(tcg_env, tcg_constant_i32(op->source - 64),
                             ia64_gr_src(op->destination));
         break;
     case IA64_OP_MOV_PMDGR_INDEXED: {
         TCGv_i64 val = tcg_temp_new_i64();
         ia64_gen_check_nat_register(insn, op->register_index);
-        ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index),
-                                      IA64_PMD_COUNT);
         gen_helper_read_pmd_checked(
             val, tcg_env, ia64_gr_src(op->register_index),
             tcg_constant_i64(insn->address),
@@ -424,14 +462,15 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
     case IA64_OP_MOV_GRPMD_INDEXED:
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_nat_register(insn, op->destination);
-        ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index),
-                                      IA64_PMD_COUNT);
+        /* PMC/PMD implementation-dependent indices never fault. */
+        ia64_gen_check_virtualization(insn);
         gen_helper_write_pmd_indexed(tcg_env, ia64_gr_src(op->register_index),
                                      ia64_gr_src(op->destination));
         break;
     case IA64_OP_MOV_CPUID: {
         TCGv_i64 val = tcg_temp_new_i64();
 
+        ia64_gen_check_virtualization(insn);
         ia64_gen_cr_read(val, 13);
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
@@ -440,6 +479,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         TCGv_i64 val = tcg_temp_new_i64();
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_register_index(insn, ia64_gr_src(op->register_index), 5);
+        ia64_gen_check_virtualization(insn);
         gen_helper_read_cpuid(val, tcg_env, ia64_gr_src(op->register_index));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
@@ -453,6 +493,11 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
     }
+    case IA64_OP_MOV_DAHR_IMM:
+        gen_helper_write_dahr(tcg_env,
+                              tcg_constant_i32(op->destination),
+                              tcg_constant_i64(op->immediate));
+        break;
     case IA64_OP_MOV_MSRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
         ia64_gen_check_nat_register(insn, op->register_index);
@@ -474,32 +519,55 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         }
         break;
     case IA64_OP_SSM:
+        ia64_gen_check_reserved_bits(
+            insn, tcg_constant_i64(op->immediate),
+            0x3eULL | (0x7ULL << 13) | (0x7fULL << 17));
+        ia64_gen_check_virtualization(insn);
         gen_helper_ssm(tcg_env, tcg_constant_i64(op->immediate));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_RSM:
+        ia64_gen_check_reserved_bits(
+            insn, tcg_constant_i64(op->immediate),
+            0x3eULL | (0x7ULL << 13) | (0x7fULL << 17));
+        ia64_gen_check_virtualization(insn);
         gen_helper_rsm(tcg_env, tcg_constant_i64(op->immediate));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_MOV_PSRGR: {
         TCGv_i64 val = tcg_temp_new_i64();
 
-        /*
-         * PSR.ri is only an rfi restart selector and is architecturally
-         * undefined after the restarted instruction begins.  Keep the
-         * existing chosen value of zero without crossing a helper boundary.
-         */
-        tcg_gen_andi_i64(val, cpu_psr, ~IA64_PSR_RI_MASK);
+        ia64_gen_check_virtualization(insn);
+        tcg_gen_andi_i64(val, cpu_psr,
+                         UINT64_C(0xffffffff) | (UINT64_C(3) << 35));
         ia64_gen_gr_write_nat_clear(insn, op->destination, val);
         break;
     }
-    case IA64_OP_MOV_GRPSR:
+    case IA64_OP_MOV_GRPSR: {
+        uint64_t allowed = UINT64_C(0x3fff00000000) |
+                           UINT64_C(0x3e) |
+                           (UINT64_C(0x7) << 13) |
+                           (UINT64_C(0x7ff) << 17);
+
+        if (ia64_env_cpu_class(ctx->env)->has_virtualization) {
+            allowed |= IA64_PSR_VM;
+        }
         ia64_gen_check_nat_register(insn, op->destination);
+        /*
+         * mov psr.l ignores GR[r2]{63:32}.  Bits corresponding to defined
+         * high PSR fields must not fault; checking corresponding reserved
+         * high fields is implementation optional and retained here.
+         */
+        ia64_gen_check_reserved_bits(insn, ia64_gr_src(op->destination),
+                                     allowed);
+        ia64_gen_check_virtualization(insn);
         gen_helper_mov_psr_write(tcg_env, ia64_gr_src(op->destination),
                                  tcg_constant_i32(op->immediate != 0));
         ia64_request_exit_after_bundle(ctx);
         break;
+    }
     case IA64_OP_BSW0:
+        ia64_gen_check_virtualization(insn);
         gen_helper_set_psr_bn(tcg_env, tcg_constant_i32(0));
         if (skip == NULL) {
             ia64_gen_exit_to_completed(ctx, next_ip, insn->address,
@@ -509,6 +577,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         }
         break;
     case IA64_OP_BSW1:
+        ia64_gen_check_virtualization(insn);
         gen_helper_set_psr_bn(tcg_env, tcg_constant_i32(1));
         if (skip == NULL) {
             ia64_gen_exit_to_completed(ctx, next_ip, insn->address,
@@ -536,6 +605,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         break;
     }
     case IA64_OP_COVER:
+        ia64_gen_check_cover_virtualization(insn);
         gen_helper_cover_rse(tcg_env);
         break;
     case IA64_OP_FLUSHRS:
@@ -587,7 +657,9 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_ptr_purge(tcg_env, ia64_gr_src(op->register_index),
                               ia64_gr_src(op->source),
-                              tcg_constant_i32(1));
+                              tcg_constant_i32(1),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_PTR_I:
@@ -596,7 +668,9 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_ptr_purge(tcg_env, ia64_gr_src(op->register_index),
                               ia64_gr_src(op->source),
-                              tcg_constant_i32(0));
+                              tcg_constant_i32(0),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_ITC_D:
@@ -627,35 +701,47 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_nat_register(insn, op->source);
         ia64_gen_sync_ip_for_helper(insn);
+        ia64_gen_memory_release(insn);
         gen_helper_ptc_purge(tcg_env, ia64_gr_src(op->register_index),
                               ia64_gr_src(op->source),
-                              tcg_constant_i32(0));
+                              tcg_constant_i32(0),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_PTC_G:
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_nat_register(insn, op->source);
         ia64_gen_sync_ip_for_helper(insn);
+        ia64_gen_memory_release(insn);
         gen_helper_ptc_purge(tcg_env, ia64_gr_src(op->register_index),
                               ia64_gr_src(op->source),
-                              tcg_constant_i32(1));
+                              tcg_constant_i32(1),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_PTC_E:
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_sync_ip_for_helper(insn);
+        ia64_gen_memory_release(insn);
         gen_helper_ptc_purge(tcg_env, ia64_gr_src(op->register_index),
                               tcg_constant_i64(0),
-                              tcg_constant_i32(2));
+                              tcg_constant_i32(2),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_PTC_GA:
         ia64_gen_check_nat_register(insn, op->register_index);
         ia64_gen_check_nat_register(insn, op->source);
         ia64_gen_sync_ip_for_helper(insn);
+        ia64_gen_memory_release(insn);
         gen_helper_ptc_purge(tcg_env, ia64_gr_src(op->register_index),
                               ia64_gr_src(op->source),
-                              tcg_constant_i32(3));
+                              tcg_constant_i32(3),
+                              tcg_constant_i64(insn->raw),
+                              tcg_constant_i32(insn->slot));
         ia64_request_exit_after_bundle(ctx);
         break;
     case IA64_OP_NOP:
@@ -821,6 +907,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         }
         break;
     case IA64_OP_RFI:
+        ia64_gen_check_virtualization(insn);
         gen_helper_rfi(tcg_env, tcg_constant_i64(insn->address),
                        tcg_constant_i32(insn->slot));
         tcg_gen_lookup_and_goto_ptr();
@@ -870,6 +957,7 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
 
         ia64_gen_check_nat_consumption(insn, op->register_index, 0,
                                        IA64_NAT_NON_ACCESS);
+        ia64_gen_check_virtualization(insn);
         ia64_gen_sync_ip_for_helper(insn);
         gen_helper_tpa(val, tcg_env, ia64_gr_src(op->register_index));
         if (op->destination != 0) {
@@ -888,25 +976,34 @@ IA64GenResult ia64_gen_system(DisasContext *ctx,
         if (insn->opcode == IA64_OP_TAK) {
             ia64_gen_check_nat_consumption(insn, op->register_index, 3,
                                            IA64_NAT_NON_ACCESS);
+            ia64_gen_check_virtualization(insn);
             gen_helper_tak(result, tcg_env, ia64_gr_src(op->register_index));
             if (op->destination != 0) {
                 ia64_gen_gr_write_nat_clear(insn, op->destination, result);
             }
         } else if (insn->opcode == IA64_OP_THASH) {
+            ia64_gen_check_virtualization(insn);
             gen_helper_thash(result, tcg_env, ia64_gr_src(op->register_index));
             if (op->destination != 0) {
-                tcg_gen_mov_i64(cpu_gr[op->destination], result);
+                /*
+                 * Determine the result NaT from the original input before
+                 * writing r1.  The source and destination may name the same
+                 * GR, in which case an earlier data write would hide an
+                 * unimplemented input virtual address.
+                 */
                 ia64_gen_gr_nat_from_1_or_unimplemented_va(
                     insn, op->destination, op->register_index,
                     ia64_env_cpu_class(ctx->env)->impl_va_msb);
+                tcg_gen_mov_i64(cpu_gr[op->destination], result);
             }
         } else {
+            ia64_gen_check_virtualization(insn);
             gen_helper_ttag(result, tcg_env, ia64_gr_src(op->register_index));
             if (op->destination != 0) {
-                tcg_gen_mov_i64(cpu_gr[op->destination], result);
                 ia64_gen_gr_nat_from_1_or_unimplemented_va(
                     insn, op->destination, op->register_index,
                     ia64_env_cpu_class(ctx->env)->impl_va_msb);
+                tcg_gen_mov_i64(cpu_gr[op->destination], result);
             }
         }
         break;

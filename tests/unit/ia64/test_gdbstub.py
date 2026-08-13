@@ -33,6 +33,14 @@ RSE_CLEAN_PROGRAM = bytes.fromhex(
     "000000000c0000000002000000000400"
 )
 
+# MII: ld8.a r22=[r3]; nop.i; nop.i, followed by the corresponding
+# ld8.c.nc.  The pair lets the debugger act as an external memory writer
+# between allocation and lookup of a full-model ALAT entry.
+ALAT_EXTERNAL_WRITE_PROGRAM = bytes.fromhex(
+    "00b000065a1000000002000000000400"
+    "00b00006381100000002000000000400"
+)
+
 
 class RspClient:
     def __init__(self, sock: socket.socket) -> None:
@@ -139,7 +147,7 @@ def _rse_state(qmp: QmpClient) -> tuple[int, ...]:
 def test_gdbstub(qemu: str) -> None:
     proc = subprocess.Popen([
         qemu,
-        "-machine", "ia64-vpc",
+        "-machine", "ia64-vpc,alat=full",
         "-nodefaults",
         "-display", "none",
         "-monitor", "none",
@@ -229,6 +237,44 @@ def test_gdbstub(qemu: str) -> None:
                 raise RuntimeError(
                     "same-value AR.BSPSTORE g/G echo changed RSE state from "
                     f"{rse_before!r} to {rse_after_g!r}")
+
+            # Writes by DMA, the debugger, and other external agents are
+            # architecturally visible ALAT collisions.  Program an advanced
+            # load, modify its datum through GDB, and require the check load
+            # to miss and reload the new value.
+            initial = struct.pack("<Q", 0x1122334455667788)
+            changed = struct.pack("<Q", 0x8877665544332211)
+            if rsp.request(
+                    f"M2000,{len(ALAT_EXTERNAL_WRITE_PROGRAM):x}:"
+                    f"{ALAT_EXTERNAL_WRITE_PROGRAM.hex()}") != "OK" or \
+                    rsp.request(f"M4000,8:{initial.hex()}") != "OK":
+                raise RuntimeError("GDB memory write for ALAT probe failed")
+            _write_reg(rsp, 3, struct.pack("<Q", 0x4000))
+            _write_reg(rsp, 331, struct.pack("<Q", 0x2000))
+            _write_reg(rsp, 332, bytes(8))
+            for _ in range(4):
+                if struct.unpack("<Q", _read_reg(rsp, 331, 8))[0] == 0x2010:
+                    break
+                step = rsp.request("s")
+                if not step.startswith("T05"):
+                    raise RuntimeError(
+                        f"unexpected ALAT allocation step reply: {step!r}")
+            else:
+                raise RuntimeError("advanced load did not reach its check load")
+            if rsp.request(f"M4000,8:{changed.hex()}") != "OK":
+                raise RuntimeError("GDB external ALAT write failed")
+            for _ in range(4):
+                if struct.unpack("<Q", _read_reg(rsp, 331, 8))[0] == 0x2020:
+                    break
+                step = rsp.request("s")
+                if not step.startswith("T05"):
+                    raise RuntimeError(
+                        f"unexpected ALAT check-load step reply: {step!r}")
+            else:
+                raise RuntimeError("check load did not complete")
+            if _read_reg(rsp, 22, 8) != changed:
+                raise RuntimeError(
+                    "external RAM write left a stale full-model ALAT entry")
 
             gr_value = struct.pack("<Q", 0x1122334455667788)
             _expect_round_trip(rsp, 2, gr_value)

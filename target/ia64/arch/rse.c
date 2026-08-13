@@ -10,6 +10,7 @@
 #include "qemu/log.h"
 #include "cpu.h"
 #include "arch/arch.h"
+#include "arch/system.h"
 #include "ia32/ia32.h"
 #include "exec-access.h"
 #include "exec/target_page.h"
@@ -43,6 +44,35 @@ static int ia64_rse_mmu_index(CPUIA64State *env)
     return env->psr & IA64_PSR_RT ? MMU_IDX_RSE : MMU_PHYS_IDX;
 }
 
+static void ia64_rse_access_begin(CPUIA64State *env)
+{
+    env->rse.rse_access = true;
+}
+
+static void ia64_rse_access_end(CPUIA64State *env)
+{
+    env->rse.rse_access = false;
+}
+
+static void ia64_rse_check_data_debug(CPUIA64State *env, uint64_t addr,
+                                      bool is_write)
+{
+    ia64_mmu_check_data_debug(
+        env, addr, 8, is_write ? IA64_ISR_W : IA64_ISR_R,
+        ia64_rsc_pl(env->ar_rsc), true, ia64_ip_bundle_addr(env->ip),
+        (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT);
+}
+
+static void ia64_rse_complete_memory_reference(CPUIA64State *env)
+{
+    bool data_access_suppressed = env->psr & IA64_PSR_DA;
+
+    env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD);
+    if (data_access_suppressed) {
+        ia64_flush_suppressed_tlb(env);
+    }
+}
+
 /*
  * RSE backing-store accesses.  The retaddr is threaded from the helper
  * entry point: a non-zero value unwinds to the issuing instruction
@@ -56,8 +86,12 @@ static void ia64_rse_write_u64(CPUIA64State *env, uint64_t addr,
 {
     int mmu_idx = ia64_rse_mmu_index(env);
 
+    ia64_rse_check_data_debug(env, addr, true);
+    ia64_rse_access_begin(env);
     ia64_exec_store_mmuidx(env, addr, value, 8,
                            (env->ar_rsc & IA64_RSC_BE) != 0, mmu_idx, ra);
+    ia64_rse_access_end(env);
+    ia64_rse_complete_memory_reference(env);
 }
 
 static uint64_t ia64_rse_write_collection(CPUIA64State *env, uint64_t addr,
@@ -65,20 +99,32 @@ static uint64_t ia64_rse_write_collection(CPUIA64State *env, uint64_t addr,
                                           uint64_t *previous, uintptr_t ra)
 {
     int mmu_idx = ia64_rse_mmu_index(env);
+    uint64_t stored;
 
-    return ia64_exec_rse_store_collection(
+    ia64_rse_check_data_debug(env, addr, true);
+    ia64_rse_access_begin(env);
+    stored = ia64_exec_rse_store_collection(
         env, addr, value, defined, (env->ar_rsc & IA64_RSC_BE) != 0,
         mmu_idx, previous, ra);
+    ia64_rse_access_end(env);
+    ia64_rse_complete_memory_reference(env);
+    return stored;
 }
 
 static uint64_t ia64_rse_read_u64(CPUIA64State *env, uint64_t addr,
                                   uintptr_t ra)
 {
     int mmu_idx = ia64_rse_mmu_index(env);
+    uint64_t value;
 
-    return ia64_exec_load_mmuidx(env, addr, 8,
-                                 (env->ar_rsc & IA64_RSC_BE) != 0,
-                                 mmu_idx, ra);
+    ia64_rse_check_data_debug(env, addr, false);
+    ia64_rse_access_begin(env);
+    value = ia64_exec_load_mmuidx(env, addr, 8,
+                                  (env->ar_rsc & IA64_RSC_BE) != 0,
+                                  mmu_idx, ra);
+    ia64_rse_access_end(env);
+    ia64_rse_complete_memory_reference(env);
+    return value;
 }
 
 uint64_t ia64_rse_current_cfm(const CPUIA64State *env)
@@ -611,6 +657,20 @@ static inline uint32_t ia64_rse_nat_words_shrink(uint64_t addr, uint32_t nregs)
     return ia64_rse_nat_word_count(total);
 }
 
+/* Register-value words in [addr - words * 8, addr) in the backing store. */
+static uint32_t ia64_rse_register_words_below(uint64_t addr, uint32_t words)
+{
+    uint32_t first_nat = ia64_rse_collect_bit(addr) + 1;
+    uint32_t nat_words;
+
+    /*
+     * Walking backward, the first RNAT slot is first_nat words below addr;
+     * subsequent RNAT slots occur every 64 backing-store words.
+     */
+    nat_words = words < first_nat ? 0 : 1 + (words - first_nat) / 64;
+    return words - nat_words;
+}
+
 /*
  * Map a virtual stacked register index [0, sof) to its physical index:
  * registers inside the rotating region are renamed by CFM.rrb.gr
@@ -1130,7 +1190,6 @@ static int ia64_rse_store_one(CPUIA64State *env, uintptr_t ra)
         if (ia64_rse_has_clean_partition(env)) {
             env->rse.rse_clean_nat++;
         }
-        env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD);
         return 0;
     } else {
         uint32_t p = ia64_rse_wrap_phys((int32_t)env->rse.rse_bol -
@@ -1150,7 +1209,6 @@ static int ia64_rse_store_one(CPUIA64State *env, uintptr_t ra)
         } else {
             env->rse.rse_invalid++;
         }
-        env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD);
         return 1;
     }
 }
@@ -1252,7 +1310,6 @@ static int ia64_rse_load_one(CPUIA64State *env, uint64_t bspload,
         env->rse.rse_load_rnat_defined = INT64_MAX;
         env->rse.rse_load_rnat_valid = true;
         env->rse.rse_clean_nat++;
-        env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD);
         return 0;
     } else {
         uint64_t value;
@@ -1287,7 +1344,6 @@ static int ia64_rse_load_one(CPUIA64State *env, uint64_t bspload,
             ia64_gr_nat_set(env, IA64_STACKED_GR_BASE + v,
                             ia64_rse_pgr_nat_get(env, p));
         }
-        env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD);
         return 1;
     }
 }
@@ -1320,6 +1376,15 @@ static void ia64_rse_complete_frame_loads(CPUIA64State *env, uintptr_t ra)
            env->rse.rse_dirty + env->rse.rse_dirty_nat;
     bspload = env->ar_bsp - (live + 1) * 8;
     env->rse.rse_cfle = true;
+
+    /*
+     * Instruction processing checks for enabled pending external interrupts
+     * before it performs a CFLE-enabled mandatory load (SDM Vol.2 section
+     * 5.3, steps 3 and 4).  The post-load window below represents the same
+     * check after execution restarts at step one; this initial window is the
+     * corresponding check before the first backing-store reference.
+     */
+    ia64_rse_interrupt_window(env);
     while (env->rse.rse_dirty < 0 || env->rse.rse_dirty_nat < 0) {
         if (ia64_rse_load_one(env, bspload, ra)) {
             env->rse.rse_clean--;
@@ -1331,6 +1396,7 @@ static void ia64_rse_complete_frame_loads(CPUIA64State *env, uintptr_t ra)
         ia64_rse_rnat_move_bspstore(env, env->ar_bspstore - 8);
         /* load_one added exactly one word to the live partitions. */
         bspload -= 8;
+        ia64_rse_interrupt_window(env);
     }
     env->rse.rse_cfle = false;
 }
@@ -1390,6 +1456,7 @@ static void ia64_rse_new_frame(CPUIA64State *env, int32_t growth,
      */
     while (growth > 0) {
         growth -= ia64_rse_store_one(env, ra);
+        ia64_rse_interrupt_window(env);
     }
     env->rse.rse_invalid = 0;
     env->rse.rse_clean = 0;
@@ -1575,6 +1642,7 @@ static void ia64_rse_return_to_frame(CPUIA64State *env, uint64_t pfm,
     ia64_rse_check(env, "return");
 }
 
+#ifdef CONFIG_DEBUG_TCG
 void ia64_rse_delivery_check(CPUIA64State *env, int excp)
 {
     char site[32];
@@ -1582,6 +1650,7 @@ void ia64_rse_delivery_check(CPUIA64State *env, int excp)
     snprintf(site, sizeof(site), "delivery excp=%d", excp);
     ia64_rse_check(env, site);
 }
+#endif /* CONFIG_DEBUG_TCG */
 
 /*
  * Internal consistency checks for the register stack model.  Each RSE
@@ -1591,9 +1660,9 @@ void ia64_rse_delivery_check(CPUIA64State *env, int excp)
  * partition boundaries.  A violation indicates an emulator bug; log it
  * once with enough state to reconstruct the failure.
  */
+#ifdef CONFIG_DEBUG_TCG
 void ia64_rse_check(CPUIA64State *env, const char *site)
 {
-#ifdef CONFIG_DEBUG_TCG
     const IA64RnatWritebackImage *writeback =
         &env->rse.rse_writeback_rnat;
     static unsigned reported;
@@ -1717,10 +1786,39 @@ void ia64_rse_check(CPUIA64State *env, const char *site)
                       writeback->defined, writeback->valid, shadow_count,
                       env->rse.rse_cfle);
     }
-#else
-    (void)env;
-    (void)site;
-#endif
+}
+#endif /* CONFIG_DEBUG_TCG */
+
+static void ia64_rse_complete_pending_trap(CPUIA64State *env)
+{
+    uint32_t conditions;
+    uint64_t source_ip;
+    uint8_t source_slot;
+    uint8_t target_slot;
+
+    if (!env->rse.rse_completion_pending) {
+        return;
+    }
+
+    conditions = IA64_NATIVE_TRAP_TAKEN |
+        (env->rse.rse_completion_demoted ? IA64_NATIVE_TRAP_LOWER : 0);
+    source_ip = env->rse.rse_completion_source_ip;
+    source_slot = env->rse.rse_completion_source_slot;
+    target_slot = (env->psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT;
+
+    /*
+     * Clear the marker only after all mandatory target-frame loads have
+     * completed.  If a load faults, control never reaches this helper and
+     * the handler's rfi can resume the same completion sequence.
+     */
+    env->rse.rse_completion_pending = false;
+    env->exception_state.psr_suppression_before_insn =
+        env->rse.rse_completion_psr & IA64_PSR_FAULT_SUPPRESS_MASK;
+    ia64_system_clear_psr_fault_suppression(env);
+    ia64_check_native_traps(
+        env, env->ip, source_ip,
+        IA64_NATIVE_TRAP_SLOTS(target_slot, source_slot), conditions, 0,
+        env->rse.rse_completion_psr);
 }
 
 void ia64_rse_resume_incomplete_frame(CPUIA64State *env)
@@ -1730,6 +1828,7 @@ void ia64_rse_resume_incomplete_frame(CPUIA64State *env)
      * interrupted after br.ret or rfi (SDM Vol.2 section 6.8).
      */
     ia64_rse_complete_frame_loads(env, 0);
+    ia64_rse_complete_pending_trap(env);
     ia64_rse_check(env, "rfi-resume");
 }
 
@@ -1807,7 +1906,10 @@ void ia64_rfi(CPUIA64State *env, uint64_t fault_ip, uint32_t fault_slot)
     if (ifs & IA64_IFS_V) {
         ia64_rse_return_to_frame(env, ifs & IA64_IFS_IFM_MASK,
                                  ifs & IA64_CFM_SOF_MASK);
-    } else if (env->rse.rse_dirty < 0 || env->rse.rse_dirty_nat < 0) {
+        /* A handler may execute cover before returning to a faulted br.ret. */
+        ia64_rse_complete_pending_trap(env);
+    } else if (env->rse.rse_completion_pending ||
+               env->rse.rse_dirty < 0 || env->rse.rse_dirty_nat < 0) {
         /*
          * SDM Vol.2 6.8: an interruption taken during the mandatory
          * loads of a br.ret/rfi leaves the current frame incomplete.
@@ -1928,6 +2030,7 @@ void ia64_rse_br_call(CPUIA64State *env, uint32_t b_reg,
 
     env->ar_pfs = pfs;
     env->br[b_reg] = next_ip;
+    ia64_system_reset_dahr(env);
     env->ip = ia64_ip_bundle_addr(target);
     env->psr &= ~IA64_PSR_RI_MASK;
     ia64_rse_check(env, "br.call");
@@ -1961,8 +2064,8 @@ void ia64_rse_br_ia(CPUIA64State *env, uint32_t b_reg,
      */
     env->ip = target & UINT32_MAX;
     env->psr |= IA64_PSR_IS;
-    env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD | IA64_PSR_IA | IA64_PSR_ED |
-                  IA64_PSR_RI_MASK);
+    env->psr &= ~(IA64_PSR_DA | IA64_PSR_DD | IA64_PSR_ID | IA64_PSR_IA |
+                  IA64_PSR_ED | IA64_PSR_RI_MASK);
     ia64_rse_sync_frame_out(env);
     env->cfm_sof = 0;
     env->cfm_sol = 0;
@@ -2000,17 +2103,25 @@ void ia64_rse_br_ia(CPUIA64State *env, uint32_t b_reg,
 
 void ia64_rse_pop_return_frame(CPUIA64State *env, uint64_t pfs)
 {
+    /*
+     * Restore EC before enabling any mandatory target-frame loads.  A fill
+     * fault is delivered on the target instruction, whose handler must see
+     * the caller's PFS.pec value (SDM Vol.3 br pseudocode).
+     */
+    env->ar_ec = (pfs & IA64_PFS_PEC_MASK) >> IA64_PFS_PEC_SHIFT;
     ia64_rse_return_to_frame(env, pfs & IA64_PFS_PFM_MASK,
                              (pfs & IA64_CFM_SOL_MASK) >>
                              IA64_CFM_SOL_SHIFT);
-    env->ar_ec = (pfs & IA64_PFS_PEC_MASK) >> IA64_PFS_PEC_SHIFT;
 }
 
-void ia64_rse_br_ret(CPUIA64State *env, uint32_t b_reg)
+void ia64_rse_br_ret(CPUIA64State *env, uint32_t b_reg,
+                     uint64_t source_ip, uint32_t source_slot)
 {
+    uint64_t old_psr = env->psr;
     uint64_t pfs = env->ar_pfs;
     uint64_t target = env->br[b_reg];
     uint8_t ppl = (pfs & IA64_PFS_PPL_MASK) >> IA64_PFS_PPL_SHIFT;
+    bool demoted = ia64_psr_cpl(env->psr) < ppl;
 
     /*
      * Commit the branch target (slot 0) and demoted privilege level
@@ -2019,11 +2130,30 @@ void ia64_rse_br_ret(CPUIA64State *env, uint32_t b_reg)
      */
     env->ip = ia64_ip_bundle_addr(target);
     env->psr &= ~IA64_PSR_RI_MASK;
-    if (ia64_psr_cpl(env->psr) < ppl) {
+    if (demoted) {
         ia64_set_psr(env, (env->psr & ~IA64_PSR_CPL_MASK) |
                           ((uint64_t)ppl << IA64_PSR_CPL_SHIFT));
     }
+    env->rse.rse_completion_pending = true;
+    env->rse.rse_completion_demoted = demoted;
+    env->rse.rse_completion_psr = old_psr;
+    env->rse.rse_completion_source_ip = ia64_ip_bundle_addr(source_ip);
+    env->rse.rse_completion_source_slot = source_slot & 3;
+
+    /*
+     * A br.ret has successfully completed before target-frame loads begin.
+     * If a mandatory fill faults, or an external interrupt wins the initial
+     * target processing window, IIPA must therefore identify this branch.
+     * The translated retirement path cannot record it when the helper exits
+     * during that sequence.  Use the pre-instruction collection state: unlike
+     * br.ret, an rfi entered with PSR.ic clear does not establish last_IP even
+     * when it restores IPSR.ic (SDM Vol.2 section 3.3.5.6).
+     */
+    if (env->rse.rse_completion_psr & IA64_PSR_IC) {
+        env->last_successful_bundle = env->rse.rse_completion_source_ip;
+    }
     ia64_rse_pop_return_frame(env, pfs);
+    ia64_rse_complete_pending_trap(env);
     IA64_TRACE_RSE_STATE(env, "br.ret");
 }
 
@@ -2104,6 +2234,7 @@ void ia64_rse_flush(CPUIA64State *env, uintptr_t ra)
      */
     while (env->rse.rse_dirty + env->rse.rse_dirty_nat > 0) {
         ia64_rse_store_one(env, ra);
+        ia64_rse_interrupt_window(env);
     }
     ia64_rse_check(env, "flushrs");
     IA64_TRACE_RSE_STATE(env, "flushrs");
@@ -2119,6 +2250,14 @@ void ia64_rse_load(CPUIA64State *env, uint64_t fault_ip, uint64_t raw,
 
     if ((env->ar_rsc & IA64_RSC_MODE) != 0 ||
         (env->cfm_sof != 0 && loadrs_bytes != 0)) {
+        ia64_raise_exception(env, IA64_EXCP_ILLEGAL, fault_ip, raw, slot);
+    }
+    if (ia64_rse_register_words_below(env->ar_bsp, words) >
+        IA64_STACKED_GR_COUNT) {
+        /*
+         * This Illegal Operation fault precedes every mandatory backing-store
+         * access and must not expose a lower-priority translation fault.
+         */
         ia64_raise_exception(env, IA64_EXCP_ILLEGAL, fault_ip, raw, slot);
     }
 
@@ -2161,6 +2300,7 @@ void ia64_rse_load(CPUIA64State *env, uint64_t fault_ip, uint64_t raw,
             /* load_one added exactly one word to the live partitions. */
             bspload -= 8;
             words_to_load--;
+            ia64_rse_interrupt_window(env);
         }
     } else {
         uint64_t tear = env->ar_bsp - loadrs_bytes;
@@ -2188,7 +2328,7 @@ void ia64_rse_load(CPUIA64State *env, uint64_t fault_ip, uint64_t raw,
 
 /* ---- Loop branch helpers ---- */
 
-uint64_t ia64_rse_br_cexit(CPUIA64State *env, uint64_t target, uint32_t b_reg)
+bool ia64_rse_br_cexit(CPUIA64State *env)
 {
     uint64_t lc = env->ar_lc;
     uint64_t ec = env->ar_ec;
@@ -2206,10 +2346,10 @@ uint64_t ia64_rse_br_cexit(CPUIA64State *env, uint64_t target, uint32_t b_reg)
         env->pr[IA64_PR_LAST] = 0;
     }
 
-    return active ? 0 : ((b_reg == 0) ? target : env->br[b_reg]);
+    return !active;
 }
 
-uint64_t ia64_rse_br_ctop(CPUIA64State *env, uint64_t target, uint32_t b_reg)
+bool ia64_rse_br_ctop(CPUIA64State *env)
 {
     uint64_t lc = env->ar_lc;
     uint64_t ec = env->ar_ec;
@@ -2227,7 +2367,7 @@ uint64_t ia64_rse_br_ctop(CPUIA64State *env, uint64_t target, uint32_t b_reg)
         env->pr[IA64_PR_LAST] = 0;
     }
 
-    return active ? ((b_reg == 0) ? target : env->br[b_reg]) : 0;
+    return active;
 }
 
 static bool ia64_update_while_loop(CPUIA64State *env, uint32_t qp)
@@ -2249,14 +2389,14 @@ static bool ia64_update_while_loop(CPUIA64State *env, uint32_t qp)
     return pipeline_active;
 }
 
-uint64_t ia64_rse_br_wexit(CPUIA64State *env, uint64_t target, uint32_t qp)
+bool ia64_rse_br_wexit(CPUIA64State *env, uint32_t qp)
 {
-    return ia64_update_while_loop(env, qp) ? 0 : target;
+    return !ia64_update_while_loop(env, qp);
 }
 
-uint64_t ia64_rse_br_wtop(CPUIA64State *env, uint64_t target, uint32_t qp)
+bool ia64_rse_br_wtop(CPUIA64State *env, uint32_t qp)
 {
-    return ia64_update_while_loop(env, qp) ? target : 0;
+    return ia64_update_while_loop(env, qp);
 }
 
 void ia64_rse_clrrrb(CPUIA64State *env, uint32_t predicate_only)

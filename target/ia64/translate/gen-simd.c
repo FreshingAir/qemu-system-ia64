@@ -34,6 +34,192 @@ typedef struct IA64SIMDLanePlan {
     uint64_t mask;
 } IA64SIMDLanePlan;
 
+static unsigned ia64_simd_vece(unsigned bits)
+{
+    switch (bits) {
+    case 8:
+        return MO_8;
+    case 16:
+        return MO_16;
+    case 32:
+        return MO_32;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static void ia64_gen_vec_result_i64(TCGv_i64 result, TCGv_vec value)
+{
+    /*
+     * TCG has an integer-to-vector duplicate, but no target-independent
+     * vector-to-integer bitcast.  A private per-vCPU slot preserves the
+     * value without synchronizing architectural globals around a helper.
+     */
+    tcg_gen_st_vec(value, tcg_env,
+                   offsetof(CPUIA64State, tcg_vec_scratch));
+    tcg_gen_ld_i64(result, tcg_env,
+                   offsetof(CPUIA64State, tcg_vec_scratch));
+}
+
+static void ia64_simd_vec_temps(DisasContext *ctx)
+{
+    if (ctx->simd.a == NULL) {
+        ctx->simd.a = tcg_temp_new_vec(TCG_TYPE_V64);
+        ctx->simd.b = tcg_temp_new_vec(TCG_TYPE_V64);
+        ctx->simd.result = tcg_temp_new_vec(TCG_TYPE_V64);
+    }
+}
+
+static bool ia64_gen_packed_vec_binary(DisasContext *ctx, TCGv_i64 result,
+                                       TCGv_i64 a,
+                                       TCGv_i64 b, unsigned bits,
+                                       TCGOpcode opcode, TCGCond cond)
+{
+    unsigned vece = ia64_simd_vece(bits);
+    TCGv_vec va, vb, vr;
+
+    if (!tcg_op_supported(INDEX_op_dup_vec, TCG_TYPE_V64, 0) ||
+        tcg_can_emit_vec_op(opcode, TCG_TYPE_V64, vece) == 0) {
+        return false;
+    }
+
+    ia64_simd_vec_temps(ctx);
+    va = ctx->simd.a;
+    vb = ctx->simd.b;
+    vr = ctx->simd.result;
+    tcg_gen_dup_i64_vec(MO_64, va, a);
+    tcg_gen_dup_i64_vec(MO_64, vb, b);
+
+    switch (opcode) {
+    case INDEX_op_ssadd_vec:
+        tcg_gen_ssadd_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_usadd_vec:
+        tcg_gen_usadd_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_sssub_vec:
+        tcg_gen_sssub_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_ussub_vec:
+        tcg_gen_ussub_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_smin_vec:
+        tcg_gen_smin_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_umin_vec:
+        tcg_gen_umin_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_smax_vec:
+        tcg_gen_smax_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_umax_vec:
+        tcg_gen_umax_vec(vece, vr, va, vb);
+        break;
+    case INDEX_op_cmp_vec:
+        tcg_gen_cmp_vec(cond, vece, vr, va, vb);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+
+    ia64_gen_vec_result_i64(result, vr);
+    return true;
+}
+
+static bool ia64_gen_packed_vec_shift(DisasContext *ctx, TCGv_i64 result,
+                                      TCGv_i64 value,
+                                      TCGv_i64 count, unsigned bits,
+                                      TCGOpcode opcode)
+{
+    unsigned vece = ia64_simd_vece(bits);
+    TCGv_i32 count32;
+    TCGv_vec vv, vr;
+
+    if (!tcg_op_supported(INDEX_op_dup_vec, TCG_TYPE_V64, 0) ||
+        tcg_can_emit_vec_op(opcode, TCG_TYPE_V64, vece) == 0) {
+        return false;
+    }
+
+    count32 = tcg_temp_new_i32();
+    ia64_simd_vec_temps(ctx);
+    vv = ctx->simd.a;
+    vr = ctx->simd.result;
+    tcg_gen_extrl_i64_i32(count32, count);
+    tcg_gen_dup_i64_vec(MO_64, vv, value);
+    switch (opcode) {
+    case INDEX_op_shls_vec:
+        tcg_gen_shls_vec(vece, vr, vv, count32);
+        break;
+    case INDEX_op_shrs_vec:
+        tcg_gen_shrs_vec(vece, vr, vv, count32);
+        break;
+    case INDEX_op_sars_vec:
+        tcg_gen_sars_vec(vece, vr, vv, count32);
+        break;
+    default:
+        g_assert_not_reached();
+    }
+    ia64_gen_vec_result_i64(result, vr);
+    return true;
+}
+
+static bool ia64_gen_pshladd2_vec(DisasContext *ctx, TCGv_i64 result,
+                                  TCGv_i64 a,
+                                  TCGv_i64 b, unsigned count)
+{
+    TCGv_vec va, vb, vr, shift_ok;
+
+    if (!tcg_op_supported(INDEX_op_dup_vec, TCG_TYPE_V64, 0) ||
+        tcg_can_emit_vec_op(INDEX_op_sari_vec, TCG_TYPE_V64, MO_16) == 0 ||
+        tcg_can_emit_vec_op(INDEX_op_cmp_vec, TCG_TYPE_V64, MO_16) == 0 ||
+        tcg_can_emit_vec_op(INDEX_op_ssadd_vec, TCG_TYPE_V64, MO_16) == 0) {
+        return false;
+    }
+
+    ia64_simd_vec_temps(ctx);
+    va = ctx->simd.a;
+    vb = ctx->simd.b;
+    vr = ctx->simd.result;
+    shift_ok = tcg_temp_new_vec(TCG_TYPE_V64);
+    tcg_gen_dup_i64_vec(MO_64, va, a);
+    tcg_gen_dup_i64_vec(MO_64, vb, b);
+    tcg_gen_mov_vec(vr, va);
+    for (unsigned i = 0; i < count; i++) {
+        tcg_gen_ssadd_vec(MO_16, vr, vr, vr);
+    }
+
+    /* A saturated shift is terminal; add b only in lanes without overflow. */
+    tcg_gen_sari_vec(MO_16, shift_ok, vr, count);
+    tcg_gen_cmp_vec(TCG_COND_EQ, MO_16, shift_ok, shift_ok, va);
+    tcg_gen_ssadd_vec(MO_16, vb, vr, vb);
+    tcg_gen_bitsel_vec(MO_16, vr, shift_ok, vb, vr);
+    ia64_gen_vec_result_i64(result, vr);
+    return true;
+}
+
+static bool ia64_gen_pshradd2_vec(DisasContext *ctx, TCGv_i64 result,
+                                  TCGv_i64 a,
+                                  TCGv_i64 b, unsigned count)
+{
+    TCGv_vec va, vb;
+
+    if (!tcg_op_supported(INDEX_op_dup_vec, TCG_TYPE_V64, 0) ||
+        tcg_can_emit_vec_op(INDEX_op_sari_vec, TCG_TYPE_V64, MO_16) == 0 ||
+        tcg_can_emit_vec_op(INDEX_op_ssadd_vec, TCG_TYPE_V64, MO_16) == 0) {
+        return false;
+    }
+
+    ia64_simd_vec_temps(ctx);
+    va = ctx->simd.a;
+    vb = ctx->simd.b;
+    tcg_gen_dup_i64_vec(MO_64, va, a);
+    tcg_gen_dup_i64_vec(MO_64, vb, b);
+    tcg_gen_sari_vec(MO_16, va, va, count);
+    tcg_gen_ssadd_vec(MO_16, va, va, vb);
+    ia64_gen_vec_result_i64(result, va);
+    return true;
+}
+
 static IA64SIMDLanePlan ia64_simd_lane_plan(unsigned bits)
 {
     return (IA64SIMDLanePlan) {
@@ -51,6 +237,27 @@ static uint64_t ia64_simd_repeated_bit(unsigned bits, unsigned bit)
         result |= UINT64_C(1) << (lane + bit);
     }
     return result;
+}
+
+static void ia64_gen_simd_mix(TCGv_i64 result, TCGv_i64 a, TCGv_i64 b,
+                              unsigned bits, bool left)
+{
+    const uint64_t low_mask =
+        bits == 8 ? UINT64_C(0x00ff00ff00ff00ff) :
+        bits == 16 ? UINT64_C(0x0000ffff0000ffff) :
+                     UINT64_C(0x00000000ffffffff);
+    TCGv_i64 tmp = tcg_temp_new_i64();
+
+    if (left) {
+        tcg_gen_andi_i64(result, a, ~low_mask);
+        tcg_gen_shri_i64(tmp, b, bits);
+        tcg_gen_andi_i64(tmp, tmp, low_mask);
+    } else {
+        tcg_gen_shli_i64(tmp, a, bits);
+        tcg_gen_andi_i64(tmp, tmp, ~low_mask);
+        tcg_gen_andi_i64(result, b, low_mask);
+    }
+    tcg_gen_or_i64(result, result, tmp);
 }
 
 static void ia64_gen_packed_wrap(TCGv_i64 result, TCGv_i64 a, TCGv_i64 b,
@@ -198,7 +405,8 @@ static void ia64_simd_insert_lane(TCGv_i64 result, TCGv_i64 value,
     tcg_gen_or_i64(result, result, value);
 }
 
-static void ia64_gen_pshr(const Ia64Instruction *insn, int lane_bits,
+static void ia64_gen_pshr(DisasContext *ctx, const Ia64Instruction *insn,
+                          int lane_bits,
                           bool unsigned_shift)
 {
     const IA64SimdOperands *op = &insn->operands.simd;
@@ -224,6 +432,19 @@ static void ia64_gen_pshr(const Ia64Instruction *insn, int lane_bits,
                         tcg_constant_i64(lane_bits),
                         tcg_constant_i64(lane_bits), count);
 
+    if (ia64_gen_packed_vec_shift(ctx,
+            result, ia64_gr_src(op->source2), clamped_count, lane_bits,
+            unsigned_shift ? INDEX_op_shrs_vec : INDEX_op_sars_vec)) {
+        tcg_gen_mov_i64(cpu_gr[op->destination], result);
+        if (op->immediate >= 0) {
+            ia64_gen_gr_nat_from_1(insn, op->destination, op->source2);
+        } else {
+            ia64_gen_gr_nat_from_2(insn, op->destination,
+                                   op->source1, op->source2);
+        }
+        return;
+    }
+
     tcg_gen_movi_i64(result, 0);
     for (int i = 0; i < plan.count; i++) {
         TCGv_i64 lane = ia64_simd_extract_lane(
@@ -246,7 +467,8 @@ static void ia64_gen_pshr(const Ia64Instruction *insn, int lane_bits,
     }
 }
 
-static void ia64_gen_pshl(const Ia64Instruction *insn, int lane_bits)
+static void ia64_gen_pshl(DisasContext *ctx, const Ia64Instruction *insn,
+                          int lane_bits)
 {
     const IA64SimdOperands *op = &insn->operands.simd;
     const IA64SIMDLanePlan plan = ia64_simd_lane_plan(lane_bits);
@@ -271,6 +493,19 @@ static void ia64_gen_pshl(const Ia64Instruction *insn, int lane_bits)
                         tcg_constant_i64(lane_bits),
                         tcg_constant_i64(lane_bits), count);
 
+    if (ia64_gen_packed_vec_shift(ctx, result, ia64_gr_src(op->source1),
+                                  clamped_count, lane_bits,
+                                  INDEX_op_shls_vec)) {
+        tcg_gen_mov_i64(cpu_gr[op->destination], result);
+        if (op->immediate >= 0) {
+            ia64_gen_gr_nat_from_1(insn, op->destination, op->source1);
+        } else {
+            ia64_gen_gr_nat_from_2(insn, op->destination,
+                                   op->source1, op->source2);
+        }
+        return;
+    }
+
     tcg_gen_movi_i64(result, 0);
     for (int i = 0; i < plan.count; i++) {
         TCGv_i64 lane = ia64_simd_extract_lane(
@@ -294,8 +529,6 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
                             const Ia64Instruction *insn)
 {
     const IA64SimdOperands *op = &insn->operands.simd;
-
-    (void)ctx;
 
     switch (insn->opcode) {
     case IA64_OP_PADD1:
@@ -326,6 +559,17 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
         if (saturation == 0) {
             ia64_gen_packed_wrap(result, ia64_gr_src(op->source1),
                                  ia64_gr_src(op->source2), plan.bits, is_sub);
+        } else if ((saturation == 1 || saturation == 2) &&
+                   ia64_gen_packed_vec_binary(
+                       ctx, result, ia64_gr_src(op->source1),
+                       ia64_gr_src(op->source2), plan.bits,
+                       is_sub ?
+                           (saturation == 1 ? INDEX_op_sssub_vec :
+                                              INDEX_op_ussub_vec) :
+                           (saturation == 1 ? INDEX_op_ssadd_vec :
+                                              INDEX_op_usadd_vec),
+                       TCG_COND_NEVER)) {
+            /* Generated above. */
         } else {
             tcg_gen_movi_i64(result, 0);
             for (int i = 0; i < plan.count; ++i) {
@@ -372,26 +616,21 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
         break;
     }
     case IA64_OP_PSHLADD2: {
-        const IA64SIMDLanePlan plan = ia64_simd_lane_plan(16);
         TCGv_i64 result = tcg_temp_new_i64();
 
         if (op->destination == 0) {
             break;
         }
-        tcg_gen_movi_i64(result, 0);
-        for (int i = 0; i < plan.count; ++i) {
-            TCGv_i64 lane_a = ia64_simd_extract_lane(
-                ia64_gr_src(op->source1), &plan, i, true);
-            TCGv_i64 lane_b = ia64_simd_extract_lane(
-                ia64_gr_src(op->source2), &plan, i, true);
-            TCGv_i64 lane_res = tcg_temp_new_i64();
-
-            tcg_gen_shli_i64(lane_res, lane_a, op->immediate);
-            ia64_gen_saturate_signed_i64(lane_res, 16);
-            tcg_gen_add_i64(lane_res, lane_res, lane_b);
-            ia64_gen_saturate_signed_i64(lane_res, 16);
-            ia64_simd_insert_lane(result, lane_res, &plan, i);
+        if (ia64_gen_pshladd2_vec(ctx, result, ia64_gr_src(op->source1),
+                                  ia64_gr_src(op->source2), op->immediate)) {
+            tcg_gen_mov_i64(cpu_gr[op->destination], result);
+            ia64_gen_gr_nat_from_2(insn, op->destination,
+                                   op->source1, op->source2);
+            break;
         }
+        gen_helper_simd_pshladd2(result, ia64_gr_src(op->source1),
+                                 ia64_gr_src(op->source2),
+                                 tcg_constant_i32(op->immediate));
         tcg_gen_mov_i64(cpu_gr[op->destination], result);
         ia64_gen_gr_nat_from_2(insn, op->destination,
                                op->source1, op->source2);
@@ -402,6 +641,13 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
         TCGv_i64 result = tcg_temp_new_i64();
 
         if (op->destination == 0) {
+            break;
+        }
+        if (ia64_gen_pshradd2_vec(ctx, result, ia64_gr_src(op->source1),
+                                  ia64_gr_src(op->source2), op->immediate)) {
+            tcg_gen_mov_i64(cpu_gr[op->destination], result);
+            ia64_gen_gr_nat_from_2(insn, op->destination,
+                                   op->source1, op->source2);
             break;
         }
         tcg_gen_movi_i64(result, 0);
@@ -423,16 +669,16 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
         break;
     }
     case IA64_OP_PSHR2:
-        ia64_gen_pshr(insn, 16, false);
+        ia64_gen_pshr(ctx, insn, 16, false);
         break;
     case IA64_OP_PSHR2_U:
-        ia64_gen_pshr(insn, 16, true);
+        ia64_gen_pshr(ctx, insn, 16, true);
         break;
     case IA64_OP_PSHR4:
-        ia64_gen_pshr(insn, 32, false);
+        ia64_gen_pshr(ctx, insn, 32, false);
         break;
     case IA64_OP_PSHR4_U:
-        ia64_gen_pshr(insn, 32, true);
+        ia64_gen_pshr(ctx, insn, 32, true);
         break;
     case IA64_OP_PAVG1:
     case IA64_OP_PAVG2:
@@ -494,7 +740,14 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
             break;
         }
         result = tcg_temp_new_i64();
-        if ((sel & 1) == 0) {
+        if (ia64_gen_packed_vec_binary(
+                ctx, result, ia64_gr_src(op->source1),
+                ia64_gr_src(op->source2),
+                sel <= 1 ? 8 : sel <= 3 ? 16 : 32,
+                INDEX_op_cmp_vec,
+                (sel & 1) ? TCG_COND_GT : TCG_COND_EQ)) {
+            /* Generated above. */
+        } else if ((sel & 1) == 0) {
             ia64_gen_packed_equal(result, ia64_gr_src(op->source1),
                                   ia64_gr_src(op->source2),
                                   sel == 0 ? 8 : sel == 2 ? 16 : 32);
@@ -528,9 +781,17 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
             break;
         }
         result = tcg_temp_new_i64();
-        gen_helper_simd_pminmax(result, tcg_constant_i32(sel),
-                                ia64_gr_src(op->source1),
-                                ia64_gr_src(op->source2));
+        if (!ia64_gen_packed_vec_binary(
+                ctx, result, ia64_gr_src(op->source1),
+                ia64_gr_src(op->source2), sel <= 1 ? 8 : 16,
+                sel == 0 ? INDEX_op_umax_vec :
+                sel == 1 ? INDEX_op_umin_vec :
+                sel == 2 ? INDEX_op_smax_vec : INDEX_op_smin_vec,
+                TCG_COND_NEVER)) {
+            gen_helper_simd_pminmax(result, tcg_constant_i32(sel),
+                                    ia64_gr_src(op->source1),
+                                    ia64_gr_src(op->source2));
+        }
         tcg_gen_mov_i64(cpu_gr[op->destination], result);
         ia64_gen_gr_nat_from_2(insn, op->destination,
                                op->source1, op->source2);
@@ -566,10 +827,10 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
         break;
     }
     case IA64_OP_PSHL2:
-        ia64_gen_pshl(insn, 16);
+        ia64_gen_pshl(ctx, insn, 16);
         break;
     case IA64_OP_PSHL4:
-        ia64_gen_pshl(insn, 32);
+        ia64_gen_pshl(ctx, insn, 32);
         break;
     case IA64_OP_PSAD1: {
         TCGv_i64 result;
@@ -627,9 +888,9 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
             break;
         }
         result = tcg_temp_new_i64();
-        gen_helper_simd_mix(result, tcg_constant_i32(sel),
-                            ia64_gr_src(op->source1),
-                            ia64_gr_src(op->source2));
+        ia64_gen_simd_mix(result, ia64_gr_src(op->source1),
+                          ia64_gr_src(op->source2), 8u << (sel >> 1),
+                          (sel & 1) == 0);
         tcg_gen_mov_i64(cpu_gr[op->destination], result);
         ia64_gen_gr_nat_from_2(insn, op->destination,
                                op->source1, op->source2);

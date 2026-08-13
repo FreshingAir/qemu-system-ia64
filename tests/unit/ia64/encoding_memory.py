@@ -182,11 +182,17 @@ def ldfe(f1, r3, hint=0, qp=0):
         | bitfield(qp, 0, 6)
     )
 
+def ldfe_s(f1, r3, hint=0, qp=0):
+    return ldfe(f1, r3, hint, qp) | bitfield(0x04, 30, 6)
+
 def ldf8_s(f1, r3, hint=0, qp=0):
     return ldf8(f1, r3, hint, qp) | bitfield(0x05, 30, 6)
 
 def ldf8_a(f1, r3, hint=0, qp=0):
     return ldf8(f1, r3, hint, qp) | bitfield(0x09, 30, 6)
+
+def ldfe_a(f1, r3, hint=0, qp=0):
+    return ldfe(f1, r3, hint, qp) | bitfield(0x08, 30, 6)
 
 def ldf8_sa(f1, r3, hint=0, qp=0):
     return ldf8(f1, r3, hint, qp) | bitfield(0x0d, 30, 6)
@@ -249,16 +255,6 @@ def store_mem_postinc(x6, r3, r2, imm, qp=0):
 def st4_postinc(r3, r2, imm, qp=0):
     return store_mem_postinc(0x32, r3, r2, imm, qp)
 
-def cmpxchg4(r1, r3, r2, qp=0):
-    return (
-        op(2)
-        | bitfield(3, 29, 2)
-        | bitfield(r3, 20, 7)
-        | bitfield(r2, 13, 7)
-        | bitfield(r1, 6, 7)
-        | bitfield(qp, 0, 6)
-    )
-
 def cmpxchg_acq(size_log2, r1, r3, r2, qp=0, hint=0):
     return (
         op(4)
@@ -274,6 +270,18 @@ def cmpxchg_acq(size_log2, r1, r3, r2, qp=0, hint=0):
 
 def cmpxchg4_acq(r1, r3, r2, qp=0):
     return cmpxchg_acq(2, r1, r3, r2, qp)
+
+def reserved_m_major2(qp=0):
+    return op(2) | bitfield(qp, 0, 6)
+
+def reserved_memory_selector(major, m, x, x6, qp=0):
+    return (
+        op(major)
+        | bitfield(m, 36, 1)
+        | bitfield(x6, 30, 6)
+        | bitfield(x, 27, 1)
+        | bitfield(qp, 0, 6)
+    )
 
 def cmpxchg_rel(size_log2, r1, r3, r2, qp=0, hint=0):
     return cmpxchg_acq(size_log2, r1, r3, r2, qp, hint) | bitfield(1, 32, 1)
@@ -690,6 +698,23 @@ def lfetch(r3, x6a=0x2c, qp=0):
     return (op(6) | bitfield(x6a, 30, 6) | bitfield(r3, 20, 7) |
             bitfield(qp, 0, 6))
 
+def lfetch_count(r3, count, stride, hint=0, h=0, qp=0):
+    if not 1 <= count <= 64:
+        raise ValueError("lfetch.count count must be in 1..64")
+    if stride % 64 != 0 or not -16 * 64 <= stride <= 15 * 64:
+        raise ValueError("lfetch.count stride must be -1024..960 by 64")
+    return (
+        op(6)
+        | bitfield(0x2c, 30, 6)
+        | bitfield(hint, 28, 2)
+        | bitfield(r3, 20, 7)
+        | bitfield(1, 19, 1)
+        | bitfield((stride // 64) & 0x1f, 14, 5)
+        | bitfield(h, 12, 1)
+        | bitfield(count - 1, 6, 6)
+        | bitfield(qp, 0, 6)
+    )
+
 def lfetch_reg_postinc(r3, r2, x6a=0x2c, hint=0, qp=0):
     return (
         op(6)
@@ -714,9 +739,13 @@ def lfetch_postinc(r3, imm, x6a=0x2c, hint=0, qp=0):
         | bitfield(qp, 0, 6)
     )
 
-def fc_i(r3, qp=0):
+def fc(r3, qp=0):
     return (op(1) | bitfield(0x30, 27, 6) | bitfield(r3, 20, 7) |
             bitfield(qp, 0, 6))
+
+
+def fc_i(r3, qp=0):
+    return fc(r3, qp) | bitfield(1, 36, 1)
 
 __all__ = (
     'load_mem',
@@ -742,8 +771,10 @@ __all__ = (
     'ldfd',
     'ldfps',
     'ldfe',
+    'ldfe_s',
     'ldf8_s',
     'ldf8_a',
+    'ldfe_a',
     'ldf8_sa',
     'ldf8_c_nc',
     'ldfp8_postinc',
@@ -754,9 +785,10 @@ __all__ = (
     'st4_rel',
     'store_mem_postinc',
     'st4_postinc',
-    'cmpxchg4',
     'cmpxchg_acq',
     'cmpxchg4_acq',
+    'reserved_m_major2',
+    'reserved_memory_selector',
     'cmpxchg_rel',
     'cmp8xchg16_acq',
     'cmp8xchg16_rel',
@@ -814,7 +846,9 @@ __all__ = (
     'probe_r_reg',
     'probe_w_reg',
     'lfetch',
+    'lfetch_count',
     'lfetch_reg_postinc',
     'lfetch_postinc',
+    'fc',
     'fc_i',
 )
