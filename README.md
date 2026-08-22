@@ -93,7 +93,7 @@ Use `-accel tcg,thread=single` for one vCPU and
 `-accel tcg,thread=multi -smp N` for 2 to 64 vCPUs. With `i8042=off`, the
 machine adds a USB keyboard and absolute tablet without requiring `-usb`.
 
-> [!INFO]
+> [!NOTE]
 > Having more processors does not necessarily guarantee better results.
 > As the number of cores increases, performance penalties can occur due to inter-core synchronisation and other factors.
 > In most cases, 2–4 SMPs are optimal, and we recommend a maximum of 8.
