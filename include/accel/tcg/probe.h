@@ -101,6 +101,32 @@ int probe_access_full_mmu(CPUArchState *env, vaddr addr, int size,
                           MMUAccessType access_type, int mmu_idx,
                           void **phost, CPUTLBEntryFull **pfull);
 
+/**
+ * tlb_lookup_full_no_fill:
+ * @env: CPUArchState
+ * @addr: guest virtual address to look up
+ * @access_type: read, write or execute permission
+ * @mmu_idx: MMU index to use for lookup
+ * @pfull: return value for the matching full TLB entry
+ * @from_victim: return whether the matching entry was promoted from the
+ *               victim TLB
+ *
+ * Look up the soft-TLB entry that the next memory access would reuse without
+ * invoking the target TLB fill.  A clean matching victim entry is promoted
+ * just as it is by the normal slow lookup.  Do not fill an entry, raise an
+ * exception, process a watchpoint, or impose a memory barrier.  Return false
+ * if both the direct comparator and reusable victim entries miss.  The caller
+ * must be running on the current CPU's owner thread.
+ *
+ * The CPUTLBEntryFull structure returned via @pfull is transient and must be
+ * consumed or copied immediately, before any further access or changes to TLB
+ * @mmu_idx.  It describes the translation but does not authorize directly
+ * accessing guest memory.
+ */
+bool tlb_lookup_full_no_fill(CPUArchState *env, vaddr addr,
+                             MMUAccessType access_type, int mmu_idx,
+                             CPUTLBEntryFull **pfull, bool *from_victim);
+
 #endif /* !CONFIG_USER_ONLY */
 
 /**

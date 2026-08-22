@@ -130,9 +130,7 @@ ia64_set_cfm_rrb_pr_slow(CPUIA64State *env, uint32_t new_rrb,
                          uint32_t old_rrb)
 {
     enum { ROTATING_COUNT = IA64_PR_COUNT - IA64_PR_ROTATING_BASE };
-    uint64_t old_pr[ROTATING_COUNT];
     uint32_t shift;
-    uint32_t first;
 
     if (old_rrb >= ROTATING_COUNT) {
         old_rrb %= ROTATING_COUNT;
@@ -151,14 +149,32 @@ ia64_set_cfm_rrb_pr_slow(CPUIA64State *env, uint32_t new_rrb,
      * so rebase that logical view just as ia64_set_cfm_rrb_fr() does for
      * rotating floating-point registers.
      */
-    memcpy(old_pr, &env->pr[IA64_PR_ROTATING_BASE], sizeof(old_pr));
     shift = new_rrb >= old_rrb ? new_rrb - old_rrb :
                                 new_rrb + ROTATING_COUNT - old_rrb;
-    first = ROTATING_COUNT - shift;
-    memcpy(&env->pr[IA64_PR_ROTATING_BASE], &old_pr[shift],
-           first * sizeof(old_pr[0]));
-    memcpy(&env->pr[IA64_PR_ROTATING_BASE + first], old_pr,
-           shift * sizeof(old_pr[0]));
+    if (shift == 1) {
+        uint64_t first = env->pr[IA64_PR_ROTATING_BASE];
+
+        memmove(&env->pr[IA64_PR_ROTATING_BASE],
+                &env->pr[IA64_PR_ROTATING_BASE + 1],
+                (ROTATING_COUNT - 1) * sizeof(env->pr[IA64_PR_TRUE]));
+        env->pr[IA64_PR_COUNT - 1] = first;
+    } else if (shift == ROTATING_COUNT - 1) {
+        uint64_t last = env->pr[IA64_PR_COUNT - 1];
+
+        memmove(&env->pr[IA64_PR_ROTATING_BASE + 1],
+                &env->pr[IA64_PR_ROTATING_BASE],
+                (ROTATING_COUNT - 1) * sizeof(env->pr[IA64_PR_TRUE]));
+        env->pr[IA64_PR_ROTATING_BASE] = last;
+    } else {
+        uint64_t old_pr[ROTATING_COUNT];
+        uint32_t first = ROTATING_COUNT - shift;
+
+        memcpy(old_pr, &env->pr[IA64_PR_ROTATING_BASE], sizeof(old_pr));
+        memcpy(&env->pr[IA64_PR_ROTATING_BASE], &old_pr[shift],
+               first * sizeof(old_pr[0]));
+        memcpy(&env->pr[IA64_PR_ROTATING_BASE + first], old_pr,
+               shift * sizeof(old_pr[0]));
+    }
     env->cfm_rrb_pr = new_rrb;
     env->pr[IA64_PR_TRUE] = 1;
 }
@@ -173,6 +189,27 @@ void ia64_set_cfm_rrb_pr(CPUIA64State *env, uint32_t new_rrb)
         return;
     }
     ia64_set_cfm_rrb_pr_slow(env, new_rrb, old_rrb);
+}
+
+void ia64_rotate_cfm_rrb_pr_right(CPUIA64State *env)
+{
+    enum { ROTATING_COUNT = IA64_PR_COUNT - IA64_PR_ROTATING_BASE };
+    uint32_t old_rrb = env->cfm_rrb_pr;
+    uint64_t last = env->pr[IA64_PR_COUNT - 1];
+
+    /*
+     * Loop branches always decrement RRB.PR by one.  Keep that hot path out
+     * of the arbitrary-rebase helper, whose general case needs a complete
+     * predicate snapshot.  env->pr[] is the logical view, so decrementing
+     * RRB.PR moves its last rotating predicate to the first logical slot.
+     */
+    memmove(&env->pr[IA64_PR_ROTATING_BASE + 1],
+            &env->pr[IA64_PR_ROTATING_BASE],
+            (ROTATING_COUNT - 1) * sizeof(env->pr[IA64_PR_TRUE]));
+    env->pr[IA64_PR_ROTATING_BASE] = last;
+    old_rrb = ia64_normalize_rrb_pr(old_rrb);
+    env->cfm_rrb_pr = old_rrb ? old_rrb - 1 : ROTATING_COUNT - 1;
+    env->pr[IA64_PR_TRUE] = 1;
 }
 
 

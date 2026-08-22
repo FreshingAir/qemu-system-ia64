@@ -71,6 +71,39 @@ jobs:
           ia64-linux-gnu-readelf -h "$elf" > firmware-elf-header.txt
           grep -Eiq 'Machine:.*IA-64' firmware-elf-header.txt
 
+      - name: Build the IA-64 SMP functional test assets
+        run: |
+          set -euo pipefail
+
+          asset_root="$PWD/ia64-functional-test-assets"
+          app_build="$PWD/build-ia64-functional-test-assets"
+
+          rm -rf "$asset_root" "$app_build"
+          mkdir -p \
+            "$asset_root/roms/ia64-firmware" \
+            "$asset_root/tests/functional/ia64" \
+            "$app_build"
+
+          tests/functional/ia64/apps/build-test-app.sh \
+            "$app_build/smp-app.efi" \
+            tests/functional/ia64/apps/smp-app.c \
+            tests/functional/ia64/apps/ia64-test-app.lds
+
+          install -m 0644 \
+            roms/ia64-firmware/ia64-firmware.bin \
+            "$asset_root/roms/ia64-firmware/"
+          install -m 0644 \
+            "$app_build/smp-app.efi" \
+            "$asset_root/tests/functional/ia64/"
+
+          test -s \
+            "$asset_root/roms/ia64-firmware/ia64-firmware.bin"
+          test -s \
+            "$asset_root/tests/functional/ia64/smp-app.efi"
+          ia64-linux-gnu-objdump -f \
+            "$asset_root/tests/functional/ia64/smp-app.efi" \
+            | grep -Eq 'file format pei-ia64'
+
       - name: Package the firmware
         run: |
           set -euo pipefail
@@ -107,6 +140,13 @@ jobs:
           path: qemu-system-ia64-firmware.tar.gz
           if-no-files-found: error
           archive: false
+
+      - name: Upload the IA-64 functional test assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: ia64-functional-test-assets
+          path: ia64-functional-test-assets/
+          if-no-files-found: error
 
   linux:
     name: Linux x86-64 (GCC)
@@ -221,6 +261,201 @@ jobs:
           path: qemu-system-ia64-linux-x86_64.tar.gz
           if-no-files-found: error
           archive: false
+
+  linux-aarch64:
+    name: Linux AArch64 (GCC, native)
+    needs: firmware
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - name: Verify the native AArch64 runner
+        run: |
+          set -euo pipefail
+
+          test "$(uname -m)" = aarch64
+          test "$(dpkg --print-architecture)" = arm64
+
+      - name: Check out the source tree
+        uses: actions/checkout@v6
+
+      - name: Install build dependencies
+        run: |
+          set -euo pipefail
+
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bison \
+            build-essential \
+            file \
+            flex \
+            git \
+            libfdt-dev \
+            libglib2.0-dev \
+            libpixman-1-dev \
+            libsdl2-dev \
+            libslirp-dev \
+            ninja-build \
+            pkg-config \
+            python3 \
+            python3-pip \
+            python3-setuptools \
+            python3-venv \
+            python3-wheel \
+            zlib1g-dev
+
+      - name: Configure and build the Linux emulator
+        run: |
+          set -euo pipefail
+
+          mkdir build-linux-aarch64
+
+          (
+            cd build-linux-aarch64
+            CC=gcc CXX=g++ ../configure \
+              --python=/usr/bin/python3 \
+              --target-list=ia64-softmmu \
+              --enable-system \
+              --enable-tcg \
+              --enable-pixman \
+              --enable-fdt=system \
+              --enable-sdl \
+              --enable-slirp \
+              --enable-vnc \
+              --disable-docs \
+              --disable-werror
+          )
+
+          ninja -C build-linux-aarch64 -j"$(nproc)" \
+            qemu-img \
+            qemu-system-ia64 \
+            tests/qtest/ia64-vpc-test \
+            tests/unit/test-ia64-decoder \
+            tests/unit/test-ia64-fpreg \
+            tests/unit/test-ia64-rse-migration \
+            tests/unit/test-ia64-simd
+
+      - name: Validate the native AArch64 executable
+        run: |
+          set -euo pipefail
+
+          executable="build-linux-aarch64/qemu-system-ia64"
+          test -x "$executable"
+          test -s "$executable"
+
+          elf_header="$(readelf -h "$executable")"
+          printf '%s\n' "$elf_header"
+          grep -Eq 'Machine:[[:space:]]+AArch64' <<<"$elf_header"
+          "$executable" --version
+
+      - name: Download the IA-64 functional test assets
+        uses: actions/download-artifact@v8
+        with:
+          name: ia64-functional-test-assets
+          path: build-linux-aarch64
+
+      - name: Run IA-64 TCG unit tests natively
+        run: |
+          set -euo pipefail
+
+          build-linux-aarch64/pyvenv/bin/meson test \
+            -C build-linux-aarch64 \
+            --no-rebuild \
+            --num-processes 1 \
+            --print-errorlogs \
+            qemu:test-ia64-decoder \
+            qemu:test-ia64-fpreg \
+            qemu:test-ia64-rse-migration \
+            qemu:test-ia64-simd \
+            qemu:test-ia64-fpmodel \
+            qemu:test-ia64-tcg-core \
+            qemu:test-ia64-tcg-memory-nat \
+            qemu:test-ia64-tcg-fp \
+            qemu:test-ia64-tcg-rse \
+            qemu:test-ia64-tcg-mmu \
+            qemu:test-ia64-tcg-interrupt \
+            qemu:test-ia64-tcg-pal \
+            qemu:qtest-ia64/ia64-vpc-test
+
+      - name: Run the IA-64 SMP functional test repeatedly
+        run: |
+          set -euo pipefail
+
+          test -s \
+            build-linux-aarch64/roms/ia64-firmware/ia64-firmware.bin
+          test -s \
+            build-linux-aarch64/tests/functional/ia64/smp-app.efi
+
+          build-linux-aarch64/pyvenv/bin/meson test \
+            -C build-linux-aarch64 \
+            --no-rebuild \
+            --num-processes 1 \
+            --print-errorlogs \
+            --repeat 3 \
+            qemu:func-ia64-smp
+
+      - name: Build the portable TCI fallback
+        run: |
+          set -euo pipefail
+
+          mkdir build-linux-aarch64-tci
+
+          (
+            cd build-linux-aarch64-tci
+            CC=gcc CXX=g++ ../configure \
+              --python=/usr/bin/python3 \
+              --target-list=ia64-softmmu \
+              --enable-system \
+              --enable-tcg \
+              --enable-tcg-interpreter \
+              --enable-pixman \
+              --enable-fdt=internal \
+              --disable-sdl \
+              --disable-slirp \
+              --disable-vnc \
+              --disable-tools \
+              --disable-guest-agent \
+              --disable-docs \
+              --disable-werror
+          )
+
+          ninja -C build-linux-aarch64-tci -j"$(nproc)" qemu-system-ia64
+          grep -qx '#define CONFIG_TCG_INTERPRETER 1' \
+            build-linux-aarch64-tci/config-host.h
+          build-linux-aarch64-tci/qemu-system-ia64 --version
+
+      - name: Run IA-64 architectural tests with TCI
+        run: |
+          set -euo pipefail
+
+          build-linux-aarch64-tci/pyvenv/bin/meson test \
+            -C build-linux-aarch64-tci \
+            --no-rebuild \
+            --num-processes 1 \
+            --print-errorlogs \
+            --timeout-multiplier 4 \
+            qemu:test-ia64-tcg-core \
+            qemu:test-ia64-tcg-memory-nat \
+            qemu:test-ia64-tcg-fp \
+            qemu:test-ia64-tcg-rse \
+            qemu:test-ia64-tcg-mmu \
+            qemu:test-ia64-tcg-interrupt \
+            qemu:test-ia64-tcg-pal
+
+      - name: Run the IA-64 SMP ordering test with TCI
+        run: |
+          set -euo pipefail
+
+          env \
+            MESON_BUILD_ROOT="$PWD/build-linux-aarch64-tci" \
+            MESON_SOURCE_ROOT="$PWD" \
+            QEMU_TEST_QEMU_BINARY="$PWD/build-linux-aarch64-tci/qemu-system-ia64" \
+            QEMU_TEST_QEMU_IMG="$PWD/build-linux-aarch64/qemu-img" \
+            IA64_TEST_FIRMWARE="$PWD/build-linux-aarch64/roms/ia64-firmware/ia64-firmware.bin" \
+            IA64_TEST_APP_DIR="$PWD/build-linux-aarch64/tests/functional/ia64" \
+            IA64_SMP_TIMEOUT=240 \
+            PYTHONPATH="$PWD/tests/functional" \
+            build-linux-aarch64-tci/pyvenv/bin/python \
+            tests/functional/ia64/test_smp.py
 
   windows:
     name: Windows x86-64 (MSYS2 MinGW GCC)

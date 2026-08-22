@@ -59,6 +59,17 @@ bool ia64_exec_probe_writeback(CPUIA64State *env, uint64_t addr,
                                uintptr_t ra);
 bool ia64_exec_advanced_load_allowed(CPUIA64State *env, uint64_t addr,
                                      int mmu_idx);
+typedef struct IA64CachedLoadTranslation {
+    uint64_t phys_page;
+    IA64MemorySpeculation speculation;
+    uint8_t memory_attribute;
+    uint8_t prot;
+    bool from_victim;
+} IA64CachedLoadTranslation;
+
+bool ia64_exec_cached_load_translation(
+    CPUIA64State *env, uint64_t addr, int mmu_idx,
+    IA64CachedLoadTranslation *translation);
 bool ia64_exec_debug_read(CPUState *cs, uint64_t addr, void *buffer,
                           size_t size);
 bool ia64_exec_physical_rw(uint64_t addr, void *buffer, size_t size,

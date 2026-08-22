@@ -12,6 +12,7 @@ ia64_itm(int cpu_index, const char *operation, uint64_t itc, uint64_t itm, int v
 ia64_mmu_purge(int cpu_index, const char *operation, uint64_t va, uint64_t page_size, uint32_t rid, uint32_t mode) "cpu=%d operation=%s va=0x%016" PRIx64 " page_size=0x%016" PRIx64 " rid=0x%06" PRIx32 " mode=%" PRIu32
 ia64_mmu_serialize(int cpu_index, uint32_t data, uint32_t instruction, uint32_t pending, bool targeted) "cpu=%d data=%" PRIu32 " instruction=%" PRIu32 " pending=%" PRIu32 " targeted=%d"
 ia64_speculative_probe_defer(int cpu_index, uint64_t ip, uint64_t va, uint32_t size) "cpu=%d ip=0x%016" PRIx64 " va=0x%016" PRIx64 " size=%" PRIu32
+ia64_stale_soft_tlb_repair(int cpu_index, uint64_t ip, uint64_t va, int mmu_idx, uint32_t rid, bool from_victim, uint64_t cached_pa, uint64_t modeled_pa, uint64_t modeled_pte) "cpu=%d ip=0x%016" PRIx64 " va=0x%016" PRIx64 " mmu_idx=%d rid=0x%06" PRIx32 " victim=%d cached_pa=0x%016" PRIx64 " modeled_pa=0x%016" PRIx64 " modeled_pte=0x%016" PRIx64
 
 # arch/rse.c
 ia64_rse_state(int cpu_index, const char *operation, uint64_t bsp, uint64_t bspstore, int32_t dirty, int32_t dirty_nat, int32_t clean, int32_t clean_nat, int32_t invalid, uint32_t sof) "cpu=%d operation=%s bsp=0x%016" PRIx64 " bspstore=0x%016" PRIx64 " dirty=%" PRId32 "/%" PRId32 " clean=%" PRId32 "/%" PRId32 " invalid=%" PRId32 " sof=%" PRIu32

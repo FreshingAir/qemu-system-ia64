@@ -100,6 +100,10 @@ void ia64_cpu_dump_state(CPUState *cs, FILE *f, int flags)
     IA64CPU *cpu = ia64_cpu_from_cpu_state(cs);
     int i;
 
+    if (flags & CPU_DUMP_FPU) {
+        ia64_sync_rotating_fr(&cpu->env);
+    }
+
     qemu_fprintf(f, "IP: 0x%016" PRIx64 "  PSR: 0x%016" PRIx64
                  "  HALTED: %u\n",
                  cpu->env.ip, cpu->env.psr, cs->halted);
@@ -193,6 +197,18 @@ void ia64_cpu_dump_state(CPUState *cs, FILE *f, int flags)
                  ia64_rse_read_rnat(&cpu->env),
                  cpu->env.rse.rse_rnat_addr,
                  ia64_rse_read_rnat_defined(&cpu->env), cpu->env.ar_rsc);
+    qemu_fprintf(f, "RSE-GR-DIRTY: 0x%016" PRIx64 "/0x%016" PRIx64
+                 " PGRNAT=0x%016" PRIx64 "/0x%016" PRIx64 "\n",
+                 cpu->env.rse.rse_gr_dirty[0],
+                 cpu->env.rse.rse_gr_dirty[1],
+                 cpu->env.rse.rse_pgr_nat[0],
+                 cpu->env.rse.rse_pgr_nat[1]);
+    for (i = 0; i < IA64_STACKED_GR_COUNT; i++) {
+        qemu_fprintf(f, "RSE-PGR[%u]: 0x%016" PRIx64 " nat=%u\n", i,
+                     cpu->env.rse.rse_pgr[i],
+                     (unsigned)((cpu->env.rse.rse_pgr_nat[i / 64] >>
+                                 (i % 64)) & 1));
+    }
     qemu_fprintf(f, "RSE-FILL: RNAT=0x%016" PRIx64
                  " ADDR=0x%016" PRIx64 " DEFINED=0x%016" PRIx64
                  " VALID=%u\n",
@@ -225,10 +241,12 @@ void ia64_cpu_dump_state(CPUState *cs, FILE *f, int flags)
         qemu_fprintf(f, "DEBUG-SAVED-RSE: BOL=%u SOF=%u SOL=%u"
                      " BSP=0x%016" PRIx64 " BSPSTORE=0x%016" PRIx64
                      " DIRTY=%d/%d CLEAN=%d/%d INVALID=%d"
+                     " GRDIRTY=0x%016" PRIx64 "/0x%016" PRIx64
                      " PGRNAT=0x%016" PRIx64 "/0x%016" PRIx64 "\n",
                      rse->bol, rse->cfm_sof, rse->cfm_sol,
                      rse->bsp, rse->bspstore, rse->dirty, rse->dirty_nat,
                      rse->clean, rse->clean_nat, rse->invalid,
+                     rse->gr_dirty[0], rse->gr_dirty[1],
                      rse->pgr_nat[0], rse->pgr_nat[1]);
         qemu_fprintf(f, "DEBUG-SAVED-RNAT: RNAT=0x%016" PRIx64
                      " ADDR=0x%016" PRIx64

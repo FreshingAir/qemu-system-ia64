@@ -227,6 +227,8 @@ typedef struct IA64FPState {
     uint64_t fr_int_value[IA64_FR_COUNT];
     uint64_t fr_int_origin[2];
     bool rotating_fr_live;
+    /* RRB.FR for which the logical rotating-register arrays are arranged. */
+    uint8_t rotating_fr_materialized_rrb;
 
     IA64FPTransactionState transaction;
 

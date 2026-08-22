@@ -661,6 +661,24 @@ uint64_t qtest_csr_call(QTestState *s, const char *name,
                          uint64_t *val);
 
 /**
+ * qtest_ia64_stale_victim_load:
+ * @s: #QTestState instance to operate on.
+ * @va: Page-aligned IA-64 virtual load address.
+ * @old_pa: Page-aligned physical page for the stale victim entry.
+ * @new_pa: Page-aligned physical page for the modeled translation.
+ * @probe_succeeded: Return whether the speculative probe accepted the load.
+ *
+ * Construct a stale IA-64 soft-TLB victim entry and perform the speculative
+ * probe followed by the corresponding 8-byte load.  This command requires a
+ * stopped single-vCPU TCG guest.
+ *
+ * Returns: The value loaded from @va.
+ */
+uint64_t qtest_ia64_stale_victim_load(QTestState *s, uint64_t va,
+                                      uint64_t old_pa, uint64_t new_pa,
+                                      bool *probe_succeeded);
+
+/**
  * qtest_bufread:
  * @s: #QTestState instance to operate on.
  * @addr: Guest address to read from.

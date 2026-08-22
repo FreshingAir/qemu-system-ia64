@@ -10,6 +10,7 @@ from .encoding import (
     CHECK_LOAD_DATA,
     DTR_PTE_NATPAGE,
     DTR_PTE_UC,
+    DTR_PTE_UCE,
     ExpectedFP,
     HIGH_TR_BASE,
     IA64_ALT_DTLB_VECTOR,
@@ -3108,6 +3109,44 @@ test_firmware_unaligned_store_assist = require_registers(
     },
 )
 
+
+def _firmware_unaligned_mapped_load_store_assist(name, pte_flags):
+    va = HIGH_TR_BASE + 0x8404
+    value = 0xaabbccddeeff0011
+
+    return require_registers(name, [
+        *dtr_setup_bundles(0x10, va, 0x408404,
+                           pte_flags=pte_flags),
+        (0x70, *movl_mlx(3, va)),
+        (0x80, *movl_mlx(24, value)),
+        (0x90, 0x00, addl(2, IA64_FIRMWARE_IVT_BASE, 0),
+         nop_i(), nop_i()),
+        (0xa0, 0x00, mov_m_gr_cr(2, 2), nop_i(), nop_i()),
+        (0xb0, 0x00, ssm(IA64_PSR_DT | IA64_PSR_IC | IA64_PSR_AC),
+         nop_i(), nop_i()),
+        # Both references are misaligned and must complete through the
+        # firmware assist while retaining the mapping's sequential attribute.
+        (0xc0, 0x00, st8(3, 24), nop_i(), nop_i()),
+        (0xd0, 0x00, ld8(22, 3), nop_i(), nop_i()),
+        (0xe0, 0x00, nop_m(), adds(23, 1, 0), nop_i()),
+        (0xf0, 0x10, nop_m(), nop_i(), br_cond(0xf0, 0xf0)),
+    ], {
+        "ip": 0xf0,
+        "exception": IA64_EXCP_NONE,
+        "r22": value,
+        "r23": 1,
+    })
+
+
+test_firmware_unaligned_uc_load_store_assist = \
+    _firmware_unaligned_mapped_load_store_assist(
+        "firmware_unaligned_uc_load_store_assist", DTR_PTE_UC)
+
+test_firmware_unaligned_uce_load_store_assist = \
+    _firmware_unaligned_mapped_load_store_assist(
+        "firmware_unaligned_uce_load_store_assist", DTR_PTE_UCE)
+
+
 test_firmware_unaligned_speculative_load_assist = require_registers(
     "firmware_unaligned_speculative_load_assist",
     [
@@ -3185,6 +3224,8 @@ test_speculative_unaligned_defers = require_registers(
     [
         (0x10, 0x00, nop_m(), addl(3, 0x104, 0), nop_i()),
         (0x20, 0x00, sum_um(0x8), nop_i(), nop_i()),
+        # Misalignment must leave the aligned integer fast path and retain
+        # the complete speculative fault qualification in its cold fallback.
         (0x30, 0x00, ld8_s(4, 3), nop_i(), nop_i()),
         (0x40, 0x00, nop_m(), nop_i(), nop_i()),
         (0x50, 0x00, nop_m(), nop_i(), nop_i()),
@@ -3214,6 +3255,47 @@ test_br_ctop_long_speculative_load_pipeline = require_registers(
           for i in range(0, len(_br_ctop_spec_data), 2)),
     ], {"exception": IA64_EXCP_NONE, "ip": 0x100,
         "r8": 129, "r20": HIGH_TR_BASE + 0x8418}, entry=0x10)
+
+_WARM_SPECULATIVE_LOAD_DATA = 0x8877665544332211
+test_speculative_load_warm_soft_tlb_succeeds = require_registers(
+    "speculative_load_warm_soft_tlb_succeeds", [
+        *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000),
+        (0x70, *movl_mlx(2, HIGH_TR_BASE + 0x8200)),
+        (0x80, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_DT)),
+        (0x90, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
+        # The ordinary load installs a direct LOAD comparator.  The following
+        # aligned integer speculative loads of every size must reuse its
+        # cached WB attributes.  Both ld.s and ld.sa use the dedicated helper.
+        (0xa0, 0x00, ld8(4, 2), nop_i(), nop_i()),
+        (0xb0, 0x00, load_mem(0x04, 5, 2), nop_i(), nop_i()),
+        (0xc0, 0x00, load_mem(0x05, 6, 2), nop_i(), nop_i()),
+        (0xd0, 0x00, load_mem(0x06, 7, 2), nop_i(), nop_i()),
+        (0xe0, 0x00, load_mem(0x07, 8, 2), nop_i(), nop_i()),
+        (0xf0, 0x00, load_mem(0x0c, 9, 2) | bitfield(2, 27, 2),
+         nop_i(), nop_i()),
+        (0x100, 0x00, load_mem(0x0d, 10, 2) | bitfield(2, 27, 2),
+         nop_i(), nop_i()),
+        (0x110, 0x00, load_mem(0x0e, 11, 2) | bitfield(2, 27, 2),
+         nop_i(), nop_i()),
+        (0x120, 0x00, load_mem(0x0f, 12, 2) | bitfield(2, 27, 2),
+         nop_i(), nop_i()),
+        (0x130, 0x10, nop_m(), nop_i(), br_cond(0x130, 0x130)),
+        raw_bundle(0x408200, _WARM_SPECULATIVE_LOAD_DATA, 0),
+    ], {
+        "ip": 0x130,
+        "exception": IA64_EXCP_NONE,
+        "r4": _WARM_SPECULATIVE_LOAD_DATA,
+        "r5": 0x11,
+        "r6": 0x2211,
+        "r7": 0x44332211,
+        "r8": _WARM_SPECULATIVE_LOAD_DATA,
+        "r9": 0x11,
+        "r10": 0x2211,
+        "r11": 0x44332211,
+        "r12": _WARM_SPECULATIVE_LOAD_DATA,
+        "r5_nat": 0, "r6_nat": 0, "r7_nat": 0, "r8_nat": 0,
+        "r9_nat": 0, "r10_nat": 0, "r11_nat": 0, "r12_nat": 0,
+    }, entry=0x10)
 
 GROUP = 'memory-nat'
 CASE_NAMES = (
@@ -3255,6 +3337,8 @@ CASE_NAMES = (
     'firmware_unaligned_reg_postinc_uses_old_increment',
     'firmware_unaligned_speculative_load_assist',
     'firmware_unaligned_store_assist',
+    'firmware_unaligned_uc_load_store_assist',
+    'firmware_unaligned_uce_load_store_assist',
     'firmware_unaligned_virtual_load_assist',
     'fp_advanced_non_speculative_unaligned_faults',
     'integer_advanced_non_speculative_unaligned_faults',
@@ -3357,6 +3441,7 @@ CASE_NAMES = (
     'speculative_load_defers_psr_ed',
     'speculative_load_handler_psr_ed_defers_retry',
     'speculative_load_no_recovery_tlb_miss_faults',
+    'speculative_load_warm_soft_tlb_succeeds',
     'speculative_recovery_unaligned_defers',
     'speculative_stacked_nat_survives_backing_store_switch',
     'speculative_stacked_nat_survives_interrupt_flush_return',

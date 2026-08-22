@@ -692,13 +692,15 @@ static bool ia64_firmware_data_access(CPUIA64State *env, uint64_t addr,
         return false;
     }
     /*
-     * Match the one-way barriers emitted by the translated memory path.
-     * Translation and all fault qualification must precede a release, while
-     * an acquire takes effect only after the load has completed successfully.
+     * The translated access was abandoned when its alignment helper raised
+     * the fault, before qemu_ld/st could emit its ordinary memory-ordering
+     * barrier.  Fully order this rare firmware-emulated reference so that UC
+     * and UCE mappings remain sequential on weakly ordered hosts as well as
+     * TSO hosts.  This also supplies the pre-store release ordering for an
+     * ordered store; an acquire takes effect only after a load has completed
+     * successfully.
      */
-    if (ordered && is_write) {
-        smp_mb_release();
-    }
+    smp_mb(); /* Order every assisted reference against prior accesses. */
     if (!ia64_exec_physical_rw(pa, buf, size, is_write)) {
         return false;
     }

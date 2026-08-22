@@ -181,6 +181,7 @@ static int ia64_cpu_pre_save(void *opaque)
 {
     IA64CPU *cpu = opaque;
 
+    ia64_sync_rotating_fr(&cpu->env);
     ia64_itc_sync(&cpu->env);
     return 0;
 }
@@ -257,6 +258,7 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
         physical_memory_write_generation();
 
     env->fp.transaction.active = false;
+    env->fp.rotating_fr_materialized_rrb = env->cfm_rrb_fr;
     env->ia32_sse_instruction_active = false;
     ia64_migration_reset_fp_status(env);
 

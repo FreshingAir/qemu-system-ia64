@@ -8756,6 +8756,7 @@ EFI_STATUS bs_install_configuration_table(void *Guid, VOID *Table)
 static EFI_START_IMAGE_FRAME *start_image_push_frame(EFI_HANDLE ImageHandle)
 {
     EFI_START_IMAGE_FRAME *frame;
+    BOOLEAN nested_image = mStartImageFrameDepth != 0;
 
     if (mStartImageFrameDepth >= LOADED_IMAGE_MAX) {
         return NULL;
@@ -8767,6 +8768,16 @@ static EFI_START_IMAGE_FRAME *start_image_push_frame(EFI_HANDLE ImageHandle)
     frame->image_handle = ImageHandle;
     frame->exit_status = EFI_SUCCESS;
     frame->saved_psr = fw_read_psr() & ~(IA64_PSR_DT | IA64_PSR_RT | IA64_PSR_IT);
+    /*
+     * mov-from-PSR does not expose PSR.bn.  The firmware starts the outermost
+     * image from bank 0, while an image entered by fw_call_efi_entry runs in
+     * the EFI/SAL bank-1 convention.  Reconstruct that implicit state when a
+     * nested StartImage returns to its parent, including the Exit longjmp
+     * path that restores the same saved PSR.
+     */
+    if (nested_image) {
+        frame->saved_psr |= IA64_PSR_BN;
+    }
     frame->saved_rsc = fw_read_rsc();
     frame->handle_database_generation = mHandleDatabaseGeneration;
     return frame;

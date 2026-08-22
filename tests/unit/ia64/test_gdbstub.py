@@ -141,6 +141,17 @@ def _rse_state(qmp: QmpClient) -> tuple[int, ...]:
     if match is None:
         raise RuntimeError("info registers did not contain the RSE state:\n" +
                            registers)
+    dirty = re.findall(
+        r"^RSE-GR-DIRTY: 0x([0-9a-f]{16})/0x([0-9a-f]{16}) "
+        r"PGRNAT=0x([0-9a-f]{16})/0x([0-9a-f]{16})\r?$",
+        registers, re.MULTILINE)
+    pgr = re.findall(
+        r"^RSE-PGR\[(\d+)\]: 0x([0-9a-f]{16}) nat=([01])\r?$",
+        registers, re.MULTILINE)
+    if len(dirty) != 1 or [int(fields[0]) for fields in pgr] != list(range(96)):
+        raise RuntimeError(
+            "info registers did not contain one complete physical RSE "
+            "diagnostic image:\n" + registers)
     return tuple(int(value) for value in match.groups())
 
 

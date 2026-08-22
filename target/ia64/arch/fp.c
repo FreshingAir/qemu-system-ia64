@@ -458,8 +458,6 @@ ia64_rebase_rotating_fr(CPUIA64State *env, uint32_t shift)
     ia64_rebase_rotating_fr_bits(env->fp.fr_int_origin, shift);
     env->fp.fr_sig[0] &= ~(env->fp.fr_nat[0] & rotating_word0_mask);
     env->fp.fr_sig[1] &= ~env->fp.fr_nat[1];
-
-    ia64_invalidate_rotating_fp_alat(env);
 }
 
 static G_GNUC_NO_INLINE uint32_t ia64_normalize_rrb_fr(uint32_t rrb)
@@ -467,16 +465,10 @@ static G_GNUC_NO_INLINE uint32_t ia64_normalize_rrb_fr(uint32_t rrb)
     return rrb % IA64_ROTATING_FR_COUNT;
 }
 
-static G_GNUC_NO_INLINE void
-ia64_set_cfm_rrb_fr_slow(CPUIA64State *env, uint32_t new_rrb,
-                         uint32_t old_rrb)
+void ia64_sync_rotating_fr(CPUIA64State *env)
 {
-    if (new_rrb >= IA64_ROTATING_FR_COUNT) {
-        new_rrb = ia64_normalize_rrb_fr(new_rrb);
-    }
-    if (old_rrb >= IA64_ROTATING_FR_COUNT) {
-        old_rrb = ia64_normalize_rrb_fr(old_rrb);
-    }
+    uint32_t new_rrb = env->cfm_rrb_fr;
+    uint32_t old_rrb = env->fp.rotating_fr_materialized_rrb;
 
     if (new_rrb != old_rrb && env->fp.rotating_fr_live) {
         uint32_t shift = new_rrb >= old_rrb ?
@@ -485,27 +477,35 @@ ia64_set_cfm_rrb_fr_slow(CPUIA64State *env, uint32_t new_rrb,
 
         ia64_rebase_rotating_fr(env, shift);
     }
-    env->cfm_rrb_fr = new_rrb;
+    env->fp.rotating_fr_materialized_rrb = new_rrb;
 }
 
 /*
  * Floating-point helpers index env->fp.fr[] by the current logical register
- * number.  Rebase every live part of that representation when RRB.FR changes
- * so that cover/call and rfi/return expose the selected physical registers.
- * Most operating-system code never writes a rotating FR; keep that case a
- * small leaf function and leave the array work out of its prologue.
+ * number.  Keep the array view lazy across integer-only software-pipeline
+ * loops: br.ctop can rotate RRB.FR millions of times without touching an FR.
+ * The translator materializes the accumulated rotation before the next high
+ * FR access, while migration and debugger state reads synchronize explicitly.
  */
 void ia64_set_cfm_rrb_fr(CPUIA64State *env, uint32_t new_rrb)
 {
     uint32_t old_rrb = env->cfm_rrb_fr;
 
-    if (likely(new_rrb < IA64_ROTATING_FR_COUNT &&
-               old_rrb < IA64_ROTATING_FR_COUNT &&
-               (new_rrb == old_rrb || !env->fp.rotating_fr_live))) {
-        env->cfm_rrb_fr = new_rrb;
+    if (unlikely(new_rrb >= IA64_ROTATING_FR_COUNT)) {
+        new_rrb = ia64_normalize_rrb_fr(new_rrb);
+    }
+    if (likely(new_rrb == old_rrb)) {
         return;
     }
-    ia64_set_cfm_rrb_fr_slow(env, new_rrb, old_rrb);
+
+    env->cfm_rrb_fr = new_rrb;
+    if (likely(!env->fp.rotating_fr_live)) {
+        env->fp.rotating_fr_materialized_rrb = new_rrb;
+        return;
+    }
+
+    /* Rotation invalidates architected ALAT tags even while data stays lazy. */
+    ia64_invalidate_rotating_fp_alat(env);
 }
 
 typedef enum IA64FPBinaryOperation {
@@ -4320,6 +4320,7 @@ void ia64_fp_fpswa_dispatch(CPUIA64State *env, uintptr_t ra)
     uint64_t flags;
     uint32_t reg;
 
+    ia64_sync_rotating_fr(env);
     trace_ia64_fpswa_call(env_cpu(env)->cpu_index, trap_type, bundle,
                           env->fp.fpswa_pending);
     if (trap_type > 1 || bundle == 0 || ipsr_ptr == 0 || fpsr_ptr == 0 ||

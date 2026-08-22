@@ -109,8 +109,12 @@ int ia64_cpu_gdb_read_register(CPUState *cs, GByteArray *buf, int reg)
         val = reg == 0 ? 0 : env->gr[reg];
     } else if (reg < IA64_GDB_PR0_REGNUM) {
         uint64_t low, high;
+        unsigned freg = reg - IA64_GDB_FR0_REGNUM;
 
-        ia64_fpreg_to_spill(env, reg - IA64_GDB_FR0_REGNUM, &low, &high);
+        if (freg >= IA64_FR_ROTATING_BASE) {
+            ia64_sync_rotating_fr(env);
+        }
+        ia64_fpreg_to_spill(env, freg, &low, &high);
         return gdb_get_reg128(buf, high, low);
     } else if (reg < IA64_GDB_BR0_REGNUM) {
         val = (ia64_gdb_read_pr(env) >>
@@ -153,6 +157,9 @@ int ia64_cpu_gdb_write_register(CPUState *cs, uint8_t *buf, int reg)
     } else if (reg < IA64_GDB_PR0_REGNUM) {
         unsigned freg = reg - IA64_GDB_FR0_REGNUM;
 
+        if (freg >= IA64_FR_ROTATING_BASE) {
+            ia64_sync_rotating_fr(env);
+        }
         ia64_fpreg_from_spill(env, freg, val, ldq_p(buf + 8));
         ia64_alat_invalidate_fp_reg(env, freg);
         return 16;

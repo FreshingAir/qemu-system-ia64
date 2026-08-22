@@ -3637,6 +3637,30 @@ static void ia64_gen_check_disabled_fp(const Ia64Instruction *insn)
     gen_set_label(done);
 }
 
+static void ia64_gen_sync_rotating_fr(const Ia64Instruction *insn)
+{
+    TCGv_i32 current;
+    TCGv_i32 materialized;
+    TCGLabel *done;
+
+    if (!((ia64_insn_fp_read_sets(insn) |
+           ia64_insn_fp_write_sets(insn)) & 2)) {
+        return;
+    }
+
+    current = tcg_temp_new_i32();
+    materialized = tcg_temp_new_i32();
+    done = gen_new_label();
+    tcg_gen_ld8u_i32(current, tcg_env,
+                     offsetof(CPUIA64State, cfm_rrb_fr));
+    tcg_gen_ld8u_i32(materialized, tcg_env,
+                     offsetof(CPUIA64State,
+                              fp.rotating_fr_materialized_rrb));
+    tcg_gen_brcond_i32(TCG_COND_EQ, current, materialized, done);
+    gen_helper_sync_rotating_fr(tcg_env);
+    gen_set_label(done);
+}
+
 /* Instructions gated by the CPUID[4].ao 16-byte atomic capability bit. */
 static bool ia64_insn_needs_16byte_atomics(const Ia64Instruction *insn)
 {
@@ -3890,6 +3914,7 @@ static IA64PrepareResult ia64_gen_prepare_insn(
     }
 
     ia64_gen_check_disabled_fp(insn);
+    ia64_gen_sync_rotating_fr(insn);
     return IA64_PREPARE_DISPATCH;
 }
 

@@ -9,15 +9,19 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qemu/cutils.h"
 #include "qemu/log.h"
+#include "qemu/rcu.h"
 #include "qemu/timer.h"
 #include "cpu.h"
 #include "arch/arch.h"
 #include "ia32/ia32.h"
 #include "debug.h"
+#include "exec-access.h"
 #include "translate/translate.h"
 #include "exec/cputlb.h"
 #include "exec/cpu-common.h"
+#include "exec/tlb-flags.h"
 #include "exec/page-protection.h"
 #include "exec/target_page.h"
 #include "exec/translation-block.h"
@@ -27,6 +31,8 @@
 #include "exec/translator.h"
 #include "exec/helper-proto.h"
 #include "system/memory.h"
+#include "system/qtest.h"
+#include "system/tcg.h"
 
 #define HELPER_H "helper.h"
 #include "exec/helper-info.c.inc"
@@ -389,6 +395,11 @@ static void ia64_tlb_set_entry_page(CPUState *cs, vaddr addr, hwaddr pa,
     (void)page_size;
     full.extra.ia64.speculation = speculation;
     full.extra.ia64.memory_attribute = memory_attribute;
+    /* UC and UCE accesses to a peripheral domain are sequential. */
+    if (memory_attribute == IA64_PTE_MA_UC ||
+        memory_attribute == IA64_PTE_MA_UCE) {
+        full.tlb_fill_flags |= TLB_FORCE_ST_LD;
+    }
     tlb_set_page_full(cs, mmu_idx, addr & TARGET_PAGE_MASK, &full);
 }
 
@@ -907,6 +918,121 @@ static ObjectClass *ia64_cpu_class_by_name(const char *cpu_model)
     return oc;
 }
 
+typedef struct IA64QTestStaleVictimWork {
+    uint64_t va;
+    uint64_t old_pa;
+    uint64_t new_pa;
+    uint64_t value;
+    uint64_t probe_result;
+    bool model_ready;
+} IA64QTestStaleVictimWork;
+
+static void ia64_qtest_stale_victim_load_work(CPUState *cs,
+                                               run_on_cpu_data data)
+{
+    IA64QTestStaleVictimWork *work = data.host_ptr;
+    CPUIA64State *env = cpu_env(cs);
+    const int mmu_idx = MMU_IDX_VIRT_CPL0;
+    CPUTLBEntryFull full = {
+        .attrs = MEMTXATTRS_UNSPECIFIED,
+        .prot = PAGE_READ,
+        .lg_page_size = TARGET_PAGE_BITS,
+        .extra.ia64 = {
+            .speculation = IA64_MEM_SPECULATIVE,
+            .memory_attribute = IA64_PTE_MA_WB,
+        },
+    };
+    uint64_t collision_va = work->va ^ (UINT64_C(1) << 32);
+
+    RCU_READ_LOCK_GUARD();
+
+    /* Establish one deterministic translated data context at CPL 0. */
+    env->psr &= ~(IA64_PSR_CPL_MASK | IA64_PSR_IS | IA64_PSR_PK |
+                  IA64_PSR_DB | IA64_PSR_DA | IA64_PSR_DD |
+                  IA64_PSR_ED | IA64_PSR_VM);
+    env->psr |= IA64_PSR_DT;
+    tlb_flush(cs);
+    work->model_ready = ia64_mmu_insert_firmware_tc(
+        env, work->va, work->new_pa, true, TARGET_PAGE_BITS);
+    if (!work->model_ready) {
+        return;
+    }
+
+    /*
+     * Seed a contradictory clean load entry, then evict it to the victim
+     * TLB.  Flipping VA bit 32 preserves every possible soft-TLB index:
+     * with 4K target pages QEMU caps the table at 2^20 entries.
+     */
+    full.phys_addr = work->old_pa;
+    tlb_set_page_full(cs, mmu_idx, work->va, &full);
+    tlb_set_page_full(cs, mmu_idx, collision_va, &full);
+
+    work->probe_result = ia64_mmu_speculative_int_probe(env, work->va, 8);
+    if (!work->probe_result) {
+        return;
+    }
+
+    /* Match the Merced helper emitted immediately before a translated load. */
+    ia64_mmu_data_access(env, work->va, 8, true);
+    work->value = ia64_exec_load_mmuidx(env, work->va, 8, false,
+                                       mmu_idx, 0);
+}
+
+static bool ia64_qtest_command(CharFrontend *chr, gchar **words)
+{
+    IA64QTestStaleVictimWork work = { 0 };
+    CPUState *cs;
+    int ret;
+
+    if (strcmp(words[0], "ia64-stale-victim-load") != 0) {
+        return false;
+    }
+    if (!words[1] || !words[2] || !words[3] || words[4]) {
+        qtest_sendf(chr, "FAIL expected VA OLD_PA NEW_PA\n");
+        return true;
+    }
+
+    ret = qemu_strtou64(words[1], NULL, 0, &work.va);
+    ret |= qemu_strtou64(words[2], NULL, 0, &work.old_pa);
+    ret |= qemu_strtou64(words[3], NULL, 0, &work.new_pa);
+    if (ret || ((work.va | work.old_pa | work.new_pa) &
+                ~TARGET_PAGE_MASK) || work.old_pa == work.new_pa) {
+        qtest_sendf(chr, "FAIL invalid or unaligned address\n");
+        return true;
+    }
+    if (!tcg_enabled()) {
+        qtest_sendf(chr, "FAIL command requires TCG\n");
+        return true;
+    }
+
+    cs = qemu_get_cpu(0);
+    if (!cs || qemu_get_cpu(1) || !cpu_is_stopped(cs)) {
+        qtest_sendf(chr, "FAIL command requires one stopped CPU\n");
+        return true;
+    }
+
+    run_on_cpu(cs, ia64_qtest_stale_victim_load_work,
+               RUN_ON_CPU_HOST_PTR(&work));
+    if (!work.model_ready) {
+        qtest_sendf(chr, "FAIL could not install modeled translation\n");
+        return true;
+    }
+
+    qtest_sendf(chr, "OK %" PRIu64 " 0x%016" PRIx64 "\n",
+                work.probe_result, work.value);
+    return true;
+}
+
+static void ia64_register_qtest_command(void)
+{
+    static bool registered;
+
+    if (qtest_driver() && !registered) {
+        registered = true;
+        qtest_set_command_cb(ia64_qtest_command);
+    }
+}
+
 static void ia64_cpu_realize(DeviceState *dev, Error **errp)
 {
     CPUState *cs = CPU(dev);
@@ -924,6 +1050,7 @@ static void ia64_cpu_realize(DeviceState *dev, Error **errp)
 
     qemu_init_vcpu(cs);
     cpu_reset(cs);
+    ia64_register_qtest_command();
 
     icc->parent_realize(dev, errp);
 }
@@ -942,7 +1069,16 @@ static bool ia64_precise_smc_enabled(CPUState *cs)
 }
 
 static const TCGCPUOps ia64_tcg_ops = {
-    .guest_default_memory_order = TCG_MO_ALL,
+    /*
+     * Native IA-64 loads and stores are weakly ordered; their acquire,
+     * release, and mf semantics are emitted explicitly by the translator.
+     * Keep the x86 TSO default for the embedded IA-32 execution mode.  TCG
+     * supplies the barriers missing from weakly ordered hosts, while TSO
+     * hosts avoid a redundant store-load fence before every ordinary load.
+     * UC and UCE mappings restore their sequential store-load ordering
+     * through TLB_FORCE_ST_LD.
+     */
+    .guest_default_memory_order = TCG_MO_ALL & ~TCG_MO_ST_LD,
     .mttcg_supported = true,
     .precise_smc = true,
     .precise_smc_enabled = ia64_precise_smc_enabled,

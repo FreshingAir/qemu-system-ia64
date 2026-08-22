@@ -50,6 +50,16 @@
 #define TEST_HIGH_TRANSLATION_ITIR (24ULL << 2)
 #define TEST_TRANSLATION_WRITE_VA_BASE 0xe000020005000000ULL
 #define TEST_TRANSLATION_WRITE_OFFSET 0x84cULL
+#define TEST_SEQUENTIAL_DATA_VA 0xe000020007000000ULL
+#define TEST_SEQUENTIAL_SYNC_VA 0xe000020007002000ULL
+#define TEST_SEQUENTIAL_ITERATIONS 50000U
+#define TEST_ASSISTED_SEQUENTIAL_ITERATIONS 8192U
+#define TEST_SEQUENTIAL_ALIGNED_PHASE 0U
+#define TEST_SEQUENTIAL_ASSISTED_PHASE 1U
+#define TEST_SEQUENTIAL_PHASES 2U
+#define TEST_SEQUENTIAL_ASSIST_OFFSET 4U
+#define TEST_TRANSLATION_PTE_FLAGS_UC  0x671ULL
+#define TEST_TRANSLATION_PTE_FLAGS_UCE 0x675ULL
 
 typedef struct {
     UINT64 Status;
@@ -130,14 +140,40 @@ static volatile UINT64 global_translation_probe[TEST_PROCESSOR_COUNT];
 static volatile UINT64
 translation_write_pages[TEST_PROCESSOR_COUNT][2][1024]
     __attribute__((aligned(8192)));
+typedef volatile UINT64 TEST_SHARED_UINT64; /* Shared by independent vCPUs. */
+typedef struct {
+    TEST_SHARED_UINT64 Value0;
+    UINT8 SeparateCacheLines[120];
+    TEST_SHARED_UINT64 Value1;
+    UINT8 Padding[8192 - 128 - sizeof(UINT64)];
+} TEST_SEQUENTIAL_DATA_PAGE;
+typedef struct {
+    TEST_SHARED_UINT64 Mapped[TEST_PROCESSOR_COUNT];
+    TEST_SHARED_UINT64 Ready[TEST_PROCESSOR_COUNT];
+    TEST_SHARED_UINT64 Result[TEST_PROCESSOR_COUNT];
+    TEST_SHARED_UINT64 Done[TEST_PROCESSOR_COUNT];
+    TEST_SHARED_UINT64 Finish[2];
+    TEST_SHARED_UINT64 PhaseDone[TEST_PROCESSOR_COUNT];
+    TEST_SHARED_UINT64 Violations[2];
+} TEST_SEQUENTIAL_SYNC_PHASE;
+typedef struct {
+    TEST_SEQUENTIAL_SYNC_PHASE Phase[TEST_SEQUENTIAL_PHASES];
+    UINT8 Padding[8192 - TEST_SEQUENTIAL_PHASES *
+                          sizeof(TEST_SEQUENTIAL_SYNC_PHASE)];
+} TEST_SEQUENTIAL_SYNC_PAGE;
+static TEST_SEQUENTIAL_DATA_PAGE sequential_data_pages[2]
+    __attribute__((aligned(8192)));
+static TEST_SEQUENTIAL_SYNC_PAGE sequential_sync_page
+    __attribute__((aligned(8192)));
 
 static BOOLEAN translation_cache_churn_check(VOID);
 
-static VOID install_data_tc_mapping(UINT64 Va, UINT64 Pa, UINT64 Itir)
+static VOID install_data_tc_mapping_flags(UINT64 Va, UINT64 Pa, UINT64 Itir,
+                                          UINT64 PteFlags)
 {
     UINT64 page_shift = (Itir >> 2) & 0x3fULL;
     UINT64 page_mask = (1ULL << page_shift) - 1ULL;
-    UINT64 pte = (Pa & ~page_mask) | TEST_TRANSLATION_PTE_FLAGS;
+    UINT64 pte = (Pa & ~page_mask) | PteFlags;
 
     __asm__ volatile ("rsm psr.ic;;\n\t"
                       "srlz.d;;\n\t"
@@ -150,6 +186,12 @@ static VOID install_data_tc_mapping(UINT64 Va, UINT64 Pa, UINT64 Itir)
                       :
                       : "r"(Va), "r"(Itir), "r"(pte)
                       : "memory");
+}
+
+static VOID install_data_tc_mapping(UINT64 Va, UINT64 Pa, UINT64 Itir)
+{
+    install_data_tc_mapping_flags(Va, Pa, Itir,
+                                  TEST_TRANSLATION_PTE_FLAGS);
 }
 
 static VOID install_data_tc_at(UINT64 Va, const volatile UINT64 *Page)
@@ -1281,6 +1323,152 @@ static UINT64 read_itc(void)
     return itc;
 }
 
+static UINT64 sequential_load_acquire(TEST_SHARED_UINT64 *Address)
+{
+    UINT64 value;
+
+    __asm__ volatile ("ld8.acq %0=[%1];;"
+                      : "=r"(value)
+                      : "r"(Address)
+                      : "memory");
+    return value;
+}
+
+static UINT64 sequential_data_load_acquire(UINT64 Address)
+{
+    UINT64 value;
+
+    __asm__ volatile ("ld8.acq %0=[%1];;"
+                      : "=r"(value)
+                      : "r"(Address)
+                      : "memory");
+    return value;
+}
+
+static VOID sequential_data_store(UINT64 Address, UINT64 Value)
+{
+    __asm__ volatile ("st8 [%0]=%1;;"
+                      :
+                      : "r"(Address), "r"(Value)
+                      : "memory");
+}
+
+static UINT64 sequential_store_load(UINT64 Store, UINT64 Load)
+{
+    UINT64 value;
+
+    /*
+     * This is the operation pair under test.  In particular, do not put an
+     * mf, acquire, release, serialization, or guest-side helper call between
+     * the two unordered references.
+     */
+    __asm__ volatile ("st8 [%1]=%3;;\n\t"
+                      "ld8 %0=[%2];;"
+                      : "=r"(value)
+                      : "r"(Store), "r"(Load), "r"(1ULL)
+                      : "memory");
+    return value;
+}
+
+static VOID sequential_wait_for(TEST_SHARED_UINT64 *Address, UINT64 Value)
+{
+    while (sequential_load_acquire(Address) != Value) {
+        __asm__ volatile ("hint @pause" : : : "memory");
+    }
+}
+
+static VOID sequential_order_check(UINTN Id, UINTN Phase)
+{
+    UINTN pair = Id >> 1;
+    UINTN side = Id & 1U;
+    UINTN peer = Id ^ 1U;
+    TEST_SEQUENTIAL_DATA_PAGE *data =
+        (TEST_SEQUENTIAL_DATA_PAGE *)(UINTN)TEST_SEQUENTIAL_DATA_VA;
+    TEST_SEQUENTIAL_SYNC_PAGE *sync_page =
+        (TEST_SEQUENTIAL_SYNC_PAGE *)(UINTN)TEST_SEQUENTIAL_SYNC_VA;
+    TEST_SEQUENTIAL_SYNC_PHASE *sync = &sync_page->Phase[Phase];
+    UINTN offset = Phase == TEST_SEQUENTIAL_ASSISTED_PHASE ?
+                   TEST_SEQUENTIAL_ASSIST_OFFSET : 0;
+    UINTN iterations = Phase == TEST_SEQUENTIAL_ASSISTED_PHASE ?
+                       TEST_ASSISTED_SEQUENTIAL_ITERATIONS :
+                       TEST_SEQUENTIAL_ITERATIONS;
+    /*
+     * Offset the ordinary st8/ld8 by four bytes in the assisted phase.  With
+     * PSR.ac set by the firmware handoff, each reference takes the firmware
+     * unaligned assist while remaining wholly inside its 8 KiB translation.
+     * Synchronization stays on the distinct WB page below and uses only
+     * acquire loads and release stores.
+     */
+    UINT64 value_address[2] = {
+        (UINT64)(UINTN)&data->Value0 + offset,
+        (UINT64)(UINTN)&data->Value1 + offset,
+    };
+    UINT64 data_flags = pair == 0 ? TEST_TRANSLATION_PTE_FLAGS_UC :
+                                    TEST_TRANSLATION_PTE_FLAGS_UCE;
+    UINTN iteration;
+
+    purge_data_tc_at(TEST_SEQUENTIAL_DATA_VA);
+    purge_data_tc_at(TEST_SEQUENTIAL_SYNC_VA);
+    install_data_tc_mapping_flags(
+        TEST_SEQUENTIAL_DATA_VA,
+        (UINT64)(UINTN)&sequential_data_pages[pair],
+        TEST_TRANSLATION_ITIR, data_flags);
+    install_data_tc_mapping_flags(
+        TEST_SEQUENTIAL_SYNC_VA,
+        (UINT64)(UINTN)&sequential_sync_page,
+        TEST_TRANSLATION_ITIR, TEST_TRANSLATION_PTE_FLAGS);
+    __asm__ volatile ("ssm psr.dt;;\n\t"
+                      "srlz.d;;"
+                      : : : "memory");
+
+    /* Warm both data soft-TLB entries before the measured store/load pair. */
+    (void)sequential_data_load_acquire(value_address[side]);
+    (void)sequential_load_acquire(&sync->Mapped[Id]);
+    store8_release(&sync->Mapped[Id], 1);
+    for (peer = 0; peer < TEST_PROCESSOR_COUNT; peer++) {
+        sequential_wait_for(&sync->Mapped[peer], 1);
+    }
+    peer = Id ^ 1U;
+
+    for (iteration = 0; iteration < iterations; iteration++) {
+        UINT64 generation = iteration + 1U;
+        UINT64 observed;
+
+        if (side == 0) {
+            sequential_data_store(value_address[0], 0);
+            sequential_data_store(value_address[1], 0);
+            __asm__ volatile ("mf;;" : : : "memory");
+        }
+
+        store8_release(&sync->Ready[Id], generation);
+        sequential_wait_for(&sync->Ready[peer], generation);
+        observed = sequential_store_load(value_address[side],
+                                         value_address[side ^ 1U]);
+        sync->Result[Id] = observed;
+        store8_release(&sync->Done[Id], generation);
+        sequential_wait_for(&sync->Done[peer], generation);
+
+        if (side == 0) {
+            if (observed == 0 && sync->Result[peer] == 0) {
+                sync->Violations[pair]++;
+            }
+            store8_release(&sync->Finish[pair], generation);
+        } else {
+            sequential_wait_for(&sync->Finish[pair], generation);
+        }
+    }
+
+    store8_release(&sync->PhaseDone[Id], 1);
+    for (peer = 0; peer < TEST_PROCESSOR_COUNT; peer++) {
+        sequential_wait_for(&sync->PhaseDone[peer], 1);
+    }
+    __asm__ volatile ("rsm psr.dt;;\n\t"
+                      "srlz.d;;"
+                      : : : "memory");
+    purge_data_tc_at(TEST_SEQUENTIAL_DATA_VA);
+    purge_data_tc_at(TEST_SEQUENTIAL_SYNC_VA);
+}
+
 static VOID global_translation_remote(UINTN Id)
 {
     if (translation_command == TEST_TRANSLATION_GLOBAL_HIGH_COMMAND) {
@@ -1324,6 +1512,10 @@ static VOID ap_rendezvous(void)
             global_translation_remote(id);
         } else {
             translation_round_check(id);
+            if (translation_round == 1) {
+                sequential_order_check(id, TEST_SEQUENTIAL_ALIGNED_PHASE);
+                sequential_order_check(id, TEST_SEQUENTIAL_ASSISTED_PHASE);
+            }
             if (translation_round == 1 &&
                 !translation_cache_churn_check()) {
                 translation_churn_mismatch[id]++;
@@ -1461,6 +1653,10 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     BOOLEAN global_translation_high_remote = 0;
     BOOLEAN partial_translation_purge;
     BOOLEAN rid_translation_switch;
+    BOOLEAN uc_sequential;
+    BOOLEAN uce_sequential;
+    BOOLEAN uc_assisted_sequential;
+    BOOLEAN uce_assisted_sequential;
     BOOLEAN big_endian_atomic;
 
     (void)ImageHandle;
@@ -1516,6 +1712,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                 send_wake_ipi(id, wake_vector);
             }
             translation_round_check(0);
+            sequential_order_check(0, TEST_SEQUENTIAL_ALIGNED_PHASE);
+            sequential_order_check(0, TEST_SEQUENTIAL_ASSISTED_PHASE);
             if (!translation_cache_churn_check()) {
                 translation_churn_mismatch[0]++;
             }
@@ -1657,6 +1855,30 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                     EFI_TIMEOUT, "secondary-start-timeout");
     ia64_test_check(&context, "repeat-rendezvous", repeat_rounds,
                     EFI_TIMEOUT, "secondary-return-timeout");
+    uc_sequential = first_round &&
+                    sequential_sync_page.Phase[
+                        TEST_SEQUENTIAL_ALIGNED_PHASE].Violations[0] == 0;
+    ia64_test_check(&context, "uc-store-load-sequentiality",
+                    uc_sequential, EFI_DEVICE_ERROR,
+                    "uc-store-bypassed-by-load");
+    uce_sequential = first_round &&
+                     sequential_sync_page.Phase[
+                         TEST_SEQUENTIAL_ALIGNED_PHASE].Violations[1] == 0;
+    ia64_test_check(&context, "uce-store-load-sequentiality",
+                    uce_sequential, EFI_DEVICE_ERROR,
+                    "uce-store-bypassed-by-load");
+    uc_assisted_sequential = first_round &&
+        sequential_sync_page.Phase[
+            TEST_SEQUENTIAL_ASSISTED_PHASE].Violations[0] == 0;
+    ia64_test_check(&context, "uc-unaligned-store-load-sequentiality",
+                    uc_assisted_sequential, EFI_DEVICE_ERROR,
+                    "uc-assisted-store-bypassed-by-load");
+    uce_assisted_sequential = first_round &&
+        sequential_sync_page.Phase[
+            TEST_SEQUENTIAL_ASSISTED_PHASE].Violations[1] == 0;
+    ia64_test_check(&context, "uce-unaligned-store-load-sequentiality",
+                    uce_assisted_sequential, EFI_DEVICE_ERROR,
+                    "uce-assisted-store-bypassed-by-load");
     translation_semantics = repeat_rounds;
     for (id = 0; id < TEST_PROCESSOR_COUNT; id++) {
         translation_semantics = translation_semantics &&

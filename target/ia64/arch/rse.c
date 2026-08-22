@@ -1942,13 +1942,33 @@ void ia64_gr_nat_set(CPUIA64State *env, uint32_t reg, bool nat)
     }
 }
 
+/* Rotate the low count bits left by one, preserving every higher bit. */
+static inline QEMU_ALWAYS_INLINE void
+ia64_rotate_low_bits_left_one(uint64_t bits[2], uint32_t count)
+{
+    uint64_t old0 = bits[0];
+    uint64_t mask;
+    uint64_t carry;
+
+    if (count <= 64) {
+        mask = count == 64 ? UINT64_MAX : (1ULL << count) - 1;
+        carry = (old0 >> (count - 1)) & 1;
+        bits[0] = (old0 & ~mask) | (((old0 << 1) | carry) & mask);
+        return;
+    }
+
+    count -= 64;
+    mask = (1ULL << count) - 1;
+    carry = (bits[1] >> (count - 1)) & 1;
+    bits[0] = (old0 << 1) | carry;
+    bits[1] = (bits[1] & ~mask) |
+              (((bits[1] << 1) | (old0 >> 63)) & mask);
+}
+
 static void ia64_rotate_rotating_gr_right(CPUIA64State *env)
 {
-    const __uint128_t all_mask = (((__uint128_t)1 << 96) - 1);
     uint32_t count = ia64_rse_rotating_gr_count(env);
-    __uint128_t nat;
-    __uint128_t mask;
-    __uint128_t rotating_nat;
+    uint64_t nat[2];
     uint64_t last;
 
     if (count == 0) {
@@ -1961,15 +1981,20 @@ static void ia64_rotate_rotating_gr_right(CPUIA64State *env)
             (count - 1) * sizeof(*env->gr));
     env->gr[IA64_STACKED_GR_BASE] = last;
 
-    nat = (((__uint128_t)env->nat[1] << 32) | (env->nat[0] >> 32)) &
-          all_mask;
-    mask = (((__uint128_t)1 << count) - 1);
-    rotating_nat = nat & mask;
-    rotating_nat = ((rotating_nat << 1) |
-                    (rotating_nat >> (count - 1))) & mask;
-    nat = (nat & ~mask) | rotating_nat;
-    env->nat[0] = (env->nat[0] & UINT32_MAX) | (uint64_t)(nat << 32);
-    env->nat[1] = nat >> 32;
+    /*
+     * Dirty bits name the current logical stacked registers.  Rotate them
+     * with that view so ctop need not commit every software-pipeline stage
+     * to the physical RSE file.  The usual call, cover and spill boundaries
+     * synchronize the writes; migration carries this dirty bitmap as-is.
+     */
+    /* Pack stacked GR32..GR127 into one low-96-bit view. */
+    nat[0] = (env->nat[0] >> 32) | (env->nat[1] << 32);
+    nat[1] = env->nat[1] >> 32;
+    ia64_rotate_low_bits_left_one(nat, count);
+    env->nat[0] = (env->nat[0] & UINT32_MAX) | (nat[0] << 32);
+    env->nat[1] = (nat[0] >> 32) | (nat[1] << 32);
+    ia64_rotate_low_bits_left_one(env->rse.rse_gr_dirty, count);
+
     ia64_invalidate_alat_reg_range(env, IA64_STACKED_GR_BASE,
                                    IA64_STACKED_GR_BASE + count, false);
 }
@@ -1979,7 +2004,6 @@ static void ia64_rotate_loop_regs(CPUIA64State *env)
     uint32_t rotating_gr_count = ia64_rse_rotating_gr_count(env);
 
     ia64_rse_check(env, "ctop");
-    ia64_rse_sync_frame_out(env);
     ia64_rotate_rotating_gr_right(env);
     if (rotating_gr_count != 0) {
         env->cfm_rrb_gr = env->cfm_rrb_gr ?
@@ -1988,8 +2012,7 @@ static void ia64_rotate_loop_regs(CPUIA64State *env)
     ia64_set_cfm_rrb_fr(env, env->cfm_rrb_fr ?
                              env->cfm_rrb_fr - 1 :
                              IA64_ROTATING_FR_COUNT - 1);
-    ia64_set_cfm_rrb_pr(env, env->cfm_rrb_pr ?
-                             env->cfm_rrb_pr - 1 : 47);
+    ia64_rotate_cfm_rrb_pr_right(env);
 }
 
 void ia64_rse_br_call(CPUIA64State *env, uint32_t b_reg,

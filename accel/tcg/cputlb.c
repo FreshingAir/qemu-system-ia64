@@ -1256,7 +1256,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     /* Now calculate the new entry */
     tn.addend = addend - addr_page;
 
-    tlb_set_compare(full, &tn, addr_page, read_flags,
+    /* TLB_FORCE_ST_LD applies to data loads, not instruction fetches. */
+    tlb_set_compare(full, &tn, addr_page,
+                    read_flags & ~TLB_FORCE_ST_LD,
                     MMU_INST_FETCH, prot & PAGE_EXEC);
 
     if (wp_flags & BP_MEM_READ) {
@@ -1271,7 +1273,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
     if (wp_flags & BP_MEM_WRITE) {
         write_flags |= TLB_WATCHPOINT;
     }
-    tlb_set_compare(full, &tn, addr_page, write_flags,
+    /* Stores retain the default guest ordering and need no slow path. */
+    tlb_set_compare(full, &tn, addr_page,
+                    write_flags & ~TLB_FORCE_ST_LD,
                     MMU_DATA_STORE, prot & PAGE_WRITE);
 
     copy_tlb_helper_locked(te, &tn);
@@ -1509,6 +1513,12 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     *pfull = full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
     flags |= full->slow_flags[access_type];
 
+    if (unlikely(flags & TLB_FORCE_ST_LD)) {
+        /* Complete prior stores before the caller dereferences the pointer. */
+        smp_mb();
+        flags &= ~TLB_FORCE_ST_LD;
+    }
+
     /* Fold all "mmio-like" bits into TLB_MMIO.  This is not RAM.  */
     if (unlikely(flags & ~(TLB_WATCHPOINT | TLB_NOTDIRTY | TLB_CHECK_ALIGNED))
         || (access_type != MMU_INST_FETCH && force_mmio)) {
@@ -1635,6 +1645,37 @@ void *tlb_vaddr_to_host(CPUArchState *env, vaddr addr,
 
     /* No combination of flags are expected by the caller. */
     return flags ? NULL : host;
+}
+
+bool tlb_lookup_full_no_fill(CPUArchState *env, vaddr addr,
+                             MMUAccessType access_type, int mmu_idx,
+                             CPUTLBEntryFull **pfull, bool *from_victim)
+{
+    CPUState *cpu = env_cpu(env);
+    uintptr_t index = tlb_index(cpu, mmu_idx, addr);
+    CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
+    uint64_t tlb_addr;
+
+    assert_cpu_is_self(cpu);
+    *from_victim = false;
+    tlb_addr = tlb_read_idx(entry, access_type);
+    if (unlikely(!tlb_hit(tlb_addr, addr))) {
+        /*
+         * Match the next slow-path memory access: a clean entry for this
+         * page in the victim TLB would be promoted and reused before a
+         * target TLB fill.  Promote it now so that the caller validates the
+         * translation that the subsequent access will actually consume.
+         */
+        if (!victim_tlb_hit(cpu, mmu_idx, index, access_type,
+                            addr & TARGET_PAGE_MASK)) {
+            *pfull = NULL;
+            return false;
+        }
+        *from_victim = true;
+    }
+
+    *pfull = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+    return true;
 }
 
 /*
@@ -1899,6 +1940,15 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
         tcg_debug_assert((flags & TLB_BSWAP) == 0);
     }
 
+    if (unlikely(flags & TLB_FORCE_ST_LD)) {
+        /* Complete prior stores before the load helper accesses memory. */
+        smp_mb();
+        l->page[0].flags &= ~TLB_FORCE_ST_LD;
+        if (crosspage) {
+            l->page[1].flags &= ~TLB_FORCE_ST_LD;
+        }
+    }
+
     return crosspage;
 }
 
@@ -1979,6 +2029,12 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     tlb_addr &= TLB_FLAGS_MASK & ~TLB_FORCE_SLOW;
     tlb_addr |= full->slow_flags[MMU_DATA_STORE];
     tlb_addr |= full->slow_flags[MMU_DATA_LOAD];
+
+    if (unlikely(tlb_addr & TLB_FORCE_ST_LD)) {
+        /* Complete prior stores before the atomic helper accesses memory. */
+        smp_mb();
+        tlb_addr &= ~TLB_FORCE_ST_LD;
+    }
 
     /* Notice an IO access or a needs-MMU-lookup access */
     if (unlikely(tlb_addr & (TLB_MMIO | TLB_DISCARD_WRITE))) {

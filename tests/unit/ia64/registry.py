@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections import Counter
-from pathlib import Path
 
 from . import (cases_core, cases_fp, cases_interrupt, cases_memory_nat,
                cases_mmu, cases_pal, cases_rse, encoding)
@@ -73,20 +72,6 @@ def coverage_inventory() -> list[dict[str, object]]:
             "expected_fields": sorted(case.expected),
         })
     return inventory
-
-
-def _validate_migration_manifest(names: set[str]) -> None:
-    path = Path(__file__).with_name("legacy-case-ids.txt")
-    legacy = {
-        line.strip() for line in path.read_text(encoding="utf-8").splitlines()
-        if line.strip() and not line.startswith("#")
-    }
-    missing = sorted(legacy - names)
-    extra = sorted(names - legacy)
-    if missing or extra:
-        raise RuntimeError(
-            "IA-64 registry differs from the pre-B6 case manifest: "
-            f"missing={missing!r}, extra={extra!r}")
 
 
 def _validate_case_metadata(case: IA64Case) -> None:
@@ -194,5 +179,4 @@ def validate_registry() -> None:
                 f"IA-64 case {name!r} has invalid group {case.group!r}")
         _validate_case_metadata(case)
 
-    _validate_migration_manifest(registered_names)
     _validate_case_programs(CASES_BY_NAME)

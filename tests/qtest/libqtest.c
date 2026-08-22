@@ -1382,6 +1382,31 @@ uint64_t qtest_csr_call(QTestState *s, const char *name,
     return 0;
 }
 
+uint64_t qtest_ia64_stale_victim_load(QTestState *s, uint64_t va,
+                                      uint64_t old_pa, uint64_t new_pa,
+                                      bool *probe_succeeded)
+{
+    gchar **args;
+    uint64_t probe;
+    uint64_t value;
+    int rc;
+
+    qtest_sendf(s, "ia64-stale-victim-load 0x%" PRIx64
+                " 0x%" PRIx64 " 0x%" PRIx64 "\n",
+                va, old_pa, new_pa);
+    args = qtest_rsp_args(s, 3);
+
+    rc = qemu_strtou64(args[1], NULL, 0, &probe);
+    g_assert(rc == 0);
+    g_assert_cmpuint(probe, <=, 1);
+    rc = qemu_strtou64(args[2], NULL, 0, &value);
+    g_assert(rc == 0);
+
+    *probe_succeeded = probe;
+    g_strfreev(args);
+    return value;
+}
+
 void qtest_add_func(const char *str, void (*fn)(void))
 {
     gchar *path = g_strdup_printf("/%s/%s", qtest_get_arch(), str);

@@ -1713,6 +1713,24 @@ static bool sapic_irr_has_vector(QTestState *qts, uint8_t vector)
     return (irr[vector / 64] & BIT_ULL(vector % 64)) != 0;
 }
 
+static bool sapic_irr_wait_for_vector(QTestState *qts, uint8_t vector)
+{
+    int i;
+
+    /*
+     * External interrupt injection is queued on the destination vCPU.  The
+     * qtest IRQ command completes when the IOSAPIC has raised the request,
+     * which can be just before the vCPU has updated its Local SAPIC IRR.
+     */
+    for (i = 0; i < 1000; i++) {
+        if (sapic_irr_has_vector(qts, vector)) {
+            return true;
+        }
+        g_usleep(1000);
+    }
+    return false;
+}
+
 static void test_iosapic_edge_requires_input(void)
 {
     const unsigned pin = 21;
@@ -1731,7 +1749,7 @@ static void test_iosapic_edge_requires_input(void)
     g_assert_false(sapic_irr_has_vector(qts, vector));
 
     qtest_set_irq_in(qts, iosapic_path, NULL, pin, 1);
-    g_assert_true(sapic_irr_has_vector(qts, vector));
+    g_assert_true(sapic_irr_wait_for_vector(qts, vector));
     qtest_quit(qts);
 }
 
@@ -1865,7 +1883,7 @@ static void test_savevm_restores_platform_state(const void *opaque)
     iosapic_write(qts, rte_low,
                   saved_vector | IA64_IOSAPIC_RTE_LEVEL);
     qtest_set_irq_in(qts, iosapic_path, NULL, pin, 1);
-    g_assert_true(sapic_irr_has_vector(qts, saved_vector));
+    g_assert_true(sapic_irr_wait_for_vector(qts, saved_vector));
     g_assert_cmphex(iosapic_read(qts, rte_low) &
                     IA64_IOSAPIC_RTE_REMOTE_IRR, !=, 0);
 
@@ -1897,7 +1915,7 @@ static void test_savevm_restores_platform_state(const void *opaque)
                   changed_vector | IA64_IOSAPIC_RTE_LEVEL);
     qtest_set_irq_in(qts, iosapic_path, NULL, pin, 1);
     g_assert_false(sapic_irr_has_vector(qts, saved_vector));
-    g_assert_true(sapic_irr_has_vector(qts, changed_vector));
+    g_assert_true(sapic_irr_wait_for_vector(qts, changed_vector));
 
     response = qtest_hmp(qts, "loadvm platform-state");
     g_assert_cmpstr(response, ==, "");
@@ -1927,6 +1945,37 @@ static void test_savevm_restores_platform_state(const void *opaque)
     qtest_quit(qts);
     g_assert_cmpint(g_unlink(disk_path), ==, 0);
     g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
+}
+
+static void test_stale_victim_speculative_load(void)
+{
+    const uint64_t target_va = 0x00008000;
+    const uint64_t old_pa = 8 * MiB;
+    const uint64_t new_pa = 12 * MiB;
+    const uint64_t old_value = 0;
+    const uint64_t new_value = 0x0000000076875e80ULL;
+    QTestState *qts;
+    uint64_t value;
+    bool probe_succeeded;
+
+    qts = qtest_init("-machine itanium-vpc -m 256M -S "
+                     "-accel tcg,thread=single");
+    qtest_writeq(qts, old_pa, old_value);
+    qtest_writeq(qts, new_pa, new_value);
+
+    /*
+     * A direct-only no-fill lookup misses the seeded target victim.  Its
+     * cold modeled probe then accepts new_pa, but the following load promotes
+     * old_pa and returns zero.  A victim-aware lookup repairs the conflict
+     * before the load and therefore returns the modeled page's sentinel.
+     */
+    value = qtest_ia64_stale_victim_load(qts, target_va, old_pa, new_pa,
+                                         &probe_succeeded);
+    g_assert_true(probe_succeeded);
+    g_assert_cmphex(value, ==, new_value);
+    g_assert_cmphex(value, !=, old_value);
+
+    qtest_quit(qts);
 }
 
 int main(int argc, char **argv)
@@ -2019,6 +2068,8 @@ int main(int argc, char **argv)
     qtest_add_data_func("/ia64-vpc/savevm/itanium2-platform-state",
                         "itanium2-vpc",
                         test_savevm_restores_platform_state);
+    qtest_add_func("/ia64-vpc/mmu/stale-victim-speculative-load",
+                   test_stale_victim_speculative_load);
 
     return g_test_run();
 }

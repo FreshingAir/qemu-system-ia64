@@ -125,29 +125,26 @@ static const char *test_template_inventory(void)
 
 static const char *test_template_stops(void)
 {
-    const IA64TemplateInfo *t00 = ia64_template_info(0x00);
-    const IA64TemplateInfo *t01 = ia64_template_info(0x01);
-    const IA64TemplateInfo *t03 = ia64_template_info(0x03);
-    const IA64TemplateInfo *t0a = ia64_template_info(0x0a);
-    const IA64TemplateInfo *t0b = ia64_template_info(0x0b);
+    static const uint8_t expected[32] = {
+        0, 4, 2, 6, 0, 4, 0, 0,
+        0, 4, 1, 5, 0, 4, 0, 4,
+        0, 4, 0, 4, 0, 0, 0, 4,
+        0, 4, 0, 0, 0, 4, 0, 0,
+    };
+    unsigned int code;
 
-    if (t00->stop_after[0] || t00->stop_after[1] || t00->stop_after[2]) {
-        return failf("template 0x00 stop map");
-    }
-    if (!t01->stop_after[2]) {
-        return failf("template 0x01 end stop");
-    }
-    if (!t03->stop_after[0] || !t03->stop_after[2]) {
-        return failf("template 0x03 stop map");
-    }
-    if (!t0a->stop_after[0] || t0a->stop_after[1] || t0a->stop_after[2]) {
-        return failf("template 0x0a stop map");
-    }
-    if (!t0b->stop_after[0] || !t0b->stop_after[2]) {
-        return failf("template 0x0b stop map");
-    }
-    if (ia64_template_info(0x06)->defined) {
-        return failf("template 0x06 must be reserved");
+    for (code = 0; code < 32; code++) {
+        const IA64TemplateInfo *info = ia64_template_info(code);
+        uint8_t actual = ((uint8_t)info->stop_after[0] << 0) |
+                         ((uint8_t)info->stop_after[1] << 1) |
+                         ((uint8_t)info->stop_after[2] << 2);
+
+        if (actual != expected[code]) {
+            snprintf(failure, sizeof(failure),
+                     "template 0x%02x stop map: expected 0x%x got 0x%x",
+                     code, expected[code], actual);
+            return failure;
+        }
     }
     return NULL;
 }
@@ -477,16 +474,17 @@ static const char *test_a_unit_reserved_aliases(void)
         static const IA64SlotUnit ignored_units[] = {
             IA64_UNIT_M, IA64_UNIT_I,
         };
-        unsigned j;
+        unsigned unit_idx;
 
         for (i = 0; i < sizeof(ignored_bit36) / sizeof(ignored_bit36[0]); ++i) {
             uint64_t raw = (8ULL << 37) | (1ULL << 36) |
                            ((uint64_t)ignored_bit36[i].x4 << 29) | 17;
 
-            for (j = 0; j < sizeof(ignored_units) / sizeof(ignored_units[0]);
-                 ++j) {
+            for (unit_idx = 0;
+                 unit_idx < sizeof(ignored_units) / sizeof(ignored_units[0]);
+                 ++unit_idx) {
                 Ia64Instruction insn = ia64_decode_insn(
-                    ignored_units[j], raw, 0x4000, j);
+                    ignored_units[unit_idx], raw, 0x4000, unit_idx);
 
                 if (!insn.valid || insn.opcode != ignored_bit36[i].opcode ||
                     insn.encoding_class != IA64_ENCODING_DEFINED) {

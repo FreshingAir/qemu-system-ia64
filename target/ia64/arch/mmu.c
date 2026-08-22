@@ -1150,7 +1150,7 @@ typedef struct IA64PtcGlobalWork {
 
 static void ia64_ptc_mark_global(CPUIA64State *env,
                                  const IA64PtcGlobalWork *work,
-                                 bool remote)
+                                 bool complete)
 {
     ia64_merced_dtlb1_purge_range(env, work->va, work->ps,
                                   work->rid, true);
@@ -1164,13 +1164,13 @@ static void ia64_ptc_mark_global(CPUIA64State *env,
         work->va, work->ps, work->rid, true, 'i');
     ia64_assert_pending_purge_counts(env);
 
-    if (remote) {
+    if (complete) {
         /* The remote processor must not execute through the old mapping. */
         ia64_tlb_serialize(env, 1, 1);
-        if (work->global_alat) {
-            memset(env->alat_state.alat, 0, sizeof(env->alat_state.alat));
-            env->alat_state.alat_active_count = 0;
-        }
+    }
+    if (work->global_alat) {
+        memset(env->alat_state.alat, 0, sizeof(env->alat_state.alat));
+        env->alat_state.alat_active_count = 0;
     }
 }
 
@@ -1182,12 +1182,12 @@ static void ia64_ptc_global_remote_work(CPUState *cs, run_on_cpu_data data)
     g_free(work);
 }
 
-static void ia64_ptc_global_source_work(CPUState *cs, run_on_cpu_data data)
+static void ia64_ptc_global_source_barrier(CPUState *cs,
+                                           run_on_cpu_data data)
 {
-    IA64PtcGlobalWork *work = data.host_ptr;
-
-    ia64_ptc_mark_global(cpu_env(cs), work, false);
-    g_free(work);
+    /* The exclusive work item is the synchronization point itself. */
+    (void)cs;
+    (void)data;
 }
 
 void ia64_mmu_ptc_purge(CPUIA64State *env, uint64_t va, uint64_t size_reg,
@@ -1214,6 +1214,13 @@ void ia64_mmu_ptc_purge(CPUIA64State *env, uint64_t va, uint64_t size_reg,
         };
         bool wait = false;
 
+        /*
+         * Mark the issuing processor before returning from the helper.
+         * A stop after ptc.g/ptc.ga may place srlz in a later instruction
+         * group of the same bundle, before queued CPU work is processed.
+         */
+        ia64_ptc_mark_global(env, &template, false);
+
         CPU_FOREACH(cs) {
             if (cs != src) {
                 IA64PtcGlobalWork *work = g_new(IA64PtcGlobalWork, 1);
@@ -1225,13 +1232,8 @@ void ia64_mmu_ptc_purge(CPUIA64State *env, uint64_t va, uint64_t size_reg,
             }
         }
         if (wait) {
-            IA64PtcGlobalWork *work = g_new(IA64PtcGlobalWork, 1);
-
-            *work = template;
-            async_safe_run_on_cpu(src, ia64_ptc_global_source_work,
-                                  RUN_ON_CPU_HOST_PTR(work));
-        } else {
-            ia64_ptc_mark_global(env, &template, false);
+            async_safe_run_on_cpu(src, ia64_ptc_global_source_barrier,
+                                  RUN_ON_CPU_NULL);
         }
     } else if (mode == 2) {
         /*
@@ -2136,10 +2138,129 @@ void ia64_mmu_check_alignment(CPUIA64State *env, uint64_t va,
     }
 }
 
+static bool ia64_cached_speculative_data_load_qualifies(
+    CPUIA64State *env, uint64_t va, uint32_t datum_size,
+    IA64MemorySpeculation *speculation, uint8_t *memory_attribute)
+{
+    IA64CachedLoadTranslation cached;
+    const IA64TlbEntry *entry;
+    uint64_t page_offset = va & ~TARGET_PAGE_MASK;
+    uint64_t pa = UINT64_MAX;
+    uint64_t modeled_phys_page = UINT64_MAX;
+    uint64_t modeled_pte = 0;
+    uint8_t perm;
+    uint32_t rid;
+    int modeled_exception = -1;
+    int mmu_idx;
+
+    /*
+     * A load comparator does not currently certify all PKR read-disable
+     * state, so protection-key accesses must retain full qualification.
+     */
+    if (!(env->psr & IA64_PSR_DT) ||
+        (env->psr & (IA64_PSR_IS | IA64_PSR_PK))) {
+        return false;
+    }
+    if (datum_size == 0 ||
+        datum_size > TARGET_PAGE_SIZE - page_offset) {
+        return false;
+    }
+    if (!ia64_va_is_implemented(env, va)) {
+        return false;
+    }
+
+    /* Firmware identity mappings additionally depend on the current IP. */
+    if (va >= IA64_FW_IDENTITY_BASE &&
+        va < IA64_FW_IDENTITY_BASE + IA64_FW_IDENTITY_SIZE) {
+        return false;
+    }
+
+    mmu_idx = ia64_exec_mmu_index(env, false);
+    if (!ia64_exec_cached_load_translation(env, va, mmu_idx, &cached)) {
+        return false;
+    }
+
+    rid = ia64_region_rid(env, va);
+    entry = ia64_tlb_find_cached(env, va, rid, false);
+    if (entry && ia64_tlb_match(entry, va, rid)) {
+        modeled_pte = entry->pte;
+        ia64_tlb_entry_translate(entry, va, ia64_psr_cpl(env->psr),
+                                 &pa, &perm);
+        modeled_phys_page = pa & TARGET_PAGE_MASK;
+        modeled_exception = ia64_tlb_exception_for_access(
+            env, entry, perm, IA64_TLB_R, false, false, false);
+        if (modeled_exception == IA64_EXCP_NONE &&
+            (pa & TARGET_PAGE_MASK) == cached.phys_page &&
+            ia64_pte_memory_speculation(entry->pte) == cached.speculation &&
+            ((entry->pte >> 2) & 7) == cached.memory_attribute &&
+            (cached.prot & PAGE_READ)) {
+            *speculation = cached.speculation;
+            *memory_attribute = cached.memory_attribute;
+            goto attributes_current;
+        }
+    }
+
+    /*
+     * A reusable soft-TLB comparator matched, but the modeled IA-64
+     * translation no longer describes the same readable physical page.
+     * Returning to the cold qualifier alone is insufficient: a successful
+     * cold probe would otherwise let the following qemu_ld reuse this stale
+     * comparator.  Evict only this contradictory data entry, retaining the
+     * instruction jump cache and unrelated address spaces.
+     */
+    trace_ia64_stale_soft_tlb_repair(
+        env_cpu(env)->cpu_index, env->ip, va, mmu_idx, rid,
+        cached.from_victim, cached.phys_page, modeled_phys_page,
+        modeled_pte);
+    tlb_flush_range_by_mmuidx_no_jmp_cache(
+        env_cpu(env), va & TARGET_PAGE_MASK, TARGET_PAGE_SIZE,
+        (MMUIdxMap)1U << mmu_idx, TARGET_LONG_BITS);
+    return false;
+
+attributes_current:
+    if (!ia64_memory_allows_control_speculation(*speculation) ||
+        (*memory_attribute != IA64_PTE_MA_WB &&
+         *memory_attribute != IA64_PTE_MA_WC)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool ia64_cached_speculative_load_succeeds(
+    CPUIA64State *env, uint64_t va, uint32_t is_write, uint32_t is_ifetch,
+    uint32_t debug_size, uint32_t alignment_info)
+{
+    uint32_t datum_size = alignment_info & IA64_ALIGNMENT_DATUM_MASK;
+    IA64MemorySpeculation speculation;
+    uint8_t memory_attribute;
+    IA64DataReferenceResult translation = { 0 };
+
+    if (is_write || is_ifetch ||
+        !ia64_cached_speculative_data_load_qualifies(
+            env, va, datum_size, &speculation, &memory_attribute)) {
+        return false;
+    }
+
+    translation.valid = true;
+    translation.speculation = speculation;
+    translation.memory_attribute = memory_attribute;
+    if (ia64_alignment_fault(env, va, alignment_info, false, &translation)) {
+        return false;
+    }
+    if ((env->psr & IA64_PSR_DB) && !(env->psr & IA64_PSR_DD) &&
+        ia64_data_breakpoint_match(env, va, debug_size, IA64_ISR_R,
+                                   ia64_psr_cpl(env->psr))) {
+        return false;
+    }
+
+    return true;
+}
+
 uint64_t ia64_mmu_speculative_probe(CPUIA64State *env, uint64_t va,
-                                  uint32_t is_write, uint32_t is_ifetch,
-                                  uint32_t debug_size,
-                                  uint32_t alignment_info)
+                                    uint32_t is_write, uint32_t is_ifetch,
+                                    uint32_t debug_size,
+                                    uint32_t alignment_info)
 {
     uint32_t datum_size = alignment_info & IA64_ALIGNMENT_DATUM_MASK;
     uint32_t natural = (alignment_info & IA64_ALIGNMENT_NATURAL_MASK) >>
@@ -2159,6 +2280,11 @@ uint64_t ia64_mmu_speculative_probe(CPUIA64State *env, uint64_t va,
         /* See the aligned-versus-unaligned FP DBR rule in Vol. 2, 7.1.2. */
         debug_size = datum_size;
     }
+    if (ia64_cached_speculative_load_succeeds(
+            env, va, is_write, is_ifetch, debug_size, alignment_info)) {
+        return 1;
+    }
+
     if (is_ifetch) {
         alignment_fault = ia64_alignment_fault(
             env, va, alignment_info, is_write, NULL);
@@ -2225,6 +2351,43 @@ qualify:
         !ia64_memory_allows_control_speculation(translation.speculation)) {
         return 0;
     }
+    return 1;
+}
+
+static G_GNUC_NO_INLINE uint64_t
+ia64_mmu_speculative_int_probe_cold(CPUIA64State *env, uint64_t va,
+                                    uint32_t size)
+{
+    return ia64_mmu_speculative_probe(
+        env, va, 0, 0, size,
+        IA64_ALIGNMENT_INFO(size, size, IA64_ALIGNMENT_INTEGER));
+}
+
+uint64_t ia64_mmu_speculative_int_probe(CPUIA64State *env, uint64_t va,
+                                        uint32_t size)
+{
+    IA64MemorySpeculation speculation;
+    uint8_t memory_attribute;
+
+    if (env->psr & IA64_PSR_ED) {
+        return 0;
+    }
+
+    if (unlikely((size != 1 && size != 2 && size != 4 && size != 8) ||
+                 (va & (size - 1U)) != 0)) {
+        return ia64_mmu_speculative_int_probe_cold(env, va, size);
+    }
+
+    if (!ia64_cached_speculative_data_load_qualifies(
+            env, va, size, &speculation, &memory_attribute)) {
+        return ia64_mmu_speculative_int_probe_cold(env, va, size);
+    }
+    if ((env->psr & IA64_PSR_DB) && !(env->psr & IA64_PSR_DD) &&
+        ia64_data_breakpoint_match(env, va, size, IA64_ISR_R,
+                                   ia64_psr_cpl(env->psr))) {
+        return ia64_mmu_speculative_int_probe_cold(env, va, size);
+    }
+
     return 1;
 }
 

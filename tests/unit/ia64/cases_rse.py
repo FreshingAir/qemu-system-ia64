@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import re
 
-from .case import (CaseEvidence, CaseMetadata, CaseObservation, bind_cases)
+from .case import (CaseEvidence, CaseMetadata, CaseObservation, IA64Case,
+                   bind_cases)
 from .encoding import (
     CHECK_LOAD_DATA,
+    DTR_PTE_UC,
     DTR_PTE_WB,
     EIGHT_K_ITIR,
     ExpectedFP,
     HIGH_TR_BASE,
     IA64_ALT_DTLB_VECTOR,
     IA64_BREAK_VECTOR,
+    IA64_CR_ITM,
+    IA64_CR_ITV,
+    IA64_CR_SAPIC_EOI,
+    IA64_CR_SAPIC_IVR,
     IA64_DATA_ACCESS_VECTOR,
     IA64_DATA_KEY_MISS_VECTOR,
     IA64_DATA_NESTED_TLB_VECTOR,
@@ -39,6 +45,7 @@ from .encoding import (
     IA64_PSR_DD,
     IA64_PSR_DT,
     IA64_PSR_IC,
+    IA64_PSR_I,
     IA64_PSR_PK,
     IA64_PSR_RT,
     IA64_PSR_SS,
@@ -58,7 +65,9 @@ from .encoding import (
     adds,
     alloc,
     alloc_m,
+    bitfield,
     br_call,
+    br_call_indirect,
     br_cond,
     br_ctop_few,
     br_ctop_many,
@@ -67,6 +76,7 @@ from .encoding import (
     break_m,
     bundle_words,
     chk_s_i,
+    chk_s_m,
     clrrrb_b,
     cmp4_eq_imm,
     cmp_eq_imm,
@@ -110,6 +120,7 @@ from .encoding import (
     mov_rr_write,
     movl_mlx,
     nop_b,
+    nop_f,
     nop_i,
     nop_m,
     or_reg,
@@ -128,6 +139,7 @@ from .encoding import (
     st4,
     st8,
     st8_postinc,
+    tnat_nz_or,
 )
 from .runner import read_stopped_state
 
@@ -2921,6 +2933,844 @@ test_rse_rfi_loadrs_preserves_caller_locals_after_nested_return = require_regist
         "cfm_sol": 57,
     }, entry=0x10)
 
+def _guest_frame_ld8_s_nested_switch_case(name, *, pte_flags, nat):
+    bundles = [
+        # Reproduce the captured frame and load shape: SOF=26/SOL=23, with
+        # the function entry loaded into local r44 and the descriptor base
+        # postincremented in r42.
+        # WB selects the successful load case; control-speculative loads on
+        # UC memory defer into NaT for the companion recovery-path case.
+        *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
+                           pte_flags=pte_flags),
+        (0x70, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT)),
+        (0x80, 0x08, mov_gr_psr_full(2), srlz_d(), nop_i()),
+
+        # Establish the backing-store geometry measured immediately before
+        # the failing guest load.  Writing ar.pfs into the highest local makes
+        # the complete 37-register bootstrap frame live.  cover+flushrs
+        # advances BSPSTORE from 0x100000 to 0x100128 and BOL from 0 to 37;
+        # alloc(0)+loadrs(0) then leaves all 96 physical registers invalid.
+        (0x90, *movl_mlx(3, 0x100000)),
+        (0xa0, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0xb0, 0x00, nop_m(), alloc(68, 37, 37, 0, 0), nop_i()),
+        (0xc0, 0x18, nop_m(), nop_m(), cover_b()),
+        (0xd0, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (0xe0, 0x00, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0xf0, 0x00, nop_m(), alloc(14, 0, 0, 0, 0), nop_i()),
+        (0x100, 0x00, loadrs_enc(), nop_i(), nop_i()),
+
+        # The outer SOF=64/SOL=38 frame has exactly 26 outputs.  Its highest
+        # local is dirty, so br.call leaves the target at BOL=37+38=75 with
+        # dirty=38/1, invalid=32, BSP=0x100260 and BSPSTORE=0x100128.
+        (0x110, 0x00, nop_m(), alloc(69, 64, 38, 0, 0), nop_i()),
+        (0x120, 0x10, nop_m(), nop_i(), br_call(0, 0x120, 0x300)),
+        (0x130, 0x10, nop_m(), nop_i(), br_cond(0x130, 0x130)),
+
+        # alloc keeps the inherited 26-register frame but changes SOL to the
+        # captured value 23.  At BOL=75, r44 maps to physical register
+        # (75 + (44 - 32)) % 96 = 87.  Its backing-store address is
+        # 0x100260 + 12*8 = 0x1002c0, bit 24 of the 0x1003f8 RNAT word.
+        (0x300, 0x00, nop_m(), alloc(52, 26, 23, 0, 0),
+         adds(10, 0, 0)),
+        (0x310, *movl_mlx(42, HIGH_TR_BASE)),
+        (0x320, 0x00, ld8_s_postinc(44, 42, 8), nop_i(), nop_i()),
+        (0x330, 0x10, nop_m(), nop_i(), br_call(0, 0x330, 0x500)),
+        (0x340, 0x08, nop_m(), chk_s_m(44, 0x340, 0x380), nop_i()),
+        (0x350, 0x00, nop_m(), adds(8, 0, 44), adds(9, 0, 42)),
+        (0x360, 0x10, nop_m(), nop_i(), br_cond(0x360, 0x360)),
+        (0x380, 0x10, nop_m(), adds(10, 1, 0),
+         br_cond(0x380, 0x360)),
+
+        # The nested call supplies the interruption boundary without changing
+        # the target's frame shape.  Returning through b0 must recover the
+        # target frame, including its r44 value and NaT bit.
+        (0x500, 0x00, break_m(0x42), nop_i(), nop_i()),
+        (0x510, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # Match the captured context switch: quiesce the RSE, save BSP before
+        # flushrs and RNAT after it, execute alloc(0)+loadrs with loadrs=0 to
+        # invalidate the physical stack, then restore BSPSTORE/RNAT and lazy
+        # RSC mode.
+        (IA64_BREAK_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+        (IA64_BREAK_VECTOR + 0x10, 0x00, nop_m(), adds(28, 0, 0),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0x20, 0x00, mov_m_gr_ar(28, 16),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x30, 0x00, mov_m_ar_gr(25, 17),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x40, 0x00, flushrs_enc(), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0x50, 0x00, mov_m_ar_gr(26, 19),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x60, 0x00, nop_m(),
+         alloc(14, 0, 0, 0, 0), nop_i()),
+        (IA64_BREAK_VECTOR + 0x70, 0x00, loadrs_enc(), nop_i(),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0x80, 0x00, mov_m_gr_ar(25, 18),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x90, 0x00, mov_m_gr_ar(26, 19),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0xa0, 0x00, nop_m(), adds(28, 3, 0),
+         nop_i()),
+        (IA64_BREAK_VECTOR + 0xb0, 0x00, mov_m_gr_ar(28, 16),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0xc0, *movl_mlx(20, 0x510)),
+        (IA64_BREAK_VECTOR + 0xd0, 0x00, mov_m_gr_cr(20, 19),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0xe0, 0x10, nop_m(), nop_i(), rfi_b()),
+        raw_bundle(0x400000, 0x7763c020, 0),
+    ]
+    expected = {
+        "ip": 0x360,
+        "exception": IA64_EXCP_NONE,
+        "r42": HIGH_TR_BASE + 8,
+        "ar_rsc": 3,
+        "cfm_sof": 26,
+        "cfm_sol": 23,
+    }
+    if nat:
+        expected.update({
+            "r10": 1,
+            "r44_nat": 1,
+        })
+    else:
+        expected.update({
+            "r8": 0x7763c020,
+            "r8_nat": 0,
+            "r9": HIGH_TR_BASE + 8,
+            "r10": 0,
+            "r44": 0x7763c020,
+            "r44_nat": 0,
+        })
+    return require_registers(name, bundles, expected, entry=0x10,
+                             cpu="merced")
+
+
+test_rse_guest_frame_ld8_s_survives_nested_switch = \
+    _guest_frame_ld8_s_nested_switch_case(
+        "rse_guest_frame_ld8_s_survives_nested_switch",
+        pte_flags=DTR_PTE_WB, nat=False)
+
+test_rse_guest_frame_ld8_s_nat_survives_nested_switch = \
+    _guest_frame_ld8_s_nested_switch_case(
+        "rse_guest_frame_ld8_s_nat_survives_nested_switch",
+        pte_flags=DTR_PTE_UC, nat=True)
+
+
+def _guest_same_mfb_pressure_poison_case(
+        name, *, context_remap, initial_bol=0, remap_delta=83):
+    """Strengthen a captured r41 failure into one deterministic RSE case.
+
+    The captured producer MFB contains ld8.s plus a direct call; the later
+    consumer MFB contains the indirect call.  Fusing ld8.s in slot 0 with
+    that indirect br.call in slot 2 deliberately strengthens the path; it is
+    not a byte-for-byte reproduction.  The observed outer
+    SOF/SOL=29/21 and producer callee SOF/SOL=15/9 are retained exactly.
+    """
+    sentinel = 0x123456789abcdef0
+    descriptor = HIGH_TR_BASE
+    descriptor_physical = 0x400000
+    callee = 0x300
+    bsp_base = 0x100040
+    r41_home = 0x100088
+    rnat_collection = 0x1001f8
+    lazy_user_rsc = 0xf
+    resume_ip = 0x430
+    seed_bsp = 0x200040
+    dummy_bsp = 0x300040
+    dtr_bundles = dtr_setup_bundles(
+        0x1000, descriptor, descriptor_physical, pte_flags=DTR_PTE_WB)
+    dtr_stop_addresses = {0x1010, 0x1020, 0x1030}
+    dtr_bundles = [
+        (address, template | int(address in dtr_stop_addresses),
+         slot0, slot1, slot2)
+        for address, template, slot0, slot1, slot2 in dtr_bundles
+    ]
+    setup_target = 0x1090 if initial_bol else 0x10
+    bol_seed_bundles = [] if initial_bol == 0 else [
+        # Establish the absolute BOL observed in the target process without
+        # retaining any registers from this bootstrap context.  BOL is not an
+        # architected save field: cover advances it, and flushrs leaves the
+        # physical stack fully invalid while preserving that absolute bias.
+        (0x1090, *movl_mlx(3, seed_bsp)),
+        (0x10a0, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x10b0, 0x00,
+         alloc(32, initial_bol, initial_bol, 0, 0), nop_i(), nop_i()),
+        (0x10c0, 0x18, nop_m(), nop_m(), cover_b()),
+        (0x10d0, 0x01, flushrs_enc(), nop_i(), nop_i()),
+        (0x10e0, 0x10, nop_m(), nop_i(), br_cond(0x10e0, 0x10)),
+    ]
+    bundles = [
+        *dtr_bundles,
+        (0x1060, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT)),
+        (0x1070, 0x0a, mov_gr_psr_full(2), srlz_d(), nop_i()),
+        (0x1080, 0x10, nop_m(), nop_i(),
+         br_cond(0x1080, setup_target)),
+        *bol_seed_bundles,
+
+        (0x10, *movl_mlx(3, bsp_base)),
+        (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x30, *movl_mlx(13, lazy_user_rsc)),
+        (0x40, 0x01, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+        (0x50, *movl_mlx(2, descriptor)),
+        (0x60, *movl_mlx(20, callee)),
+        (0x70, 0x01, nop_m(), mov_b_gr(7, 20), nop_i()),
+
+        # The captured outer frame maps virtual r41 offset 9 to physical
+        # (BOL+9)%96, whose backing-store home is 0x100088 independently of
+        # that physical bias.  The synthetic fused producer/indirect-call
+        # shape is intentionally stronger than the captured separated
+        # producer and consumer bundles.
+        (0x80, 0x00, alloc(43, 29, 21, 0, 0), nop_i(), nop_i()),
+        (0x90, 0x10, nop_m(), adds(44, 0, 2),
+         br_cond(0x90, 0x100)),
+        (0x100, 0x1d, ld8_s_postinc(41, 44, 8), nop_f(),
+         br_call_indirect(0, 7, wh=5, many=True)),
+
+        # The indirect callee inherits eight outputs, then takes the observed
+        # 15/9 frame.  Its b6 nested call advances BOL to 30 while leaving b0
+        # intact for the eventual return to the outer frame.
+        (callee, 0x00, alloc_m(39, 15, 9, 0, 0), nop_i(), nop_i()),
+        (callee + 0x10, 0x10, nop_m(), nop_i(),
+         br_call(6, callee + 0x10, 0x400)),
+        (callee + 0x20, 0x01, mov_m_gr_ar(39, 64), nop_i(), nop_i()),
+        (callee + 0x30, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # The nested call inherits six registers.  Growing to SOF=76 consumes
+        # all 60 invalid physical registers and spills exactly p0..p9.  Its
+        # r107 maps back onto p9, so this write poisons the physical home after
+        # r41 has been saved.  The two returns must mandatory-fill p9 from
+        # 0x100088; retaining the poisoned physical value cannot pass.
+        (0x400, 0x00, alloc_m(36, 76, 68, 0, 0), nop_i(), nop_i()),
+        (0x410, 0x01, nop_m(), adds(107, 0, 0), nop_i()),
+        (0x420, 0x03,
+         break_m(0x42) if context_remap else nop_m(), nop_i(), nop_i()),
+        (resume_ip, 0x01, mov_m_gr_ar(36, 64), nop_i(), nop_i()),
+        (0x440, 0x10, nop_m(), nop_i(), br_ret(6)),
+
+        # Independently observe the backing-store image left by the exact ten
+        # spills, plus the final BSP and BSPSTORE after both mandatory fills.
+        (0x110, *movl_mlx(2, r41_home)),
+        (0x120, 0x01, ld8(8, 2), nop_i(), nop_i()),
+        (0x130, *movl_mlx(3, rnat_collection)),
+        (0x140, 0x01, ld8(10, 3), nop_i(), nop_i()),
+        (0x150, 0x01, mov_m_ar_gr(11, 17), nop_i(), nop_i()),
+        (0x160, 0x01, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0x170, 0x01, mov_m_ar_gr(12, 18), nop_i(), nop_i()),
+        (0x180, 0x01, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+        (0x190, 0x10, nop_m(), nop_i(), br_cond(0x190, 0x190)),
+        raw_bundle(descriptor_physical, sentinel, 0),
+    ]
+    if context_remap:
+        bundles += [
+            # Save the covered target context, quiesce it to memory, then run
+            # a dummy backing-store context on the same CPU.  Its second cover
+            # deliberately changes BOL and overwrites CR.IFS, so both the
+            # original IFS and backing-store state must be restored explicitly.
+            (IA64_BREAK_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+            (IA64_BREAK_VECTOR + 0x10, 0x09,
+             mov_m_cr_gr(24, 23), mov_m_ar_gr(27, 16), nop_i()),
+            (IA64_BREAK_VECTOR + 0x20, 0x01,
+             mov_m_ar_gr(25, 17), adds(28, 0, 0), nop_i()),
+            (IA64_BREAK_VECTOR + 0x30, 0x01,
+             mov_m_gr_ar(28, 16), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x40, 0x01,
+             flushrs_enc(), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x50, 0x01,
+             mov_m_ar_gr(26, 19), nop_i(), nop_i()),
+
+            (IA64_BREAK_VECTOR + 0x60, *movl_mlx(28, dummy_bsp)),
+            (IA64_BREAK_VECTOR + 0x70, 0x01,
+             mov_m_gr_ar(28, 18), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x80, 0x01,
+             mov_m_gr_ar(0, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x90, 0x00,
+             alloc(32, remap_delta, remap_delta, 0, 0), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xa0, 0x18,
+             nop_m(), nop_m(), cover_b()),
+            (IA64_BREAK_VECTOR + 0xb0, 0x01,
+             flushrs_enc(), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xc0, 0x00,
+             alloc(14, 0, 0, 0, 0), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xd0, 0x01,
+             loadrs_enc(), nop_i(), nop_i()),
+
+            # Dummy cover changes the target's eventual BOL by remap_delta.
+            # A 96-register temporary frame maps r127 to the physical slot
+            # that the final outer r41 will use after rfi and both returns.
+            # Poison it before restoring the target; correct backing-store
+            # fills must overwrite this zero.
+            (IA64_BREAK_VECTOR + 0xe0, 0x00,
+             alloc(32, 96, 96, 0, 0), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xf0, 0x01,
+             nop_m(), adds(127, 0, 0), nop_i()),
+            (IA64_BREAK_VECTOR + 0x100, 0x00,
+             alloc(14, 0, 0, 0, 0), nop_i(), nop_i()),
+
+            (IA64_BREAK_VECTOR + 0x110, 0x01,
+             mov_m_gr_ar(25, 18), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x120, 0x01,
+             mov_m_gr_ar(26, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x130, 0x01,
+             mov_m_gr_ar(27, 16), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x140, 0x01,
+             mov_m_gr_cr(24, 23), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x150, *movl_mlx(20, resume_ip)),
+            (IA64_BREAK_VECTOR + 0x160, 0x01,
+             mov_m_gr_cr(20, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x170, 0x10,
+             nop_m(), nop_i(), rfi_b()),
+        ]
+    expected = {
+        "ip": 0x190,
+        "exception": IA64_EXCP_NONE,
+        "r8": sentinel,
+        "r10": 0,
+        "r11": bsp_base,
+        "r12": bsp_base,
+        "r13": lazy_user_rsc,
+        "r41": sentinel,
+        "r41_nat": 0,
+        "r44": descriptor + 8,
+        "b0": 0x110,
+        "b7": callee,
+        "ar_rsc": lazy_user_rsc,
+        "cfm_sof": 29,
+        "cfm_sol": 21,
+    }
+
+    def run_and_check(qemu):
+        result = run_program(qemu, bundles, entry=0x1000, alat=None,
+                             expected=expected, name=name, cpu="merced")
+        cfm = re.search(
+            r"CFM: sof=(\d+) sol=(\d+).* "
+            r"BSP=0x([0-9a-f]+) BSPSTORE=0x([0-9a-f]+)",
+            result.register_output)
+        observed_pointers = None if cfm is None else (
+            int(cfm.group(3), 16), int(cfm.group(4), 16))
+        wanted_pointers = (bsp_base, bsp_base)
+        if observed_pointers != wanted_pointers:
+            raise RuntimeError(
+                f"{name} final BSP/BSPSTORE: expected "
+                f"{wanted_pointers!r}, got {observed_pointers!r}\n"
+                f"{result.register_output}")
+
+        rse = re.search(
+            r"RSE: bol=(\d+) dirty=(-?\d+)/(-?\d+) "
+            r"clean=(-?\d+)/(-?\d+) invalid=(-?\d+)",
+            result.register_output)
+        observed_partitions = None if rse is None else tuple(
+            int(value) for value in rse.groups())
+        final_bol = ((initial_bol + remap_delta) % 96
+                     if context_remap else initial_bol)
+        wanted_partitions = (final_bol, 0, 0, 0, 0, 67)
+        if observed_partitions != wanted_partitions:
+            raise RuntimeError(
+                f"{name} final RSE: expected {wanted_partitions!r}, "
+                f"got {observed_partitions!r}\n{result.register_output}")
+
+        dirty = re.search(
+            r"RSE-GR-DIRTY: 0x([0-9a-f]{16})/0x([0-9a-f]{16}) "
+            r"PGRNAT=0x([0-9a-f]{16})/0x([0-9a-f]{16})",
+            result.register_output)
+        pgr = re.findall(
+            r"^RSE-PGR\[(\d+)\]: 0x([0-9a-f]{16}) nat=([01])\r?$",
+            result.register_output, re.MULTILINE)
+        if dirty is None or [int(fields[0]) for fields in pgr] != \
+                list(range(96)):
+            raise RuntimeError(
+                f"{name} lacks a complete physical RSE image\n"
+                f"{result.register_output}")
+        dirty_words = tuple(int(value, 16) for value in dirty.groups()[:2])
+        nat_words = tuple(int(value, 16) for value in dirty.groups()[2:])
+        final_pgr = (final_bol + 9) % 96
+        pgr_value = (int(pgr[final_pgr][1], 16),
+                     int(pgr[final_pgr][2]))
+        pgr_mask = 1 << (final_pgr % 64)
+        pgr_word = final_pgr // 64
+        # RSE-GR-DIRTY is indexed by logical stacked offset, whereas PGRNAT
+        # and RSE-PGR are indexed by the BOL-rotated physical register.
+        if dirty_words[0] & (1 << 9) or \
+                nat_words[pgr_word] & pgr_mask or \
+                pgr_value != (sentinel, 0):
+            raise RuntimeError(
+                f"{name} final p{final_pgr}: expected "
+                f"value=0x{sentinel:016x}, nat=0, clean dirty-bit; got "
+                f"value/nat={pgr_value!r}, dirty={dirty_words!r}, "
+                f"nat={nat_words!r}\n"
+                f"{result.register_output}")
+
+    return IA64Case(
+        name=name,
+        runner=run_and_check,
+        bundles=tuple(tuple(bundle) for bundle in bundles),
+        expected=expected,
+        metadata=CaseMetadata(required_features=frozenset({
+            "cpu-model:merced",
+        })),
+    )
+
+
+test_rse_guest_same_mfb_ld8_s_r41_survives_nested_pressure_poison = \
+    _guest_same_mfb_pressure_poison_case(
+        "rse_guest_same_mfb_ld8_s_r41_survives_nested_pressure_poison",
+        context_remap=False)
+
+test_rse_guest_same_mfb_ld8_s_r41_survives_same_cpu_context_remap_poison = \
+    _guest_same_mfb_pressure_poison_case(
+        "rse_guest_same_mfb_ld8_s_r41_survives_same_cpu_"
+        "context_remap_poison", context_remap=True)
+
+test_rse_guest_same_mfb_ld8_s_r41_survives_bol79_to8_remap_poison = \
+    _guest_same_mfb_pressure_poison_case(
+        "rse_guest_same_mfb_ld8_s_r41_survives_bol79_to8_"
+        "remap_poison", context_remap=True, initial_bol=79,
+        remap_delta=25)
+
+
+def _guest_helper_ld8_s_r41_nested_pressure_case(name, *, switch):
+    entry_value = 0x77cf16e0
+    descriptor_gp = 0x78002000
+    bsp_base = 0x100040
+    lazy_user_rsc = 0xf
+    resume_ip = 0x420
+    dtr_bundles = dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
+                                    pte_flags=DTR_PTE_WB)
+    dtr_stop_addresses = {0x20, 0x30, 0x40}
+    dtr_bundles = [
+        (address, template | int(address in dtr_stop_addresses),
+         slot0, slot1, slot2)
+        for address, template, slot0, slot1, slot2 in dtr_bundles
+    ]
+    bundles = [
+        # Match the successful captured descriptor load: WB memory produces a
+        # valid, non-NaT entry point and postincrements the stacked base.
+        *dtr_bundles,
+        (0x70, 0x05, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT)[1:]),
+        (0x80, 0x0a, mov_gr_psr_full(2), srlz_d(), nop_i()),
+        (0x90, 0x05, *movl_mlx(3, bsp_base)[1:]),
+        (0xa0, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0xb0, 0x05, *movl_mlx(13, lazy_user_rsc)[1:]),
+        (0xc0, 0x00, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+
+        # The observed outer frame has SOF=19/SOL=13.  With reset BOL=0,
+        # r41 is physical register 9 and its backing-store home is
+        # 0x100088 (RNAT collection bit 17 in the word at 0x1001f8).
+        (0xd0, 0x00, alloc(43, 19, 13, 0, 0), adds(10, 0, 0),
+         nop_i()),
+        (0xe0, 0x05, *movl_mlx(35, HIGH_TR_BASE)[1:]),
+        (0xf0, 0x00, ld8_s_postinc(41, 35, 8), nop_i(), nop_i()),
+        (0x100, 0x10, nop_m(), nop_i(), br_call(0, 0x100, 0x300)),
+        (0x110, 0x08, nop_m(), chk_s_m(41, 0x110, 0x190), nop_i()),
+        (0x120, 0x00, nop_m(), adds(8, 0, 41), adds(9, 0, 35)),
+
+        # AR.BSPSTORE is accessible only with RSC.mode=0.  Capture both
+        # backing-store pointers, then restore the observed lazy PL3 value.
+        (0x130, 0x00, mov_m_ar_gr(11, 17), nop_i(), nop_i()),
+        (0x140, 0x01, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0x150, 0x00, mov_m_ar_gr(12, 18), nop_i(), nop_i()),
+        (0x160, 0x00, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+        (0x170, 0x10, nop_m(), nop_i(), br_cond(0x170, 0x170)),
+        (0x190, 0x10, nop_m(), adds(10, 1, 0),
+         br_cond(0x190, 0x130)),
+
+        # Match the intervening helper: SOF=16/SOL=9, with b0 saved in its
+        # highest local before a nested call.  The child's inherited seven
+        # inputs put its BOL at 22 while outer r41 remains physical register
+        # 9, exactly thirteen physical registers behind it.
+        (0x300, 0x00, alloc_m(39, 16, 9, 0, 0), nop_i(), nop_i()),
+        (0x310, 0x01, nop_m(), mov_gr_b(40, 0), nop_i()),
+        (0x320, 0x10, nop_m(), nop_i(), br_call(0, 0x320, 0x400)),
+        (0x330, 0x00, nop_m(), mov_m_gr_ar(39, 64), mov_b_gr(0, 40)),
+        (0x340, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # Before this alloc there are 67 invalid and 22 dirty physical
+        # registers.  Growing the inherited seven-register frame to 96 uses
+        # all 67 invalid registers, then spills exactly those 22 dirty
+        # registers.  Outer r41 is the tenth store, at 0x100088.
+        (0x400, 0x00, alloc_m(34, 96, 88, 0, 0), nop_i(), nop_i()),
+        (0x410, 0x01, break_m(0x42) if switch else nop_m(), nop_i(),
+         nop_i()),
+        (resume_ip, 0x00, nop_m(), mov_m_gr_ar(34, 64), nop_i()),
+        (0x430, 0x10, nop_m(), nop_i(), br_ret(0)),
+        raw_bundle(0x400000, entry_value, descriptor_gp),
+    ]
+
+    if switch:
+        bundles += [
+            # At the break, the child owns all 96 physical registers at
+            # BOL=22 and BSP=0x1000f0.  cover crosses the RNAT words at
+            # 0x1001f8 and 0x1003f8 and advances BSP to 0x100400.  The
+            # flushrs/loadrs(0) sequence invalidates the complete physical
+            # stack before rfi reloads it and resumes the two normal returns.
+            (IA64_BREAK_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+            (IA64_BREAK_VECTOR + 0x10, 0x00,
+             mov_m_ar_gr(27, 16), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x20, 0x01, nop_m(), adds(28, 0, 0),
+             nop_i()),
+            (IA64_BREAK_VECTOR + 0x30, 0x01,
+             mov_m_gr_ar(28, 16), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x40, 0x00,
+             mov_m_ar_gr(25, 17), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x50, 0x01,
+             flushrs_enc(), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x60, 0x00,
+             mov_m_ar_gr(26, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x70, 0x00, nop_m(),
+             alloc(14, 0, 0, 0, 0), nop_i()),
+            (IA64_BREAK_VECTOR + 0x80, 0x01,
+             loadrs_enc(), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0x90, 0x01,
+             mov_m_gr_ar(25, 18), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xa0, 0x00,
+             mov_m_gr_ar(26, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xb0, 0x00,
+             mov_m_gr_ar(27, 16), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xc0, 0x05,
+             *movl_mlx(20, resume_ip)[1:]),
+            (IA64_BREAK_VECTOR + 0xd0, 0x01,
+             mov_m_gr_cr(20, 19), nop_i(), nop_i()),
+            (IA64_BREAK_VECTOR + 0xe0, 0x10,
+             nop_m(), nop_i(), rfi_b()),
+        ]
+
+    return require_registers(name, bundles, {
+        "ip": 0x170,
+        "exception": IA64_EXCP_NONE,
+        "r8": entry_value,
+        "r8_nat": 0,
+        "r9": HIGH_TR_BASE + 8,
+        "r10": 0,
+        "r11": bsp_base,
+        "r12": bsp_base,
+        "r13": lazy_user_rsc,
+        "r35": HIGH_TR_BASE + 8,
+        "r41": entry_value,
+        "r41_nat": 0,
+        "ar_rsc": lazy_user_rsc,
+        "cfm_sof": 19,
+        "cfm_sol": 13,
+    }, entry=0x10, alat=None, cpu="merced", smp="2")
+
+
+test_rse_guest_helper_ld8_s_r41_survives_nested_pressure = \
+    _guest_helper_ld8_s_r41_nested_pressure_case(
+        "rse_guest_helper_ld8_s_r41_survives_nested_pressure", switch=False)
+
+test_rse_guest_helper_ld8_s_r41_survives_nested_switch = \
+    _guest_helper_ld8_s_r41_nested_pressure_case(
+        "rse_guest_helper_ld8_s_r41_survives_nested_switch", switch=True)
+
+
+def _guest_bol82_switch_poison_case(name, *, switch_site,
+                                         deferred=False):
+    """Reproduce captured cold-start BOL and partition geometry."""
+    entry_value = 0x77cf16e0
+    descriptor_gp = 0x78002000
+    bsp_seed = 0x100038
+    outer_bsp = 0x1002d0
+    lazy_user_rsc = 0xf
+    pre_call_switch = switch_site == "pre-call"
+    helper_switches = switch_site == "helper"
+    if not (pre_call_switch or helper_switches):
+        raise ValueError(f"unsupported guest switch site: {switch_site}")
+    if deferred and not helper_switches:
+        raise ValueError("deferred guest case requires helper switches")
+
+    # cover leaves BOL=5 for an interruption in the SOF=19 outer frame and
+    # BOL=19 for the observed SOF=11 child.  Grow a temporary frame
+    # far enough that the selected virtual register maps to physical r91, and
+    # overwrite that register after loadrs has made the physical stack stale.
+    # A correct rfi/return fill must replace this zero with the backing-store
+    # value; merely retaining the old physical-register contents cannot pass.
+    poison_sof, poison_reg = ((87, 118) if pre_call_switch else (73, 104))
+    switch_vector = 0x3000 if pre_call_switch else IA64_BREAK_VECTOR
+
+    dtr_bundles = dtr_setup_bundles(
+        0x10, HIGH_TR_BASE, 0x400000,
+        pte_flags=DTR_PTE_UC if deferred else DTR_PTE_WB)
+    dtr_stop_addresses = {0x20, 0x30, 0x40}
+    dtr_bundles = [
+        (address, template | int(address in dtr_stop_addresses),
+         slot0, slot1, slot2)
+        for address, template, slot0, slot1, slot2 in dtr_bundles
+    ]
+    timer_prep_bundles = []
+    if pre_call_switch:
+        timer_prep_bundles = [
+            # Mirror the deterministic pending-timer primitive used by the
+            # interrupt tests.  PSR.i remains clear while the timer is armed;
+            # the branch back also gives the zero-deadline timer a TB exit at
+            # which to become pending before the captured load sequence.
+            (0xa00, 0x01, adds(4, 0xef, 0), nop_i(), nop_i()),
+            (0xa10, 0x01, mov_m_gr_cr(4, IA64_CR_ITV), nop_i(), nop_i()),
+            (0xa20, 0x01, mov_m_gr_ar(0, 44), nop_i(), nop_i()),
+            (0xa30, 0x01, mov_m_gr_cr(0, IA64_CR_ITM), nop_i(), nop_i()),
+            (0xa40, 0x10, nop_m(), nop_i(),
+             br_cond(0xa40, 0x210)),
+        ]
+    recovery_bundles = [
+        (0x2f0, 0x10, nop_m(), adds(10, 1, 0),
+         br_cond(0x2f0, 0x290)),
+    ]
+    if deferred:
+        recovery_bundles = [
+            # Match the captured 0x764b91d0 and 0x764b91e0 bundles exactly.
+            # Rewind the speculative postincrement, redo the descriptor load
+            # non-speculatively, publish its entry in b7, then rejoin the real
+            # indirect-call bundle at the corresponding 0x764b9150 site.
+            (0x2f0, 0x0b, adds(35, -8, 35),
+             ld8_postinc(41, 35, 8), nop_i()),
+            (0x300, 0x11, nop_m(),
+             mov_b_gr(7, 41) | bitfield(1, 20, 1),
+             br_cond(0x300, 0x270)),
+        ]
+
+    bundles = [
+        *dtr_bundles,
+        (0x70, 0x05, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT)[1:]),
+        (0x80, 0x0a, mov_gr_psr_full(2), srlz_d(), nop_i()),
+        (0x90, 0x05, *movl_mlx(3, bsp_seed)[1:]),
+        (0xa0, 0x01, mov_ar(3, 18), nop_i(), nop_i()),
+        (0xb0, 0x05, *movl_mlx(13, lazy_user_rsc)[1:]),
+        (0xc0, 0x01, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+
+        # Seed BOL=45, flush the 45-register bootstrap frame, then invalidate
+        # all 96 physical registers without changing the flushed BSPSTORE.
+        (0xd0, 0x00, alloc(76, 45, 45, 0, 0), nop_i(), nop_i()),
+        (0xe0, 0x18, nop_m(), nop_m(), cover_b()),
+        (0xf0, 0x01, flushrs_enc(), nop_i(), nop_i()),
+        (0x100, 0x01, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0x110, 0x00, alloc(14, 0, 0, 0, 0), nop_i(), nop_i()),
+        (0x120, 0x01, loadrs_enc(), nop_i(), nop_i()),
+        (0x130, 0x01, mov_m_gr_ar(0, 19), nop_i(), nop_i()),
+        (0x140, 0x01, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+
+        # SOF=43/SOL=37 leaves six outputs.  The call therefore enters with
+        # BOL=82 and six inherited inputs; alloc grows by thirteen registers
+        # to the observed SOF=19/SOL=13 partition.
+        (0x150, 0x00, alloc(68, 43, 37, 0, 0), nop_i(), nop_i()),
+        (0x160, 0x10, nop_m(), nop_i(), br_call(0, 0x160, 0x200)),
+        (0x170, 0x10, nop_m(), nop_i(), br_cond(0x170, 0x170)),
+
+        (0x200, 0x10 if pre_call_switch else 0x00,
+         alloc(43, 19, 13, 0, 0), adds(10, 0, 0),
+         br_cond(0x200, 0xa00) if pre_call_switch else
+         adds(41, 0, 0) if deferred else nop_i()),
+        (0x210, 0x05, *movl_mlx(35, HIGH_TR_BASE)[1:]),
+        # Match the two captured bundles at 0x764b90e0 byte for byte.
+        # The successful ld8.s and three register moves form one group through
+        # slot 0 of the second bundle.  The timer variant then enables PSR.i
+        # in a separate group, exposing an external-interrupt boundary before
+        # the helper call; the companion case uses software interruptions at
+        # all five helper sites.
+        (0x220, 0x00, ld8_s_postinc(41, 35, 8),
+         adds(45, 0, 38), adds(46, 0, 33)),
+        (0x230, 0x0a, adds(47, 0, 34), addl(48, 983071, 0),
+         addl(49, 2, 0)),
+        (0x240, 0x01,
+         ssm(IA64_PSR_I) if pre_call_switch else nop_m(),
+         tnat_nz_or(6, 0, 41) if deferred else nop_i(), nop_i()),
+        (0x250, 0x10, nop_m(), nop_i(), br_call(0, 0x250, 0x400)),
+        # Match the two final captured bundles byte for byte.  The raw +0
+        # prediction hint in mov b7=r41 is bit 20; it has no architectural
+        # effect, but retaining it also exercises the exact decoder path.
+        # There is no stop between these bundles, so chk.s, the BR write, the
+        # descriptor-GP load and the indirect call form one instruction group.
+        (0x260, 0x10, chk_s_m(41, 0x260, 0x2f0),
+         mov_b_gr(7, 41) | bitfield(1, 20, 1), nop_b()),
+        (0x270, 0x1d, ld8(1, 35), nop_f(),
+         br_call_indirect(0, 7, wh=5, many=True)),
+        (0x280, 0x01, nop_m(), adds(8, 0, 41), adds(9, 0, 35)),
+        (0x290, 0x01, mov_m_ar_gr(11, 17), nop_i(), nop_i()),
+        (0x2a0, 0x01, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
+        (0x2b0, 0x01, mov_m_ar_gr(12, 18), nop_i(), nop_i()),
+        (0x2c0, 0x01, mov_m_ar_gr(14, 19), nop_i(), nop_i()),
+        (0x2d0, 0x01, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
+        (0x2e0, 0x10, nop_m(), nop_i(), br_cond(0x2e0, 0x2e0)),
+        *recovery_bundles,
+
+        # Intermediate helper: SOF=16/SOL=9, with b0, ar.pfs, and gp in
+        # r38-r40.  The call sequence uses the captured frame sizes.
+        (0x400, 0x00, alloc_m(39, 16, 9, 0, 0), nop_i(), nop_i()),
+        (0x410, 0x01, nop_m(), mov_gr_b(38, 0), adds(40, 0, 1)),
+        (0x420, 0x10, nop_m(), nop_i(), br_call(0, 0x420, 0x600)),
+        (0x430, 0x10, nop_m(), nop_i(), br_call(0, 0x430, 0x700)),
+        (0x440, 0x10, nop_m(), nop_i(), br_call(0, 0x440, 0x600)),
+        (0x450, 0x10, nop_m(), nop_i(), br_call(0, 0x450, 0x700)),
+        (0x460, 0x10, nop_m(), nop_i(), br_call(0, 0x460, 0x800)),
+        (0x470, 0x10, nop_m(), nop_i(), br_call(0, 0x470, 0x900)),
+        (0x480, 0x10, nop_m(), nop_i(), br_call(0, 0x480, 0x900)),
+        (0x490, 0x01, nop_m(), mov_m_gr_ar(39, 64), adds(1, 0, 40)),
+        (0x4a0, 0x01, nop_m(), mov_b_gr(0, 38), nop_i()),
+        (0x4b0, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # The first nested helper is a leaf in the recovered call chain.
+        (0x600, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # The SOF=11/SOL=7 nested helper is reached twice.
+        (0x700, 0x00, alloc_m(37, 11, 7, 0, 0), nop_i(), nop_i()),
+        (0x710, 0x01, nop_m(), mov_gr_b(38, 0), nop_i()),
+        (0x720, 0x03,
+         break_m(0x42) if helper_switches else nop_m(), nop_i(), nop_i()),
+        (0x730, 0x01, mov_m_gr_ar(37, 64), mov_b_gr(0, 38), nop_i()),
+        (0x740, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # The SOF=18/SOL=11 nested helper is reached once.
+        (0x800, 0x00, alloc_m(41, 18, 11, 0, 0), nop_i(), nop_i()),
+        (0x810, 0x01, nop_m(), mov_gr_b(42, 0), nop_i()),
+        (0x820, 0x03,
+         break_m(0x42) if helper_switches else nop_m(), nop_i(), nop_i()),
+        (0x830, 0x01, mov_m_gr_ar(41, 64), mov_b_gr(0, 42), nop_i()),
+        (0x840, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        # The SOF=5/SOL=4 leaf helper is reached twice.
+        (0x900, 0x00, alloc_m(34, 5, 4, 0, 0), nop_i(), nop_i()),
+        (0x910, 0x01, nop_m(), mov_gr_b(35, 0), nop_i()),
+        (0x920, 0x03,
+         break_m(0x42) if helper_switches else nop_m(), nop_i(), nop_i()),
+        (0x930, 0x01, mov_m_gr_ar(34, 64), mov_b_gr(0, 35), nop_i()),
+        (0x940, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        *timer_prep_bundles,
+
+        # Dynamic resume supports all five helper break sites.  The pre-call
+        # variant instead acknowledges the pending timer and naturally
+        # resumes at 0x250.  Both paths cover, flush, invalidate and reload
+        # the RSE, deliberately poison physical r91 while it is invalid, then
+        # restore the interrupted backing-store state before rfi.
+        (switch_vector, 0x18, nop_m(), nop_m(), cover_b()),
+        (switch_vector + 0x10, 0x0b,
+         mov_m_cr_gr(20, IA64_CR_SAPIC_IVR) if pre_call_switch else
+         mov_m_cr_gr(20, 19),
+         mov_m_cr_gr(21, 19) if pre_call_switch else adds(20, 16, 20),
+         adds(15, 1, 15)),
+        (switch_vector + 0x20, 0x01,
+         mov_m_ar_gr(27, 16), nop_i(), nop_i()),
+        (switch_vector + 0x30, 0x01,
+         nop_m(), adds(28, 0, 0), nop_i()),
+        (switch_vector + 0x40, 0x01,
+         mov_m_gr_ar(28, 16), nop_i(), nop_i()),
+        (switch_vector + 0x50, 0x01,
+         mov_m_ar_gr(25, 17), nop_i(), nop_i()),
+        (switch_vector + 0x60, 0x01,
+         flushrs_enc(), nop_i(), nop_i()),
+        (switch_vector + 0x70, 0x01,
+         mov_m_ar_gr(26, 19), nop_i(), nop_i()),
+        (switch_vector + 0x80, 0x00,
+         alloc(14, 0, 0, 0, 0), nop_i(), nop_i()),
+        (switch_vector + 0x90, 0x01,
+         loadrs_enc(), nop_i(), nop_i()),
+        (switch_vector + 0xa0, 0x00,
+         alloc(32, poison_sof, poison_sof, 0, 0), nop_i(), nop_i()),
+        (switch_vector + 0xb0, 0x01,
+         nop_m(), adds(poison_reg, 0, 0), nop_i()),
+        (switch_vector + 0xc0, 0x00,
+         alloc(14, 0, 0, 0, 0), nop_i(), nop_i()),
+        (switch_vector + 0xd0, 0x01,
+         mov_m_gr_ar(25, 18), nop_i(), nop_i()),
+        (switch_vector + 0xe0, 0x01,
+         mov_m_gr_ar(26, 19), nop_i(), nop_i()),
+        (switch_vector + 0xf0, 0x01,
+         mov_m_gr_ar(27, 16), nop_i(), nop_i()),
+        (switch_vector + 0x100, 0x01,
+         mov_m_gr_cr(0, IA64_CR_SAPIC_EOI) if pre_call_switch else
+         mov_m_gr_cr(20, 19), nop_i(), nop_i()),
+        (switch_vector + 0x110, 0x10,
+         nop_m(), nop_i(), rfi_b()),
+
+        raw_bundle(0x400000, entry_value, descriptor_gp),
+
+        # The real descriptor entry is below the machine's default 2 GiB RAM
+        # ceiling, so execute the indirect call at its observed guest address.
+        # A marker and GP capture prove that b7 selected this leaf and that the
+        # call bundle loaded the descriptor's second word before branching.
+        (entry_value, 0x01, nop_m(), adds(2, 0, 1), adds(3, 0x5a, 0)),
+        (entry_value + 0x10, 0x10, nop_m(), nop_i(), br_ret(0)),
+    ]
+    expected = {
+        "ip": 0x2e0,
+        "exception": IA64_EXCP_NONE,
+        "r1": descriptor_gp,
+        "r2": descriptor_gp,
+        "r3": 0x5a,
+        "r8": entry_value,
+        "r8_nat": 0,
+        "r9": HIGH_TR_BASE + 8,
+        "r10": 0,
+        "r11": outer_bsp,
+        "r12": outer_bsp,
+        "r14": 0,
+        "r35": HIGH_TR_BASE + 8,
+        "r41": entry_value,
+        "r41_nat": 0,
+        "b0": 0x280,
+        "b7": entry_value,
+        "ar_rnat": 0,
+        "ar_rsc": lazy_user_rsc,
+        "cfm_sof": 19,
+        "cfm_sol": 13,
+    }
+    expected["r15"] = 1 if pre_call_switch else 5
+    if pre_call_switch:
+        expected.update({
+            "r20": 0xef,
+            "r21": 0x250,
+        })
+    if deferred:
+        expected.update({
+            # p6 records that the original UC ld8.s produced NaT before any
+            # helper call or RSE switch.  The remaining values prove that the
+            # NaT survived all five interruptions, selected the fixup, was
+            # cleared by the ordinary reload, and reached the real call leaf.
+            "p6": 1,
+            "r20": 0x930,
+        })
+
+    def run_and_check(qemu):
+        result = run_program(qemu, bundles, entry=0x10, alat=None,
+                             expected=expected, name=name, cpu="merced",
+                             smp="2")
+        match = re.search(
+            r"RSE: bol=(\d+) dirty=(-?\d+)/(-?\d+) "
+            r"clean=(-?\d+)/(-?\d+) invalid=(-?\d+)",
+            result.register_output)
+        observed = None if match is None else tuple(
+            int(value) for value in match.groups())
+        wanted = (82, 0, 0, 0, 0, 77)
+        if observed != wanted:
+            raise RuntimeError(
+                f"{name} final RSE: expected {wanted!r}, got {observed!r}\n"
+                f"{result.register_output}")
+
+    return IA64Case(
+        name=name,
+        runner=run_and_check,
+        bundles=tuple(tuple(bundle) for bundle in bundles),
+        expected=expected,
+        metadata=CaseMetadata(required_features=frozenset({
+            "cpu-model:merced", "smp",
+        })),
+    )
+
+
+test_rse_guest_bol82_ld8_s_survives_precall_switch_poison = \
+    _guest_bol82_switch_poison_case(
+        "rse_guest_bol82_ld8_s_survives_precall_switch_poison",
+        switch_site="pre-call")
+
+test_rse_guest_bol82_ld8_s_survives_helper_switches_poison = \
+    _guest_bol82_switch_poison_case(
+        "rse_guest_bol82_ld8_s_survives_helper_switches_poison",
+        switch_site="helper")
+
+test_rse_guest_bol82_ld8_s_deferred_nat_recovers_after_helper_switches = \
+    _guest_bol82_switch_poison_case(
+        "rse_guest_bol82_ld8_s_deferred_nat_recovers_after_"
+        "helper_switches",
+        switch_site="helper", deferred=True)
+
+
 test_rse_rfi_loadrs_preserves_caller_locals_after_syscall_error = require_registers(
     "rse_rfi_loadrs_preserves_caller_locals_after_syscall_error", [
         (0x10, *movl_mlx(2, 1 << 13)),
@@ -3326,7 +4176,7 @@ test_rse_br_ret_fill_dtlb_miss_retries_atomically = require_registers(
          adds(7, EIGHT_K_ITIR, 0), nop_i(), nop_i()),
         (IA64_ALT_DTLB_VECTOR + 0x20, 0x00,
          mov_m_gr_cr(7, 21), nop_i(), nop_i()),
-        (IA64_ALT_DTLB_VECTOR + 0x30, 0x00,
+        (IA64_ALT_DTLB_VECTOR + 0x30, 0x08,
          itc_d(18), adds(29, 0x77, 0),
          nop_i()),
         (IA64_ALT_DTLB_VECTOR + 0x40, 0x10, nop_m(), nop_i(),
@@ -5278,6 +6128,16 @@ CASE_NAMES = (
     'rse_rfi_loadrs_preserves_gp_save_after_syscall_error',
     'rse_rfi_loadrs_preserves_high_sol_caller_local',
     'rse_rfi_loadrs_preserves_low_sol_caller_local',
+    'rse_guest_same_mfb_ld8_s_r41_survives_nested_pressure_poison',
+    'rse_guest_same_mfb_ld8_s_r41_survives_same_cpu_context_remap_poison',
+    'rse_guest_same_mfb_ld8_s_r41_survives_bol79_to8_remap_poison',
+    'rse_guest_frame_ld8_s_nat_survives_nested_switch',
+    'rse_guest_frame_ld8_s_survives_nested_switch',
+    'rse_guest_bol82_ld8_s_deferred_nat_recovers_after_helper_switches',
+    'rse_guest_bol82_ld8_s_survives_helper_switches_poison',
+    'rse_guest_bol82_ld8_s_survives_precall_switch_poison',
+    'rse_guest_helper_ld8_s_r41_survives_nested_pressure',
+    'rse_guest_helper_ld8_s_r41_survives_nested_switch',
     'rse_rfi_nested_handler_preserves_faulting_frame',
     'rse_rfi_repeated_cover_preserves_latest_dirty_partition',
     'rse_rfi_repeated_cover_uses_latest_current_frame',
@@ -5322,6 +6182,52 @@ CASE_METADATA = {
             'firmware-sal',
             'machine:itanium-vpc',
         }),
+    ),
+    'rse_guest_frame_ld8_s_nat_survives_nested_switch': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_frame_ld8_s_survives_nested_switch': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_same_mfb_ld8_s_r41_survives_nested_pressure_poison': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression', 'synthetic-strengthening'}),
+    ),
+    'rse_guest_same_mfb_ld8_s_r41_survives_same_cpu_context_remap_poison': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({
+            'external-guest-regression', 'synthetic-strengthening',
+            'same-cpu-context-remap',
+        }),
+    ),
+    'rse_guest_same_mfb_ld8_s_r41_survives_bol79_to8_remap_poison': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({
+            'external-guest-regression', 'synthetic-strengthening',
+            'same-cpu-context-remap', 'physical-rse-wrap',
+        }),
+    ),
+    'rse_guest_bol82_ld8_s_survives_helper_switches_poison': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_bol82_ld8_s_deferred_nat_recovers_after_helper_switches': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_bol82_ld8_s_survives_precall_switch_poison': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_helper_ld8_s_r41_survives_nested_pressure': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
+    ),
+    'rse_guest_helper_ld8_s_r41_survives_nested_switch': CaseMetadata(
+        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
+        tags=frozenset({'external-guest-regression'}),
     ),
     'rse_physical_spill_fault_sets_isr_rs': CaseMetadata(
         nonterminal_effect_loop=True),

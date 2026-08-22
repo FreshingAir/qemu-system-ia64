@@ -349,13 +349,9 @@ static void ia64_gen_speculative_load(DisasContext *ctx,
             tcg_gen_brcondi_i64(TCG_COND_NE, addr_nat, 0, l_fail);
         }
         ia64_gen_sync_ip_for_helper(insn);
-        gen_helper_speculative_probe(ok, tcg_env, addr, tcg_constant_i32(0),
-                                     tcg_constant_i32(0),
-                                     tcg_constant_i32(ia64_memop_size(mop)),
-                                     tcg_constant_i32(IA64_ALIGNMENT_INFO(
-                                         ia64_memop_size(mop),
-                                         ia64_memop_size(mop),
-                                         IA64_ALIGNMENT_INTEGER)));
+        gen_helper_speculative_int_probe(
+            ok, tcg_env, addr,
+            tcg_constant_i32(ia64_memop_size(mop)));
         tcg_gen_brcondi_i64(TCG_COND_EQ, ok, 0, l_fail);
 
         if (advanced && ctx->memory.full_alat) {

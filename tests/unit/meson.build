@@ -280,6 +280,12 @@ if 'ia64-softmmu' in target_dirs
        timeout: 30,
        suite: ['unit', 'ia64'])
 
+  test('test-ia64-encoding-common',
+       python,
+       args: [files('ia64/test_encoding_common.py')],
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
   test('test-ia64-firmware-layout',
        python,
        depends: ia64_firmware_bin,

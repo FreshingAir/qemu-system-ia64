@@ -366,6 +366,52 @@ static void ia64_gen_czx(TCGv_i64 result, TCGv_i64 value,
     tcg_gen_shri_i64(result, result, bits == 8 ? 3 : 4);
 }
 
+static void ia64_gen_mux2(TCGv_i64 result, TCGv_i64 value, uint32_t imm)
+{
+    uint32_t first_lane = imm & 3;
+    uint32_t broadcast = first_lane * 0x55;
+    bool first = true;
+    int i;
+
+    if ((imm & 0xff) == 0xe4) {
+        /* Each destination lane selects the same-numbered source lane. */
+        tcg_gen_mov_i64(result, value);
+        return;
+    }
+    if ((imm & 0xff) == broadcast) {
+        if (first_lane != 0) {
+            tcg_gen_shri_i64(result, value, first_lane * 16);
+        } else {
+            tcg_gen_mov_i64(result, value);
+        }
+        tcg_gen_ext16u_i64(result, result);
+        tcg_gen_muli_i64(result, result, UINT64_C(0x0001000100010001));
+        return;
+    }
+
+    for (i = 0; i < 4; i++) {
+        uint32_t source_lane = (imm >> (i * 2)) & 3;
+        int shift = ((int)source_lane - i) * 16;
+        uint64_t mask = UINT64_C(0xffff) << (i * 16);
+        TCGv_i64 lane = tcg_temp_new_i64();
+
+        if (shift > 0) {
+            tcg_gen_shri_i64(lane, value, shift);
+        } else if (shift < 0) {
+            tcg_gen_shli_i64(lane, value, -shift);
+        } else {
+            tcg_gen_mov_i64(lane, value);
+        }
+        tcg_gen_andi_i64(lane, lane, mask);
+        if (first) {
+            tcg_gen_mov_i64(result, lane);
+            first = false;
+        } else {
+            tcg_gen_or_i64(result, result, lane);
+        }
+    }
+}
+
 static void ia64_simd_sign_extend(TCGv_i64 lane, unsigned bits)
 {
     switch (bits) {
@@ -854,10 +900,13 @@ IA64GenResult ia64_gen_simd(DisasContext *ctx,
             break;
         }
         result = tcg_temp_new_i64();
-        gen_helper_simd_mux(
-            result,
-            tcg_constant_i32(insn->opcode == IA64_OP_MUX1 ? 0 : 1),
-            ia64_gr_src(op->source1), tcg_constant_i32(op->immediate));
+        if (insn->opcode == IA64_OP_MUX2) {
+            ia64_gen_mux2(result, ia64_gr_src(op->source1), op->immediate);
+        } else {
+            gen_helper_simd_mux(result, tcg_constant_i32(0),
+                                 ia64_gr_src(op->source1),
+                                 tcg_constant_i32(op->immediate));
+        }
         tcg_gen_mov_i64(cpu_gr[op->destination], result);
         ia64_gen_gr_nat_from_1(insn, op->destination, op->source1);
         break;

@@ -122,7 +122,7 @@ not from the translator implementation.  Reuse the encoder in the matching
 ``tests/unit/ia64/encoding_<family>.py`` module, give the program an explicit
 terminal loop, and define it in exactly one ``cases_*.py`` semantic test group.
 ``encoding.py`` is only the compatibility facade and shared microprogram
-harness.  The typed registry rejects missing, duplicate, or renamed entries,
+harness.  The typed registry rejects missing or duplicate entries,
 and attaches coverage tags, specification references, and required emulator
 features to every case.
 

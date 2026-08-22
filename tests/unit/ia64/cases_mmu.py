@@ -158,6 +158,8 @@ from .encoding import (
     probe_w_imm,
     probe_w_reg,
     ptc_e,
+    ptc_g,
+    ptc_ga,
     ptc_l,
     ptr_d,
     ptr_d_alt,
@@ -3310,6 +3312,35 @@ test_itc_d_virtual_stack_local_passed_as_high_sol_output = require_registers(
         "r9": 0xe0000106014cdcf0,
     }, entry=0x10)
 
+
+def _itc_d_mii_slot0_without_stop_is_illegal(name, template):
+    return require_registers(name, [
+        # Prepare a valid itc.d with PSR.ic clear.  Converting itc_d() to int
+        # deliberately suppresses bundle_words()'s automatic end-group
+        # template selection.  The raw MII 0x02/0x03 template has no stop
+        # after slot 0, so the must-end instruction is illegal.
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
+        (0x20, *movl_mlx(2, 0x9000)),
+        (0x30, 0x00, adds(7, LOW_VECTOR_ITIR, 0), nop_i(), nop_i()),
+        (0x40, 0x00, mov_m_gr_cr(2, 20), nop_i(), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (0x60, template, int(itc_d(18)), nop_i(), nop_i()),
+        (0x70, 0x10, nop_m(), nop_i(), br_cond(0x70, 0x70)),
+    ], {
+        "exception": IA64_EXCP_ILLEGAL,
+        "fault_ip": 0x60,
+    }, entry=0x10)
+
+
+test_itc_d_mii_02_slot0_without_stop_is_illegal = \
+    _itc_d_mii_slot0_without_stop_is_illegal(
+        "itc_d_mii_02_slot0_without_stop_is_illegal", 0x02)
+
+test_itc_d_mii_03_slot0_without_stop_is_illegal = \
+    _itc_d_mii_slot0_without_stop_is_illegal(
+        "itc_d_mii_03_slot0_without_stop_is_illegal", 0x03)
+
+
 test_itc_i_m_unit_decode = require_registers("itc_i_m_unit_decode", [
     (0x10, *movl_mlx(18, 0x0010000004000661)),
     (0x20, *movl_mlx(19, 1 << 36)),
@@ -3319,7 +3350,7 @@ test_itc_i_m_unit_decode = require_registers("itc_i_m_unit_decode", [
      nop_i()),
     (0x50, 0x00, mov_m_gr_cr(0, 20), nop_i(),
      nop_i()),
-    (0x60, 0x00, itc_i(18), addl(31, 0x8430, 0),
+    (0x60, 0x08, itc_i(18), addl(31, 0x8430, 0),
      nop_i()),
     *rfi_to_gr(0x70, 19, 31),
     (0x4008430, 0x10, nop_m(), adds(31, 0x7b, 0),
@@ -3338,7 +3369,7 @@ test_itc_i_resumes_next_slot_after_tb_exit = require_registers(
          nop_i()),
         (0x40, 0x00, mov_m_gr_cr(0, 20), nop_i(),
          nop_i()),
-        (0x50, 0x00, itc_i(18), adds(31, 1, 0),
+        (0x50, 0x08, itc_i(18), adds(31, 1, 0),
          nop_i()),
         (0x60, 0x10, nop_m(), nop_i(),
          br_cond(0x60, 0x60)),
@@ -6311,6 +6342,63 @@ test_ptr_d_purge_completes_on_srlz_d = require_registers(
     }, entry=0x10)
 
 
+test_ptc_g_source_purge_precedes_same_bundle_srlz_d = require_registers(
+    "ptc_g_source_purge_precedes_same_bundle_srlz_d", [
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
+        (0x20, *movl_mlx(20, HIGH_TR_BASE)),
+        (0x30, 0x00, adds(7, 0x68, 0), nop_i(), nop_i()),
+        (0x40, 0x00, mov_m_gr_cr(20, 20), nop_i(), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (0x60, 0x00, itc_d(18), nop_i(), nop_i()),
+        (0x70, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x80, *movl_mlx(2, HIGH_TR_BASE + 0x9000)),
+        (0x90, *movl_mlx(19, IA64_PSR_DT)),
+        (0xa0, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        # Warm the source vCPU's data soft-TLB before the global purge.
+        (0xb0, 0x00, ld8(30, 2), nop_i(), nop_i()),
+        # MMI template 0x0a has a stop after slot 0.  The following srlz.d
+        # is therefore a legal later instruction group in the same bundle.
+        (0xc0, 0x08, ptc_g(20, 7), srlz_d(), nop_i()),
+        (0xd0, 0x00, tak(31, 20), nop_i(), nop_i()),
+        (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xe0)),
+        ITC_DATA_BUNDLE,
+    ], {
+        "ip": 0xe0,
+        "exception": IA64_EXCP_NONE,
+        "r30": ITC_DATA_LOW,
+        # TAK returns one when the completed source purge removed the TC.
+        "r31": 1,
+    }, entry=0x10, alat=None, smp="2")
+
+
+test_ptc_ga_clears_source_alat = require_registers(
+    "ptc_ga_clears_source_alat", [
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
+        (0x20, *movl_mlx(20, HIGH_TR_BASE)),
+        (0x30, 0x00, adds(7, 0x68, 0), nop_i(), nop_i()),
+        (0x40, 0x00, mov_m_gr_cr(20, 20), nop_i(), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+        (0x60, 0x00, itc_d(18), nop_i(), nop_i()),
+        (0x70, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x80, *movl_mlx(2, HIGH_TR_BASE + 0x9000)),
+        (0x90, *movl_mlx(19, IA64_PSR_DT)),
+        (0xa0, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0xb0, 0x00, ld8_a(31, 2), nop_i(), nop_i()),
+        (0xc0, *movl_mlx(31, 0x55)),
+        (0xd0, 0x00, ptc_ga(20, 7), nop_i(), nop_i()),
+        # The source translation is pending until srlz.d, so ld8.c can
+        # distinguish a cleared source ALAT entry by reloading memory.
+        (0xe0, 0x00, ld8_c_clr(31, 2), nop_i(), nop_i()),
+        (0xf0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x100, 0x10, nop_m(), nop_i(), br_cond(0x100, 0x100)),
+        ITC_DATA_BUNDLE,
+    ], {
+        "ip": 0x100,
+        "exception": IA64_EXCP_NONE,
+        "r31": ITC_DATA_LOW,
+    }, entry=0x10)
+
+
 test_ptr_d_purge_invalidates_advanced_load = require_registers(
     "ptr_d_purge_invalidates_advanced_load", [
         (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
@@ -6353,6 +6441,128 @@ test_ptr_d_purge_invalidates_advanced_load = require_registers(
         "exception": IA64_EXCP_NONE,
         "r29": 0x73,
     }, entry=0x10)
+
+
+test_ptr_d_purge_invalidates_warm_speculative_load = require_registers(
+    "ptr_d_purge_invalidates_warm_speculative_load", [
+        (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
+        (0x20, *movl_mlx(20, HIGH_TR_BASE)),
+        (0x30, 0x00, adds(7, 0x68, 0), adds(5, 5, 0),
+         nop_i()),
+        (0x40, 0x00, mov_m_gr_cr(7, 21), nop_i(),
+         nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(20, 20), nop_i(),
+         nop_i()),
+        (0x60, 0x00, itr_d(5, 18), nop_i(),
+         nop_i()),
+        (0x70, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x80, *movl_mlx(2, HIGH_TR_BASE + 0x9000)),
+        (0x90, *movl_mlx(3, HIGH_TR_BASE)),
+        # Keep PSR.ic clear so the post-purge speculative miss must defer.
+        (0xa0, *movl_mlx(19, IA64_PSR_DT)),
+        (0xb0, 0x00, mov_gr_psr_full(19), nop_i(),
+         nop_i()),
+        (0xc0, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        # Install a direct LOAD comparator and its WB/speculative attributes.
+        (0xd0, 0x00, ld8(30, 2), nop_i(),
+         nop_i()),
+        (0xe0, 0x00, ptr_d(3, 7), nop_i(),
+         nop_i()),
+        (0xf0, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        # The completed purge must prevent the no-fill shortcut from seeing
+        # the old comparator.  The current architectural lookup is a miss.
+        (0x100, 0x00, ld8_s(31, 2), nop_i(),
+         nop_i()),
+        (0x110, 0x10, nop_m(), nop_i(),
+         br_cond(0x110, 0x110)),
+        ITC_DATA_BUNDLE,
+    ], {
+        "ip": 0x110,
+        "exception": IA64_EXCP_NONE,
+        "r30": ITC_DATA_LOW,
+        "r30_nat": 0,
+        "r31": 0,
+        "r31_nat": 1,
+    }, entry=0x10)
+
+
+_SPEC_RID_A = 0x123
+_SPEC_RID_B = 0x124
+_SPEC_RR_A = (_SPEC_RID_A << 8) | (16 << 2)
+_SPEC_RR_B = (_SPEC_RID_B << 8) | (16 << 2)
+_SPEC_RID_NEW_BUNDLE = (0x509000, 0x00, 0x1122334455667788, 0, 0)
+_SPEC_RID_NEW_LOW, _ = bundle_words(*_SPEC_RID_NEW_BUNDLE[1:])
+
+test_speculative_load_refills_after_region_rid_switch = require_registers(
+    "speculative_load_refills_after_region_rid_switch", [
+        (0x10, *movl_mlx(20, HIGH_TR_BASE)),
+        (0x20, *movl_mlx(23, _SPEC_RR_A)),
+        (0x30, 0x00, mov_rr_write(23, 20), nop_i(),
+         nop_i()),
+        (0x40, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x50, *movl_mlx(18, 0x400000 | DTR_PTE_WB)),
+        (0x60, *movl_mlx(19, HIGH_TR_BASE)),
+        (0x70, 0x00, mov_m_gr_cr(19, 20), adds(21, 16 << 2, 0),
+         nop_i()),
+        (0x80, 0x00, mov_m_gr_cr(21, 21), adds(10, 4, 0),
+         nop_i()),
+        (0x90, 0x00, itr_d(10, 18), nop_i(),
+         nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+
+        (0xb0, *movl_mlx(24, _SPEC_RR_B)),
+        (0xc0, 0x00, mov_rr_write(24, 20), nop_i(),
+         nop_i()),
+        (0xd0, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0xe0, *movl_mlx(18, 0x500000 | DTR_PTE_WB)),
+        (0xf0, 0x00, mov_m_gr_cr(19, 20), adds(10, 5, 0),
+         nop_i()),
+        (0x100, 0x00, itr_d(10, 18), nop_i(),
+         nop_i()),
+        (0x110, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+
+        # Warm the direct soft-TLB entry under RID A with a zero-valued page.
+        (0x120, 0x00, mov_rr_write(23, 20), nop_i(),
+         nop_i()),
+        (0x130, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x140, *movl_mlx(2, HIGH_TR_BASE + 0x9000)),
+        (0x150, *movl_mlx(22, IA64_PSR_DT)),
+        (0x160, 0x00, mov_gr_psr_full(22), nop_i(),
+         nop_i()),
+        (0x170, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x180, 0x00, ld8(30, 2), nop_i(),
+         nop_i()),
+
+        # RR writes must discard the same-VA RID-A host entry.  The
+        # speculative load must therefore resolve RID B and read its page.
+        (0x190, 0x00, mov_rr_write(24, 20), nop_i(),
+         nop_i()),
+        (0x1a0, 0x00, srlz_d(), nop_i(),
+         nop_i()),
+        (0x1b0, 0x00, ld8_s(31, 2), nop_i(),
+         nop_i()),
+        (0x1c0, 0x10, nop_m(), nop_i(),
+         br_cond(0x1c0, 0x1c0)),
+        (0x409000, 0x00, 0, 0, 0),
+        _SPEC_RID_NEW_BUNDLE,
+    ], {
+        "ip": 0x1c0,
+        "exception": IA64_EXCP_NONE,
+        "r30": 0,
+        "r30_nat": 0,
+        "r31": _SPEC_RID_NEW_LOW,
+        "r31_nat": 0,
+    }, entry=0x10)
+
 
 test_interruption_serializes_pending_ptr_d = require_registers(
     "interruption_serializes_pending_ptr_d", [
@@ -7667,6 +7877,8 @@ CASE_NAMES = (
     'itc_d_replaces_full_tc',
     'itc_d_uses_source_pte_and_cr_ifa',
     'itc_d_virtual_stack_local_passed_as_high_sol_output',
+    'itc_d_mii_02_slot0_without_stop_is_illegal',
+    'itc_d_mii_03_slot0_without_stop_is_illegal',
     'itc_i_m_unit_decode',
     'itc_i_present_reserved_pte_field_fault',
     'itc_i_resumes_next_slot_after_tb_exit',
@@ -7764,6 +7976,8 @@ CASE_NAMES = (
     'probe_w_register_level_nat_consumption',
     'ptc_e_nat_addr_consumes',
     'ptc_e_purges_data_tc_on_srlz_i',
+    'ptc_g_source_purge_precedes_same_bundle_srlz_d',
+    'ptc_ga_clears_source_alat',
     'ptc_l_4g_page_size_is_purgeable',
     'ptc_l_does_not_clear_local_alat',
     'ptc_l_keeps_nonoverlapping_tc',
@@ -7772,6 +7986,7 @@ CASE_NAMES = (
     'ptr_d_nat_size_consumes',
     'ptr_d_purge_completes_on_srlz_d',
     'ptr_d_purge_invalidates_advanced_load',
+    'ptr_d_purge_invalidates_warm_speculative_load',
     'ptr_i_preserves_non_overlapping_itr',
     'ptr_i_purges_matching_itr_by_address',
     'region6_high_dtr_tpa_decode',
@@ -7813,6 +8028,7 @@ CASE_NAMES = (
     'short_vhpt_walker_rejects_pending_table_purge',
     'speculative_deferred_access_bit_yields_to_data_debug',
     'speculative_load_defers_region6_vhpt_not_present',
+    'speculative_load_refills_after_region_rid_switch',
     'speculative_load_walks_short_vhpt_with_ic_clear',
     'speculative_recovery_dcr_da_defers_access_bit',
     'speculative_recovery_dcr_dd_defers_data_debug',

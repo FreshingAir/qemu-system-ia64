@@ -148,6 +148,18 @@ uint64_t helper_speculative_probe(CPUIA64State *env, uint64_t va,
     return result;
 }
 
+uint64_t helper_speculative_int_probe(CPUIA64State *env, uint64_t va,
+                                      uint32_t size)
+{
+    uint64_t result = ia64_mmu_speculative_int_probe(env, va, size);
+
+    if (!result) {
+        trace_ia64_speculative_probe_defer(
+            env_cpu(env)->cpu_index, env->ip, va, size);
+    }
+    return result;
+}
+
 uint64_t helper_advanced_load_allowed(CPUIA64State *env, uint64_t va)
 {
     return ia64_mmu_advanced_load_allowed(env, va);

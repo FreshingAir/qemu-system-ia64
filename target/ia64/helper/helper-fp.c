@@ -10,6 +10,11 @@ void helper_fpswa_dispatch(CPUIA64State *arg0)
     ia64_fp_fpswa_dispatch(arg0, GETPC());
 }
 
+void helper_sync_rotating_fr(CPUIA64State *arg0)
+{
+    ia64_sync_rotating_fr(arg0);
+}
+
 void helper_fadd(CPUIA64State *arg0, uint32_t arg1, uint32_t arg2,
                  uint32_t arg3, uint32_t arg4)
 {

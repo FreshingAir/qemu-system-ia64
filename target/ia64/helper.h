@@ -79,6 +79,7 @@ DEF_HELPER_FLAGS_2(read_ibr, TCG_CALL_NO_RWG_SE, i64, env, i32)
 DEF_HELPER_3(write_ibr, void, env, i32, i64)
 DEF_HELPER_1(pal_dispatch, i32, env)
 DEF_HELPER_1(fpswa_dispatch, void, env)
+DEF_HELPER_1(sync_rotating_fr, void, env)
 DEF_HELPER_2(firmware_debug_enter, i32, env, i64)
 DEF_HELPER_1(firmware_debug_save, i32, env)
 DEF_HELPER_1(firmware_debug_restore, i32, env)
@@ -125,6 +126,8 @@ DEF_HELPER_FLAGS_5(check_alignment, TCG_CALL_NO_WG,
                    void, env, i64, i32, i64, i64)
 DEF_HELPER_FLAGS_6(speculative_probe, TCG_CALL_NO_WG,
                    i64, env, i64, i32, i32, i32, i32)
+DEF_HELPER_FLAGS_3(speculative_int_probe, TCG_CALL_NO_WG,
+                   i64, env, i64, i32)
 DEF_HELPER_FLAGS_1(itc_read, TCG_CALL_NO_RWG, i64, env)
 DEF_HELPER_2(tak, i64, env, i64)
 DEF_HELPER_FLAGS_2(thash, TCG_CALL_NO_RWG_SE, i64, env, i64)

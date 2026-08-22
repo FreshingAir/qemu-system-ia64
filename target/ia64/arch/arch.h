@@ -55,6 +55,8 @@ uint64_t ia64_mmu_speculative_probe(CPUIA64State *env, uint64_t va,
                                     uint32_t is_write, uint32_t is_ifetch,
                                     uint32_t debug_size,
                                     uint32_t alignment_info);
+uint64_t ia64_mmu_speculative_int_probe(CPUIA64State *env, uint64_t va,
+                                        uint32_t size);
 uint64_t ia64_mmu_advanced_load_allowed(CPUIA64State *env, uint64_t va);
 uint64_t ia64_mmu_tak(CPUIA64State *env, uint64_t va);
 uint64_t ia64_mmu_thash(CPUIA64State *env, uint64_t va);

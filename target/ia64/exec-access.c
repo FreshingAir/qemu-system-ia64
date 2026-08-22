@@ -318,6 +318,28 @@ bool ia64_exec_advanced_load_allowed(CPUIA64State *env, uint64_t addr,
     return full->extra.ia64.speculation != IA64_MEM_NON_SPECULATIVE;
 }
 
+bool ia64_exec_cached_load_translation(
+    CPUIA64State *env, uint64_t addr, int mmu_idx,
+    IA64CachedLoadTranslation *translation)
+{
+    CPUTLBEntryFull *full;
+    bool from_victim;
+
+    if (!tlb_lookup_full_no_fill(env, addr, MMU_DATA_LOAD, mmu_idx, &full,
+                                 &from_victim)) {
+        return false;
+    }
+
+    *translation = (IA64CachedLoadTranslation) {
+        .phys_page = full->phys_addr,
+        .speculation = full->extra.ia64.speculation,
+        .memory_attribute = full->extra.ia64.memory_attribute,
+        .prot = full->prot,
+        .from_victim = from_victim,
+    };
+    return true;
+}
+
 bool ia64_exec_debug_read(CPUState *cs, uint64_t addr, void *buffer,
                           size_t size)
 {
