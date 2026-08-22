@@ -4270,6 +4270,18 @@ static void uart_putc(char c)
     *fw_uart_reg(UART_THR) = (UINT8)c;
 }
 
+static void uart_putc_paced(char c)
+{
+    if (fw_data_translation_enabled()) {
+        return;
+    }
+
+    while ((*fw_uart_reg(UART_LSR) & UART_LSR_THRE) == 0) {
+        __asm__ volatile ("hint @pause" : : : "memory");
+    }
+    *fw_uart_reg(UART_THR) = (UINT8)c;
+}
+
 static BOOLEAN uart_can_read(void)
 {
     return (*fw_uart_reg(UART_LSR) & UART_LSR_DR) != 0;
@@ -4925,9 +4937,9 @@ EFI_STATUS efi_conout_string(VOID *This, CHAR16 *String)
         if (*String <= 0x7fU) {
             char c = (char)(*String & 0xFF);
             if (c == '\n') {
-                uart_putc('\r');
+                uart_putc_paced('\r');
             }
-            uart_putc(c);
+            uart_putc_paced(c);
         }
         text_put_char(*String);
         String++;
@@ -4991,7 +5003,10 @@ EFI_STATUS efi_conout_set_attribute(VOID *This, UINTN Attribute)
 EFI_STATUS efi_conout_clear_screen(VOID *This)
 {
     (void)This;
-    uart_puts("\n\n");
+    uart_putc_paced('\r');
+    uart_putc_paced('\n');
+    uart_putc_paced('\r');
+    uart_putc_paced('\n');
     text_clear_screen();
     return EFI_SUCCESS;
 }
