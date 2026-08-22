@@ -67,6 +67,11 @@ static Notifier mouse_mode_notifier;
 #define SDL_HINT_RENDER_BATCHING "SDL_RENDER_BATCHING"
 #endif
 
+/* introduced in SDL 2.24.0 */
+#ifndef SDL_HINT_WINDOWS_DPI_AWARENESS
+#define SDL_HINT_WINDOWS_DPI_AWARENESS "SDL_WINDOWS_DPI_AWARENESS"
+#endif
+
 static void sdl_update_caption(struct sdl2_console *scon);
 
 static struct sdl2_console *get_scon_from_window(uint32_t window_id)
@@ -888,6 +893,16 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     char *dir;
 
     assert(o->type == DISPLAY_TYPE_SDL);
+
+#ifdef SDL_VIDEO_DRIVER_WINDOWS
+    /*
+     * Prevent Windows from bitmap-scaling SDL windows, which makes the guest
+     * display blurry on monitors using high-DPI scaling.  Default priority
+     * preserves an explicit SDL_WINDOWS_DPI_AWARENESS environment setting.
+     */
+    SDL_SetHintWithPriority(SDL_HINT_WINDOWS_DPI_AWARENESS,
+                            "permonitorv2", SDL_HINT_DEFAULT);
+#endif
 
     if (SDL_GetHintBoolean("QEMU_ENABLE_SDL_LOGGING", SDL_FALSE)) {
         SDL_LogSetAllPriority(SDL_LOG_PRIORITY_VERBOSE);
