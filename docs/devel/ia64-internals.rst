@@ -110,11 +110,12 @@ Tests and adding instructions
 -----------------------------
 
 The architectural microprogram registry contains typed ``IA64Case`` objects.
-Every case has a single family, coverage tags, specification references,
-required features, independent encoding/expectation evidence, and explicit
-observation metadata.  The registry validates the preserved case-ID manifest
-and lints structured bundle data.  Instruction encoders follow the translator
-boundaries in ``encoding_branch.py``, ``encoding_integer.py``,
+Each case is registered in exactly one family and contains an executable
+runner, optional structured bundles, and expected architectural state.  The
+registry validates the preserved case-ID manifest and lints structured bundle
+data.  Instruction encoders follow the translator boundaries in
+``encoding_branch.py``,
+``encoding_integer.py``,
 ``encoding_system.py``, ``encoding_memory.py``, ``encoding_fp.py``, and
 ``encoding_simd.py``; ``encoding.py`` remains a compatibility facade and the
 cross-family microprogram harness.

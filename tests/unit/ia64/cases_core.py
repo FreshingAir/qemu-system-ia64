@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseEvidence, CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     HIGH_TR_BASE,
     IA64_EXCP_BREAK,
@@ -698,8 +698,8 @@ test_cmp_ne_and_parallel_semantics = require_registers(
         "pr_mask": 1 | (1 << 16) | (1 << 17),
     }, entry=0x10)
 
-test_ws2003_compare_update_decode = require_registers(
-    "ws2003_compare_update_decode", [
+test_compare_update_decode = require_registers(
+    "compare_update_decode", [
         (0x10, *movl_mlx(10, 0x100000005)),
         (0x20, *movl_mlx(9, 0x200000005)),
         (0x30, 0x00, adds(16, 1, 0), adds(17, -1, 0),
@@ -3634,15 +3634,7 @@ CASE_NAMES = (
     'vmsw1_montecito_virtualization_fault',
     'vmsw_cpl3_madison_illegal_operation',
     'vmsw_cpl3_montecito_privileged_operation',
-    'ws2003_compare_update_decode',
+    'compare_update_decode',
 )
 
-CASE_METADATA = {
-}
-
-CASE_ALIASES = {
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())

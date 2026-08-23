@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     DTR_PTE_UC,
     DTR_PTE_WB,
@@ -5891,21 +5891,4 @@ CASE_NAMES = (
     'unimplemented_physical_instruction_traps',
 )
 
-CASE_METADATA = {
-    'async_timer_interrupt_enters_ivt': CaseMetadata(nonterminal_effect_loop=True),
-    'async_timer_interrupt_preserves_bank1_grs': CaseMetadata(nonterminal_effect_loop=True),
-    'async_timer_interrupt_records_boundary_ri': CaseMetadata(nonterminal_effect_loop=True),
-    'future_itm_rearm_preserves_pended_timer_irr': CaseMetadata(nonterminal_effect_loop=True),
-    'invalid_itv_vector_is_ignored': CaseMetadata(nonterminal_effect_loop=True),
-    'masked_itv_discards_due_timer': CaseMetadata(nonterminal_effect_loop=True),
-    'masking_itv_preserves_pended_timer_irr': CaseMetadata(nonterminal_effect_loop=True),
-    'past_itm_does_not_fire': CaseMetadata(nonterminal_effect_loop=True),
-    'rfi_target_rse_fill_fault_uses_restored_psr': CaseMetadata(nonterminal_effect_loop=True),
-}
-
-CASE_ALIASES = {
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())

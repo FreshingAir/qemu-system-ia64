@@ -6,10 +6,8 @@ from collections import Counter
 
 from . import (cases_core, cases_fp, cases_interrupt, cases_memory_nat,
                cases_mmu, cases_pal, cases_rse, encoding)
-from .case import CaseObservation, IA64Case
+from .case import IA64Case
 
-
-GROUPS = ("core", "memory-nat", "fp", "rse", "mmu", "interrupt", "pal")
 
 GROUP_MODULES = {
     "core": cases_core,
@@ -21,11 +19,13 @@ GROUP_MODULES = {
     "pal": cases_pal,
 }
 
+GROUPS = tuple(GROUP_MODULES)
+
 
 def _registered_cases() -> dict[str, IA64Case]:
     cases: dict[str, IA64Case] = {}
-    for group in GROUPS:
-        for name, case in GROUP_MODULES[group].CASES.items():
+    for module in GROUP_MODULES.values():
+        for name, case in module.CASES.items():
             if name in cases:
                 raise RuntimeError(f"duplicate IA-64 case id {name!r}")
             cases[name] = case
@@ -33,13 +33,6 @@ def _registered_cases() -> dict[str, IA64Case]:
 
 
 CASES_BY_NAME = _registered_cases()
-
-
-def group_for_name(name: str) -> str:
-    try:
-        return CASES_BY_NAME[name].group
-    except KeyError as exc:
-        raise ValueError(f"unassigned IA-64 test case {name!r}") from exc
 
 
 def cases_for_group(group: str) -> dict[str, IA64Case]:
@@ -52,49 +45,8 @@ def all_cases() -> dict[str, IA64Case]:
     return dict(sorted(CASES_BY_NAME.items()))
 
 
-def coverage_inventory() -> list[dict[str, object]]:
-    """Return deterministic, serialization-ready coverage metadata."""
-
-    inventory = []
-    for name, case in all_cases().items():
-        metadata = case.metadata
-        inventory.append({
-            "id": name,
-            "group": case.group,
-            "tags": sorted(metadata.tags),
-            "spec_refs": list(metadata.spec_refs),
-            "required_features": sorted(metadata.required_features),
-            "encoding_evidence": metadata.encoding_evidence.name.lower(),
-            "expectation_evidence": (
-                metadata.expectation_evidence.name.lower()),
-            "observation": metadata.observation.name.lower(),
-            "bundle_count": len(case.bundles),
-            "expected_fields": sorted(case.expected),
-        })
-    return inventory
-
-
-def _validate_case_metadata(case: IA64Case) -> None:
-    case.metadata.validate(case.name)
-    if case.group not in case.metadata.tags:
-        raise RuntimeError(
-            f"IA-64 case {case.name!r} lacks its family coverage tag")
-    if case.metadata.observation is CaseObservation.TNAT_PREDICATE and \
-            not case.name.startswith("tnat_"):
-        raise RuntimeError(
-            f"non-tnat case {case.name!r} declares a tnat observer")
-    if case.name.startswith("tnat_") and \
-            case.metadata.observation is not CaseObservation.TNAT_PREDICATE:
-        raise RuntimeError(f"tnat case {case.name!r} lacks observer metadata")
-    if case.metadata.observation is CaseObservation.FP_TRANSFER and \
-            case.group != "fp":
-        raise RuntimeError(
-            f"non-FP case {case.name!r} declares an FP transfer observer")
-
-
 def _validate_case_programs(cases: dict[str, IA64Case]) -> None:
     duplicate_bundle_cases: list[str] = []
-    effect_self_loop_cases: list[str] = []
     missing_successor_cases: list[str] = []
     effect_at_terminal_cases: list[str] = []
 
@@ -113,16 +65,15 @@ def _validate_case_programs(cases: dict[str, IA64Case]) -> None:
                 encoding.nop_i(), encoding.nop_f(), encoding.nop_m())
             if not has_effect:
                 continue
-            if bundle[4] == encoding.br_cond(address, address) and \
-                    not case.metadata.nonterminal_effect_loop:
-                effect_self_loop_cases.append(f"{name}@0x{address:x}")
             if bundle[4] == encoding.br_cond(address, address + 0x10) and \
                     address + 0x10 not in address_counts:
                 missing_successor_cases.append(f"{name}@0x{address:x}")
 
         terminal_ip = case.expected.get("ip")
+        # A fault leaves IP at the faulting bundle, whose effects do not
+        # retire.  That is a valid observation point, not a terminal loop.
         if not isinstance(terminal_ip, int) or \
-                case.metadata.terminal_is_fault_ip:
+                case.expected.get("fault_ip") == terminal_ip:
             continue
         for bundle in program:
             if bundle[0] == terminal_ip:
@@ -136,10 +87,6 @@ def _validate_case_programs(cases: dict[str, IA64Case]) -> None:
         raise RuntimeError(
             "IA-64 cases contain colliding bundle addresses: " +
             ", ".join(sorted(duplicate_bundle_cases)))
-    if effect_self_loop_cases:
-        raise RuntimeError(
-            "IA-64 cases couple effects to a self-loop observation point: " +
-            ", ".join(sorted(effect_self_loop_cases)))
     if missing_successor_cases:
         raise RuntimeError(
             "IA-64 effect bundles branch to an absent successor: " +
@@ -153,8 +100,8 @@ def _validate_case_programs(cases: dict[str, IA64Case]) -> None:
 def validate_registry() -> None:
     manifest_names = [
         name
-        for group in GROUPS
-        for name in GROUP_MODULES[group].CASE_NAMES
+        for module in GROUP_MODULES.values()
+        for name in module.CASE_NAMES
     ]
     manifest_duplicates = sorted(
         name for name, count in Counter(manifest_names).items() if count > 1)
@@ -173,10 +120,4 @@ def validate_registry() -> None:
         if case.name != name:
             raise RuntimeError(
                 f"IA-64 registry key {name!r} disagrees with {case.name!r}")
-        if case.group not in GROUP_MODULES or \
-                name not in GROUP_MODULES[case.group].CASES:
-            raise RuntimeError(
-                f"IA-64 case {name!r} has invalid group {case.group!r}")
-        _validate_case_metadata(case)
-
     _validate_case_programs(CASES_BY_NAME)

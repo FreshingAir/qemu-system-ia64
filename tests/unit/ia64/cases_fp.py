@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     ADV_UC_LOAD_BUNDLE,
     ADV_UC_LOAD_DATA,
@@ -3966,7 +3966,7 @@ test_fprsqrta_simd_high_lane_fault_isr = require_registers(
         "ar_fpsr": 0x33e,
     }, entry=0x10)
 
-test_w2k_fp_s1_pred_false_decode = require_registers("w2k_fp_s1_pred_false_decode", [
+test_fp_s1_pred_false_decode = require_registers("fp_s1_pred_false_decode", [
     (0x10, 0x1c, nop_m(), fnma_s1(7, 9, 6, 1, qp=6),
      nop_b()),
     (0x20, 0x0d, nop_m(), fmpy_s1(10, 8, 6, qp=6),
@@ -4978,7 +4978,7 @@ test_fand_f1_illegal_operation = require_exception(
         (0x10, 0x0d, nop_m(), fand(1, 0, 1), nop_i()),
     ], IA64_EXCP_ILLEGAL, fault_ip=0x10)
 
-test_w2k_frcpa_capacity_calc = require_registers("w2k_frcpa_capacity_calc", [
+test_frcpa_capacity_calc = require_registers("frcpa_capacity_calc", [
     (0x10, 0x00, addl(24, 0x230, 0), adds(25, 0x28, 0),
      nop_i()),
     (0x20, 0x09, setf_sig(8, 24), setf_sig(9, 25),
@@ -5046,8 +5046,8 @@ test_coreutils_hash_bucket_float_division = require_registers(
         "exception": IA64_EXCP_NONE,
     }, entry=0x10)
 
-test_ws2003_vga_frcpa_integer_division = require_registers(
-    "ws2003_vga_frcpa_integer_division", [
+test_frcpa_integer_division = require_registers(
+    "frcpa_integer_division", [
         (0x10, *movl_mlx(26, 0x3f800040)),
         (0x20, 0x00, addl(24, 400, 0), adds(25, 12, 0),
          nop_i()),
@@ -6060,109 +6060,14 @@ CASE_NAMES = (
     'stfs_natval_consumption',
     'stfs_stfd_convert_register_format',
     'umodsi3_hash_remainder',
-    'w2k_fp_s1_pred_false_decode',
-    'w2k_frcpa_capacity_calc',
-    'ws2003_vga_frcpa_integer_division',
+    'fp_s1_pred_false_decode',
+    'frcpa_capacity_calc',
+    'frcpa_integer_division',
     'xma_fcvt_xf_read_architected_significand',
     'xma_h_decode',
     'xma_hu_decode',
     'xma_natval_propagates',
 )
 
-CASE_METADATA = {
-    'data_big_endian_ldfe_stfe': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'data_big_endian_stf_spill_ldf_fill': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'disabled_fp_store_sets_isr_w': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_00': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_01': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_02': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_03': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_04': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_05': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_06': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_07': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_08': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_09': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_10': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_11': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_12': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_13': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_14': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_15': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_16': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_17': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_18': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_19': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_20': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_21': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_22': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary32_23': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_00': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_01': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_02': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_03': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_04': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_05': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_06': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_07': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_08': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_09': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_10': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_11': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_12': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_13': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_14': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_15': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_16': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_17': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_18': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_19': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_20': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_21': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_22': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'fpmodel_binary64_23': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'getf_exact_register_format_translation': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'getf_exp_after_fnorm_sig': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'getf_natval_sets_gr_nat': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'getf_sig_ignored_bits_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_a_chk_a_f_hit': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_a_uc_zeroes_target_and_skips_alat': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_c_nc_hit_consumes_nat_base': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_c_nc_hit_preserves_target': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_f1_illegal_operation': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_loads_integer_register_format': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf8_s_chk_s_f_defers_nat_base': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldf_fill_postinc_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfd_loads_double_memory_format': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfe_stfe_preserves_extended_payload': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfp8_postinc_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfp_requires_opposite_register_banks': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfps_expands_both_single_values': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfs_expands_single_memory_format': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'ldfs_preserves_single_nan_payload': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'setf_exp_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'setf_nat_source_sets_fr_natval': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'setf_sig_direct_scalar_operand': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'setf_sig_ignored_bits_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf8_natval_consumption': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf8_postinc_imm9_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf8_postinc_stores_setf_sig': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf8_stfe_convert_register_format': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf_spill_ldf_fill_preserves_sig': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf_spill_postinc_decode': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stf_spill_preserves_natval': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stfd_natval_consumption': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stfe_natval_consumption': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stfe_stores_extended_float': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stfs_natval_consumption': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-    'stfs_stfd_convert_register_format': CaseMetadata(observation=CaseObservation.FP_TRANSFER),
-}
-
-CASE_ALIASES = {
-}
-
 CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   extras=FP_REPRESENTATION_CASES,
-                   metadata=CASE_METADATA)
+                   extras=FP_REPRESENTATION_CASES)

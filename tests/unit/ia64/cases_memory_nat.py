@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseEvidence, CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     ADV_UC_LOAD_BUNDLE,
     ADV_UC_LOAD_DATA,
@@ -14,6 +14,7 @@ from .encoding import (
     ExpectedFP,
     HIGH_TR_BASE,
     IA64_ALT_DTLB_VECTOR,
+    IA64_ALT_ITLB_VECTOR,
     IA64_BREAK_VECTOR,
     IA64_EXCP_SINGLE_STEP,
     IA64_EXCP_ILLEGAL,
@@ -85,6 +86,7 @@ from .encoding import (
     flushrs_enc,
     invala,
     invala_e_gr,
+    itr_d,
     itr_i,
     ld1,
     ld16,
@@ -1680,8 +1682,101 @@ test_speculative_recovery_unaligned_defers = require_registers(
         "r31_nat": 1,
     }, entry=0x10)
 
-test_ws2003_cmd646_unaligned_check_load_sets_ed = require_registers(
-    "ws2003_cmd646_unaligned_check_load_sets_ed", [
+_SPLIT_TLB_CODE_VA = 0x000006fb7c447750
+_SPLIT_TLB_CODE_PAGE = _SPLIT_TLB_CODE_VA & ~0x1fff
+_SPLIT_TLB_CODE_PHYS_PAGE = 0x400000
+_SPLIT_TLB_CODE_PHYS = (
+    _SPLIT_TLB_CODE_PHYS_PAGE +
+    (_SPLIT_TLB_CODE_VA & 0x1fff)
+)
+_SPLIT_TLB_CODE_PTE = (
+    PTE_ED | _SPLIT_TLB_CODE_PHYS_PAGE | 0x661
+)
+
+# Use a fixed raw IA-64 bundle as the regression input.  Its ld8.sa accepts
+# an unaligned pointer, defers the Madison alignment fault through the code
+# PTE's ED bit, and produces a NaT for a later recovery load.  Warm the data
+# soft-TLB at the code VA before fetching it: an incorrectly shared I/D entry
+# grants execute permission, bypasses the modeled ITLB and loses the
+# code-page ED.  The Alternate ITLB handler is consequently reached only by
+# a correctly separated I/D soft-TLB and installs the instruction translation
+# used by the bundle.
+test_ld8_sa_instruction_ed_survives_data_soft_tlb_warmup = \
+    require_registers(
+        "ld8_sa_instruction_ed_survives_data_soft_tlb_warmup", [
+            # Keep the interruption vectors executable and the unaligned
+            # test pointer readable while translated execution is enabled.
+            # Every synthetic setup bundle ends its instruction group so
+            # register/control-register dependencies and the itr/srlz pairs
+            # obey SDM Vol. 2 section 3.2.2 serialization requirements.
+            (0x10, 0x05, *movl_mlx(17, PTE_ED | 0x661)[1:]),
+            (0x20, 0x05, *movl_mlx(20, 0)[1:]),
+            (0x30, 0x01, mov_m_gr_cr(20, 20), adds(7, 16 << 2, 0),
+             nop_i()),
+            (0x40, 0x01, mov_m_gr_cr(7, 21), adds(6, 6, 0), nop_i()),
+            (0x50, 0x01, itr_i(6, 17), nop_i(), nop_i()),
+            (0x60, 0x01, itr_d(6, 17), nop_i(), nop_i()),
+            (0x70, 0x01, srlz_i(), nop_i(), nop_i()),
+            (0x80, 0x01, srlz_d(), nop_i(), nop_i()),
+
+            # Install only the target's data translation, then touch its
+            # bytes as data to seed QEMU's shared soft-TLB comparator.
+            (0x90, 0x05,
+             *movl_mlx(18, _SPLIT_TLB_CODE_PTE)[1:]),
+            (0xa0, 0x05,
+             *movl_mlx(20, _SPLIT_TLB_CODE_PAGE)[1:]),
+            (0xb0, 0x01, mov_m_gr_cr(20, 20), adds(7, 13 << 2, 0),
+             nop_i()),
+            (0xc0, 0x01, mov_m_gr_cr(7, 21), adds(5, 5, 0), nop_i()),
+            (0xd0, 0x01, itr_d(5, 18), nop_i(), nop_i()),
+            (0xe0, 0x01, srlz_d(), nop_i(), nop_i()),
+            (0xf0, 0x05,
+             *movl_mlx(2, _SPLIT_TLB_CODE_VA)[1:]),
+            (0x100, 0x05, *movl_mlx(19, IA64_PSR_DT)[1:]),
+            (0x110, 0x01, mov_gr_psr_full(19), nop_i(), nop_i()),
+            (0x120, 0x01, srlz_d(), nop_i(), nop_i()),
+            (0x130, 0x00, ld8(8, 2), nop_i(), nop_i()),
+
+            (0x140, 0x01, nop_m(), alloc(2, 5, 4, 0, 0), nop_i()),
+            (0x150, 0x05, *movl_mlx(36, 0x105)[1:]),
+            (0x160, 0x05, *movl_mlx(
+                19, IA64_PSR_IC | IA64_PSR_IT |
+                IA64_PSR_DT | IA64_PSR_AC)[1:]),
+            (0x170, 0x05,
+             *movl_mlx(31, _SPLIT_TLB_CODE_VA)[1:]),
+            *rfi_to_gr(0x180, 19, 31),
+
+            raw_bundle(_SPLIT_TLB_CODE_PHYS,
+                       0x01d005801a515808, 0x5f000403e020f090),
+            (_SPLIT_TLB_CODE_PHYS + 0x10, 0x10,
+             nop_m(), nop_i(),
+             br_cond(_SPLIT_TLB_CODE_VA + 0x10,
+                     _SPLIT_TLB_CODE_VA + 0x10)),
+
+            # A split soft-TLB rejects the warmed data entry for execution,
+            # so service the expected initial instruction-translation miss.
+            (IA64_ALT_ITLB_VECTOR, 0x01,
+             mov_m_gr_cr(7, 21), nop_i(), nop_i()),
+            (IA64_ALT_ITLB_VECTOR + 0x10, 0x01,
+             itr_i(5, 18), nop_i(), nop_i()),
+            (IA64_ALT_ITLB_VECTOR + 0x20, 0x01,
+             srlz_i(), nop_i(), nop_i()),
+            (IA64_ALT_ITLB_VECTOR + 0x30, 0x10,
+             nop_m(), nop_i(), rfi_b()),
+            (IA64_UNALIGNED_VECTOR, 0x00, nop_m(), nop_i(), nop_i()),
+            (IA64_UNALIGNED_VECTOR + 0x10, 0x10,
+             nop_m(), nop_i(),
+             br_cond(IA64_UNALIGNED_VECTOR + 0x10,
+                     IA64_UNALIGNED_VECTOR + 0x10)),
+        ], {
+            "ip": _SPLIT_TLB_CODE_VA + 0x10,
+            "exception": IA64_EXCP_NONE,
+            "r8": 0x01d005801a515808,
+            "r29_nat": 1,
+        }, entry=0x10, cpu="madison")
+
+test_unaligned_check_load_sets_isr_ed = require_registers(
+    "unaligned_check_load_sets_isr_ed", [
         (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE | PTE_ED)),
         (0x20, 0x00, nop_m(), addl(3, 0x101, 0),
          nop_i()),
@@ -2858,10 +2953,9 @@ def test_ld2_bias_st2_raw_large_frame_sequence(qemu):
         (0x90, 0x10, nop_m(), nop_i(), bsw1()),
         (0xa0, *movl_mlx(22, 0x8000)),
 
-        # Preserve the original instruction words, template stops, and the
-        # unrelated speculative load around the 16-bit accounting update.
-        # Fourteen iterations match the number of live entries observed in
-        # the failing leaf table.
+        # Keep fixed instruction words, template stops, and an unrelated
+        # speculative load around the 16-bit accounting update.  Fourteen
+        # iterations exercise the large-frame loop.
         raw_bundle(0xb0, 0x093010882c00a80b, 0x0004000000420054),
         raw_bundle(0xc0, 0x067011882c4c0018, 0x2000000000207160),
         (0xd0, 0x11, nop_m(), nop_i(), br_cloop(0xd0, 0xb0)),
@@ -3373,6 +3467,7 @@ CASE_NAMES = (
     'ld8_s_d2_hint_decode',
     'ld8_s_uc_defers',
     'ld8_sa_failure_invalidates_old_entry',
+    'ld8_sa_instruction_ed_survives_data_soft_tlb_warmup',
     'ld_imm_postinc_same_target_illegal',
     'ld_postinc_same_target_predicated_false',
     'ld_reg_postinc_same_target_illegal',
@@ -3474,50 +3569,11 @@ CASE_NAMES = (
     'unimplemented_physical_load_merced_44bit',
     'unimplemented_physical_precludes_unaligned',
     'unimplemented_virtual_load_merced_54bit',
-    'ws2003_cmd646_unaligned_check_load_sets_ed',
+    'unaligned_check_load_sets_isr_ed',
     'xchg4_decode',
     'xchg4_result_base_alias_invalidates_alat',
     'zero_alat_check_load_always_reloads',
     'zero_alat_chk_a_always_branches',
 )
 
-CASE_METADATA = {
-    'firmware_alt_dtlb_nonspeculative_load_installs_identity_tc':
-        CaseMetadata(
-            expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-            tags=frozenset({'firmware-sal'}),
-            spec_refs=(
-                'itanium-system-abstraction-layer-specification.pdf: '
-                'sections 3.3.2.1 and 3.3.2.2',
-            ),
-            required_features=frozenset({'firmware-sal'}),
-        ),
-    'firmware_alt_dtlb_nonspeculative_load_faults': CaseMetadata(
-        expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-        tags=frozenset({'firmware-sal'}),
-        spec_refs=(
-            'itanium-system-abstraction-layer-specification.pdf: '
-            'section 3.3.1',
-        ),
-        required_features=frozenset({'firmware-sal'}),
-    ),
-    'firmware_alt_dtlb_speculative_load_defers': CaseMetadata(
-        expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-        tags=frozenset({'firmware-sal'}),
-        spec_refs=(
-            'itanium-system-abstraction-layer-specification.pdf: '
-            'section 3.3.1',
-        ),
-        required_features=frozenset({'firmware-sal'}),
-    ),
-    'tnat_nz_and_ignored_bits_decode': CaseMetadata(observation=CaseObservation.TNAT_PREDICATE),
-    'tnat_nz_or_decode': CaseMetadata(observation=CaseObservation.TNAT_PREDICATE),
-    'tnat_unc_same_pred_pred_false_illegal': CaseMetadata(observation=CaseObservation.TNAT_PREDICATE),
-}
-
-CASE_ALIASES = {
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())

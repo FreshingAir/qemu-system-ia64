@@ -13,7 +13,7 @@ from .fpmodel import (BINARY32_EDGE_VECTORS, BINARY64_EDGE_VECTORS,
                       deterministic_words, fnorm_setf_sig,
                       spill_to_binary32, spill_to_binary64)
 from .state import ExpectedBits, ExpectedFP, StateExpectation
-from .case import CaseMetadata, IA64Case
+from .case import IA64Case
 from .encoding_constants import *
 from .encoding_common import *
 from .encoding_branch import *
@@ -107,13 +107,9 @@ def require_qemu_failure(name, bundles, expected_substrings, entry=0x10,
         if missing:
             raise RuntimeError(
                 f"{name} failed: missing {missing!r}\n{output}")
-    features = {"negative-qemu-startup"}
-    if cpu is not None:
-        features.add(f"cpu-model:{cpu}")
     return IA64Case(
         name=name, runner=tc,
         bundles=tuple(tuple(bundle) for bundle in bundles),
-        metadata=CaseMetadata(required_features=frozenset(features)),
     )
 
 
@@ -159,20 +155,10 @@ def require_registers(name, bundles, expected, entry=0x10, alat="full",
         run_program(qemu, bundles, entry=entry, alat=alat,
                     expected=expected, name=name, cpu=cpu, smp=smp,
                     machine=machine)
-    features = set()
-    if alat is not None:
-        features.add(f"alat:{alat}")
-    if cpu is not None:
-        features.add(f"cpu-model:{cpu}")
-    if smp != "1":
-        features.add("smp")
-    if machine != "ia64-vpc":
-        features.add(f"machine:{machine}")
     return IA64Case(
         name=name, runner=tc,
         bundles=tuple(tuple(bundle) for bundle in bundles),
         expected=dict(expected),
-        metadata=CaseMetadata(required_features=frozenset(features)),
     )
 
 
@@ -246,14 +232,10 @@ def require_exception(name, bundles, excp, fault_ip=None, fault_imm=None,
         case_expected["fault_ip"] = fault_ip
     if fault_imm is not None:
         case_expected["fault_imm"] = fault_imm
-    features = {"alat:full"}
-    if cpu is not None:
-        features.add(f"cpu-model:{cpu}")
     return IA64Case(
         name=name, runner=tc,
         bundles=tuple(tuple(bundle) for bundle in bundles),
         expected=case_expected,
-        metadata=CaseMetadata(required_features=frozenset(features)),
     )
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseEvidence, CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     DTR_PTE_NATPAGE,
     DTR_PTE_UC,
@@ -1067,7 +1067,7 @@ test_probe_natpage_outranks_dirty_bit = natpage_priority_probe_test(
 
 # Data NaT Page Consumption reports ISR.ed as 0 even while the executing
 # code runs under an instruction translation whose PTE.ed is set, which
-# would otherwise set ISR.ed (see ws2003_cmd646_unaligned_check_load_sets_ed).
+# would otherwise set ISR.ed (see unaligned_check_load_sets_isr_ed).
 test_probe_natpage_reports_isr_ed_zero = require_registers(
     "probe_natpage_reports_isr_ed_zero", [
         (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE | PTE_ED)),
@@ -8115,68 +8115,4 @@ CASE_NAMES = (
     'system_vm_predicated_off_is_nop',
 )
 
-CASE_METADATA = {
-    'interruption_serializes_pending_ptr_d': CaseMetadata(nonterminal_effect_loop=True),
-    'itc_reserved_outranks_vm': CaseMetadata(terminal_is_fault_ip=True),
-    'itc_d_not_present_rejects_low_itir_reserved_field': CaseMetadata(terminal_is_fault_ip=True),
-    'itc_d_merced_main_tlb_capacity': CaseMetadata(
-        expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-        tags=frozenset({'cpu-model:merced', 'model-specific-tlb'}),
-        spec_refs=(
-            'Itanium-hardware-developer-manual-248701-002.pdf: '
-            'sections 2.5.6.1 and 2.5.6.2',
-        ),
-        required_features=frozenset({'cpu-model:merced'}),
-    ),
-    'itc_d_merced_dtlb1_micro_hit_updates_lru': CaseMetadata(
-        expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-        tags=frozenset({'cpu-model:merced', 'model-specific-tlb'}),
-        spec_refs=(
-            'Itanium-hardware-developer-manual-248701-002.pdf: '
-            'sections 2.5.6.1 and 2.5.6.2',
-        ),
-        required_features=frozenset({'cpu-model:merced'}),
-    ),
-    'itc_d_present_reserved_itir_field_fault': CaseMetadata(terminal_is_fault_ip=True),
-    'itc_d_present_reserved_ma_field_fault': CaseMetadata(terminal_is_fault_ip=True),
-    'itc_d_present_reserved_pte_field_fault': CaseMetadata(terminal_is_fault_ip=True),
-    'itc_i_present_reserved_pte_field_fault': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_d_madison_first_invalid_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_d_merced_first_invalid_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_d_reserved_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_i_8k_translation_uses_unrounded_paddr': CaseMetadata(nonterminal_effect_loop=True),
-    'itr_i_clear_accessed_raises_inst_access_bit': CaseMetadata(nonterminal_effect_loop=True),
-    'itr_i_madison_first_invalid_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_i_merced_first_invalid_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'itr_i_reserved_slot_faults': CaseMetadata(terminal_is_fault_ip=True),
-    'kr3_update_does_not_serialize_inflight_psr_ic':
-        CaseMetadata(nonterminal_effect_loop=True),
-    'ptr_i_purges_matching_itr_by_address': CaseMetadata(nonterminal_effect_loop=True),
-    'rsm_ic_inflight_dtlb_not_data_nested': CaseMetadata(nonterminal_effect_loop=True),
-    'sal_boot_nonstandard_direct_tc_is_purgeable_after_iva_handoff':
-        CaseMetadata(
-            expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-            tags=frozenset({
-                'external-guest-regression',
-                'firmware-loader-compatibility',
-                'nonstandard-platform-behavior',
-            }),
-            spec_refs=(
-                'itanium-system-abstraction-layer-specification.pdf: '
-                'sections 3.3.2.1 and 3.3.2.2 specify identity mappings only',
-                'IA-64 build 2600 setup-loader trace: RR7=0x135, '
-                '8 KiB pages, VA=PA+0x80000000',
-            ),
-            required_features=frozenset({'firmware-sal-loader-compatibility'}),
-        ),
-    'short_vhpt_walker_rejects_pending_table_purge': CaseMetadata(nonterminal_effect_loop=True),
-    'ssm_ic_inflight_dtlb_sets_ni': CaseMetadata(nonterminal_effect_loop=True),
-    'ssm_ic_inflight_short_vhpt_entry_miss_raises_vhpt': CaseMetadata(nonterminal_effect_loop=True),
-}
-
-CASE_ALIASES = {
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())

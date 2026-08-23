@@ -122,9 +122,8 @@ not from the translator implementation.  Reuse the encoder in the matching
 ``tests/unit/ia64/encoding_<family>.py`` module, give the program an explicit
 terminal loop, and define it in exactly one ``cases_*.py`` semantic test group.
 ``encoding.py`` is only the compatibility facade and shared microprogram
-harness.  The typed registry rejects missing or duplicate entries,
-and attaches coverage tags, specification references, and required emulator
-features to every case.
+harness.  The typed registry rejects missing or duplicate entries and lints
+structured bundle data.
 
 Arithmetic tests should assert the destination FR spill pair and FPSR
 directly.  Do not append ``getf`` or ``stf`` only to observe an arithmetic
@@ -135,9 +134,3 @@ predicated ``adds`` as an observer.
 The command below lists the registry without starting QEMU::
 
   python3 tests/unit/ia64/test_tcg_group.py --list
-
-The deterministic JSON coverage inventory is generated from the same typed
-registry, so it cannot drift from the executable case set::
-
-  python3 tests/unit/ia64/test_tcg_group.py --inventory \
-      > ia64-coverage.json

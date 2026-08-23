@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from .case import (CaseMetadata, CaseObservation, bind_cases)
+from .case import bind_cases
 from .encoding import (
     IA64_DBR_IMPLEMENTED_COUNT,
     IA64_IBR_IMPLEMENTED_COUNT,
@@ -2058,12 +2058,4 @@ CASE_NAMES = (
     'pal_vm_tr_read_rejects_first_non_tr',
 )
 
-CASE_METADATA = {
-}
-
-CASE_ALIASES = {
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())

@@ -38,12 +38,10 @@ bool ia64_firmware_boot_miss_mapping(IA64CPU *cpu, uint64_t va,
      *
      * SAL 3.0, sections 3.3.2.1 and 3.3.2.2, specify firmware-assisted
      * identity mappings (VA == PA).  They do not specify this PA + 2 GiB
-     * alias.  The alias was observed in an IA-64 build 2600 setup-loader
-     * trace, but no published loader or platform ABI defining it has been
-     * located.  It is therefore unclear whether it originated in historical
-     * platform firmware or in a private loader contract.
+     * alias.  The compatibility option deliberately provides behavior
+     * outside the published loader and platform ABIs.
      *
-     * Keep the observed behavior narrowly scoped to its exact RR state
+     * Keep the compatibility behavior narrowly scoped to its exact RR state
      * (region 7, RID 1, 8 KiB pages, VHPT disabled), only while the firmware
      * IVT owns misses, and only for installed low RAM.  The caller installs
      * an ordinary TC entry so architectural replacement and purge rules

@@ -795,7 +795,7 @@ static void test_int10_legacy_for_device(const char *extra_args)
     g_assert_cmphex(qtest_readw(qts, IA64_BDA_CHARACTER_HEIGHT), ==, 16);
     g_assert_cmphex(qtest_readb(qts, IA64_BDA_VIDEO_CONTROL), ==, 0x60);
 
-    /* Match bootvid.dll's planar write path and verify actual scanout. */
+    /* Exercise a planar byte-write path and verify actual scanout. */
     qtest_writeb(qts, IA64_VGA_LEGACY_BASE, 0xff);
     tmpdir = g_dir_make_tmp("ia64-int10-legacy-XXXXXX", &error);
     g_assert_no_error(error);

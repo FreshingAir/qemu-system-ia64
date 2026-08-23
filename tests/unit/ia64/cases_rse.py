@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import re
 
-from .case import (CaseEvidence, CaseMetadata, CaseObservation, IA64Case,
-                   bind_cases)
+from .case import IA64Case, bind_cases
 from .encoding import (
     CHECK_LOAD_DATA,
     DTR_PTE_UC,
@@ -2935,9 +2934,8 @@ test_rse_rfi_loadrs_preserves_caller_locals_after_nested_return = require_regist
 
 def _guest_frame_ld8_s_nested_switch_case(name, *, pte_flags, nat):
     bundles = [
-        # Reproduce the captured frame and load shape: SOF=26/SOL=23, with
-        # the function entry loaded into local r44 and the descriptor base
-        # postincremented in r42.
+        # Construct a SOF=26/SOL=23 frame with the function entry loaded into
+        # local r44 and the descriptor base postincremented in r42.
         # WB selects the successful load case; control-speculative loads on
         # UC memory defer into NaT for the companion recovery-path case.
         *dtr_setup_bundles(0x10, HIGH_TR_BASE, 0x400000,
@@ -2966,8 +2964,8 @@ def _guest_frame_ld8_s_nested_switch_case(name, *, pte_flags, nat):
         (0x120, 0x10, nop_m(), nop_i(), br_call(0, 0x120, 0x300)),
         (0x130, 0x10, nop_m(), nop_i(), br_cond(0x130, 0x130)),
 
-        # alloc keeps the inherited 26-register frame but changes SOL to the
-        # captured value 23.  At BOL=75, r44 maps to physical register
+        # alloc keeps the inherited 26-register frame but changes SOL to 23.
+        # At BOL=75, r44 maps to physical register
         # (75 + (44 - 32)) % 96 = 87.  Its backing-store address is
         # 0x100260 + 12*8 = 0x1002c0, bit 24 of the 0x1003f8 RNAT word.
         (0x300, 0x00, nop_m(), alloc(52, 26, 23, 0, 0),
@@ -2987,10 +2985,10 @@ def _guest_frame_ld8_s_nested_switch_case(name, *, pte_flags, nat):
         (0x500, 0x00, break_m(0x42), nop_i(), nop_i()),
         (0x510, 0x10, nop_m(), nop_i(), br_ret(0)),
 
-        # Match the captured context switch: quiesce the RSE, save BSP before
-        # flushrs and RNAT after it, execute alloc(0)+loadrs with loadrs=0 to
-        # invalidate the physical stack, then restore BSPSTORE/RNAT and lazy
-        # RSC mode.
+        # Exercise a complete context switch: quiesce the RSE, save BSP
+        # before flushrs and RNAT after it, execute alloc(0)+loadrs with
+        # loadrs=0 to invalidate the physical stack, then restore
+        # BSPSTORE/RNAT and lazy RSC mode.
         (IA64_BREAK_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
         (IA64_BREAK_VECTOR + 0x10, 0x00, nop_m(), adds(28, 0, 0),
          nop_i()),
@@ -3059,13 +3057,13 @@ test_rse_guest_frame_ld8_s_nat_survives_nested_switch = \
 
 def _guest_same_mfb_pressure_poison_case(
         name, *, context_remap, initial_bol=0, remap_delta=83):
-    """Strengthen a captured r41 failure into one deterministic RSE case.
+    """Exercise an r41 spill/fill failure shape deterministically.
 
-    The captured producer MFB contains ld8.s plus a direct call; the later
-    consumer MFB contains the indirect call.  Fusing ld8.s in slot 0 with
-    that indirect br.call in slot 2 deliberately strengthens the path; it is
-    not a byte-for-byte reproduction.  The observed outer
-    SOF/SOL=29/21 and producer callee SOF/SOL=15/9 are retained exactly.
+    The producer MFB contains ld8.s plus a direct call; the later consumer MFB
+    contains the indirect call.  Fusing ld8.s in slot 0 with that indirect
+    br.call in slot 2 deliberately strengthens the path.  The outer
+    SOF/SOL=29/21 and producer callee SOF/SOL=15/9 preserve the relevant
+    register-stack pressure.
     """
     sentinel = 0x123456789abcdef0
     descriptor = HIGH_TR_BASE
@@ -3088,7 +3086,7 @@ def _guest_same_mfb_pressure_poison_case(
     ]
     setup_target = 0x1090 if initial_bol else 0x10
     bol_seed_bundles = [] if initial_bol == 0 else [
-        # Establish the absolute BOL observed in the target process without
+        # Establish the selected absolute BOL without
         # retaining any registers from this bootstrap context.  BOL is not an
         # architected save field: cover advances it, and flushrs leaves the
         # physical stack fully invalid while preserving that absolute bias.
@@ -3116,19 +3114,19 @@ def _guest_same_mfb_pressure_poison_case(
         (0x60, *movl_mlx(20, callee)),
         (0x70, 0x01, nop_m(), mov_b_gr(7, 20), nop_i()),
 
-        # The captured outer frame maps virtual r41 offset 9 to physical
+        # The outer frame maps virtual r41 offset 9 to physical
         # (BOL+9)%96, whose backing-store home is 0x100088 independently of
-        # that physical bias.  The synthetic fused producer/indirect-call
-        # shape is intentionally stronger than the captured separated
-        # producer and consumer bundles.
+        # that physical bias.  The fused producer/indirect-call shape is
+        # intentionally stronger than separate producer and consumer
+        # bundles.
         (0x80, 0x00, alloc(43, 29, 21, 0, 0), nop_i(), nop_i()),
         (0x90, 0x10, nop_m(), adds(44, 0, 2),
          br_cond(0x90, 0x100)),
         (0x100, 0x1d, ld8_s_postinc(41, 44, 8), nop_f(),
          br_call_indirect(0, 7, wh=5, many=True)),
 
-        # The indirect callee inherits eight outputs, then takes the observed
-        # 15/9 frame.  Its b6 nested call advances BOL to 30 while leaving b0
+        # The indirect callee inherits eight outputs, then takes a 15/9
+        # frame.  Its b6 nested call advances BOL to 30 while leaving b0
         # intact for the eventual return to the outer frame.
         (callee, 0x00, alloc_m(39, 15, 9, 0, 0), nop_i(), nop_i()),
         (callee + 0x10, 0x10, nop_m(), nop_i(),
@@ -3305,9 +3303,6 @@ def _guest_same_mfb_pressure_poison_case(
         runner=run_and_check,
         bundles=tuple(tuple(bundle) for bundle in bundles),
         expected=expected,
-        metadata=CaseMetadata(required_features=frozenset({
-            "cpu-model:merced",
-        })),
     )
 
 
@@ -3343,8 +3338,8 @@ def _guest_helper_ld8_s_r41_nested_pressure_case(name, *, switch):
         for address, template, slot0, slot1, slot2 in dtr_bundles
     ]
     bundles = [
-        # Match the successful captured descriptor load: WB memory produces a
-        # valid, non-NaT entry point and postincrements the stacked base.
+        # A successful descriptor load from WB memory produces a valid,
+        # non-NaT entry point and postincrements the stacked base.
         *dtr_bundles,
         (0x70, 0x05, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DT)[1:]),
         (0x80, 0x0a, mov_gr_psr_full(2), srlz_d(), nop_i()),
@@ -3353,7 +3348,7 @@ def _guest_helper_ld8_s_r41_nested_pressure_case(name, *, switch):
         (0xb0, 0x05, *movl_mlx(13, lazy_user_rsc)[1:]),
         (0xc0, 0x00, mov_m_gr_ar(13, 16), nop_i(), nop_i()),
 
-        # The observed outer frame has SOF=19/SOL=13.  With reset BOL=0,
+        # The outer frame has SOF=19/SOL=13.  With reset BOL=0,
         # r41 is physical register 9 and its backing-store home is
         # 0x100088 (RNAT collection bit 17 in the word at 0x1001f8).
         (0xd0, 0x00, alloc(43, 19, 13, 0, 0), adds(10, 0, 0),
@@ -3365,7 +3360,7 @@ def _guest_helper_ld8_s_r41_nested_pressure_case(name, *, switch):
         (0x120, 0x00, nop_m(), adds(8, 0, 41), adds(9, 0, 35)),
 
         # AR.BSPSTORE is accessible only with RSC.mode=0.  Capture both
-        # backing-store pointers, then restore the observed lazy PL3 value.
+        # backing-store pointers, then restore the selected lazy PL3 value.
         (0x130, 0x00, mov_m_ar_gr(11, 17), nop_i(), nop_i()),
         (0x140, 0x01, mov_m_gr_ar(0, 16), nop_i(), nop_i()),
         (0x150, 0x00, mov_m_ar_gr(12, 18), nop_i(), nop_i()),
@@ -3464,7 +3459,7 @@ test_rse_guest_helper_ld8_s_r41_survives_nested_switch = \
 
 def _guest_bol82_switch_poison_case(name, *, switch_site,
                                          deferred=False):
-    """Reproduce captured cold-start BOL and partition geometry."""
+    """Construct the required cold-start BOL and partition geometry."""
     entry_value = 0x77cf16e0
     descriptor_gp = 0x78002000
     bsp_seed = 0x100038
@@ -3478,7 +3473,7 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
         raise ValueError("deferred guest case requires helper switches")
 
     # cover leaves BOL=5 for an interruption in the SOF=19 outer frame and
-    # BOL=19 for the observed SOF=11 child.  Grow a temporary frame
+    # BOL=19 for the SOF=11 child.  Grow a temporary frame
     # far enough that the selected virtual register maps to physical r91, and
     # overwrite that register after loadrs has made the physical stack stale.
     # A correct rfi/return fill must replace this zero with the backing-store
@@ -3501,7 +3496,7 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
             # Mirror the deterministic pending-timer primitive used by the
             # interrupt tests.  PSR.i remains clear while the timer is armed;
             # the branch back also gives the zero-deadline timer a TB exit at
-            # which to become pending before the captured load sequence.
+            # which to become pending before the speculative load sequence.
             (0xa00, 0x01, adds(4, 0xef, 0), nop_i(), nop_i()),
             (0xa10, 0x01, mov_m_gr_cr(4, IA64_CR_ITV), nop_i(), nop_i()),
             (0xa20, 0x01, mov_m_gr_ar(0, 44), nop_i(), nop_i()),
@@ -3515,10 +3510,9 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
     ]
     if deferred:
         recovery_bundles = [
-            # Match the captured 0x764b91d0 and 0x764b91e0 bundles exactly.
             # Rewind the speculative postincrement, redo the descriptor load
-            # non-speculatively, publish its entry in b7, then rejoin the real
-            # indirect-call bundle at the corresponding 0x764b9150 site.
+            # non-speculatively, publish its entry in b7, then rejoin the
+            # indirect-call bundle.
             (0x2f0, 0x0b, adds(35, -8, 35),
              ld8_postinc(41, 35, 8), nop_i()),
             (0x300, 0x11, nop_m(),
@@ -3548,7 +3542,7 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
 
         # SOF=43/SOL=37 leaves six outputs.  The call therefore enters with
         # BOL=82 and six inherited inputs; alloc grows by thirteen registers
-        # to the observed SOF=19/SOL=13 partition.
+        # to the selected SOF=19/SOL=13 partition.
         (0x150, 0x00, alloc(68, 43, 37, 0, 0), nop_i(), nop_i()),
         (0x160, 0x10, nop_m(), nop_i(), br_call(0, 0x160, 0x200)),
         (0x170, 0x10, nop_m(), nop_i(), br_cond(0x170, 0x170)),
@@ -3558,12 +3552,11 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
          br_cond(0x200, 0xa00) if pre_call_switch else
          adds(41, 0, 0) if deferred else nop_i()),
         (0x210, 0x05, *movl_mlx(35, HIGH_TR_BASE)[1:]),
-        # Match the two captured bundles at 0x764b90e0 byte for byte.
-        # The successful ld8.s and three register moves form one group through
-        # slot 0 of the second bundle.  The timer variant then enables PSR.i
-        # in a separate group, exposing an external-interrupt boundary before
-        # the helper call; the companion case uses software interruptions at
-        # all five helper sites.
+        # Keep the successful ld8.s and three register moves in one group
+        # through slot 0 of the second bundle.  The timer variant then enables
+        # PSR.i in a separate group, exposing an external-interrupt boundary
+        # before the helper call; the companion case uses software
+        # interruptions at all five helper sites.
         (0x220, 0x00, ld8_s_postinc(41, 35, 8),
          adds(45, 0, 38), adds(46, 0, 33)),
         (0x230, 0x0a, adds(47, 0, 34), addl(48, 983071, 0),
@@ -3572,9 +3565,8 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
          ssm(IA64_PSR_I) if pre_call_switch else nop_m(),
          tnat_nz_or(6, 0, 41) if deferred else nop_i(), nop_i()),
         (0x250, 0x10, nop_m(), nop_i(), br_call(0, 0x250, 0x400)),
-        # Match the two final captured bundles byte for byte.  The raw +0
-        # prediction hint in mov b7=r41 is bit 20; it has no architectural
-        # effect, but retaining it also exercises the exact decoder path.
+        # The raw +0 prediction hint in mov b7=r41 is bit 20; it has no
+        # architectural effect, but retaining it exercises that decoder path.
         # There is no stop between these bundles, so chk.s, the BR write, the
         # descriptor-GP load and the indirect call form one instruction group.
         (0x260, 0x10, chk_s_m(41, 0x260, 0x2f0),
@@ -3591,7 +3583,7 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
         *recovery_bundles,
 
         # Intermediate helper: SOF=16/SOL=9, with b0, ar.pfs, and gp in
-        # r38-r40.  The call sequence uses the captured frame sizes.
+        # r38-r40.  The call sequence uses the selected frame sizes.
         (0x400, 0x00, alloc_m(39, 16, 9, 0, 0), nop_i(), nop_i()),
         (0x410, 0x01, nop_m(), mov_gr_b(38, 0), adds(40, 0, 1)),
         (0x420, 0x10, nop_m(), nop_i(), br_call(0, 0x420, 0x600)),
@@ -3681,10 +3673,10 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
 
         raw_bundle(0x400000, entry_value, descriptor_gp),
 
-        # The real descriptor entry is below the machine's default 2 GiB RAM
-        # ceiling, so execute the indirect call at its observed guest address.
-        # A marker and GP capture prove that b7 selected this leaf and that the
-        # call bundle loaded the descriptor's second word before branching.
+        # The descriptor entry is below the machine's default 2 GiB RAM
+        # ceiling.  A marker and GP capture prove that b7 selected this leaf
+        # and that the call bundle loaded the descriptor's second word before
+        # branching.
         (entry_value, 0x01, nop_m(), adds(2, 0, 1), adds(3, 0x5a, 0)),
         (entry_value + 0x10, 0x10, nop_m(), nop_i(), br_ret(0)),
     ]
@@ -3748,9 +3740,6 @@ def _guest_bol82_switch_poison_case(name, *, switch_site,
         runner=run_and_check,
         bundles=tuple(tuple(bundle) for bundle in bundles),
         expected=expected,
-        metadata=CaseMetadata(required_features=frozenset({
-            "cpu-model:merced", "smp",
-        })),
     )
 
 
@@ -4963,7 +4952,8 @@ test_rse_rfi_invalid_ifs_exact_iip_keeps_guest_gr = require_registers(
         "cfm_sol": 5,
     }, entry=0x10)
 
-test_rfi_unmatched_context_keeps_interruption_resources = require_registers(
+test_rse_rfi_unmatched_context_keeps_guest_interruption_resources = \
+    require_registers(
     "rse_rfi_unmatched_context_keeps_guest_interruption_resources", [
         (0x10, *movl_mlx(3, 0x100008)),
         (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
@@ -4998,7 +4988,7 @@ test_rfi_unmatched_context_keeps_interruption_resources = require_registers(
         "cfm_sof": 1,
     }, entry=0x10)
 
-test_rfi_cross_region_context_ignores_stale_exception_frame = \
+test_rse_rfi_cross_region_context_ignores_stale_exception_frame = \
     require_registers(
         "rse_rfi_cross_region_context_ignores_stale_exception_frame", [
         (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE)),
@@ -5040,7 +5030,8 @@ test_rfi_cross_region_context_ignores_stale_exception_frame = \
         "r8": 0x123456789abcdef0,
     }, entry=0x10)
 
-test_rfi_backward_context_ignores_stale_exception_frame = require_registers(
+test_rse_rfi_backward_context_ignores_stale_exception_frame = \
+    require_registers(
     "rse_rfi_backward_context_ignores_stale_exception_frame", [
         (0x10, *movl_mlx(3, 0x100000)),
         (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
@@ -6163,86 +6154,4 @@ CASE_NAMES = (
     'stacked_gr_destination_out_of_frame',
 )
 
-CASE_METADATA = {
-    'rse_architectural_reset_exposes_full_frame': CaseMetadata(
-        tags=frozenset({'processor-reset'}),
-        required_features=frozenset({'machine:none', 'cpu-model:madison'})),
-    'rse_boot_handoff_preserves_empty_frame': CaseMetadata(
-        tags=frozenset({'firmware-handoff'}),
-        required_features=frozenset({'machine:ia64-vpc'})),
-    'rse_sal_alt_dtlb_resumes_br_ret_fill': CaseMetadata(
-        expectation_evidence=CaseEvidence.PAL_OR_PLATFORM_ABI,
-        tags=frozenset({'firmware-sal'}),
-        spec_refs=(
-            'IA64-softdevman-vol2.pdf: System Architecture, section 6.8',
-            'itanium-system-abstraction-layer-specification.pdf: '
-            'section 3.3.1',
-        ),
-        required_features=frozenset({
-            'firmware-sal',
-            'machine:itanium-vpc',
-        }),
-    ),
-    'rse_guest_frame_ld8_s_nat_survives_nested_switch': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_frame_ld8_s_survives_nested_switch': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_same_mfb_ld8_s_r41_survives_nested_pressure_poison': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression', 'synthetic-strengthening'}),
-    ),
-    'rse_guest_same_mfb_ld8_s_r41_survives_same_cpu_context_remap_poison': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({
-            'external-guest-regression', 'synthetic-strengthening',
-            'same-cpu-context-remap',
-        }),
-    ),
-    'rse_guest_same_mfb_ld8_s_r41_survives_bol79_to8_remap_poison': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({
-            'external-guest-regression', 'synthetic-strengthening',
-            'same-cpu-context-remap', 'physical-rse-wrap',
-        }),
-    ),
-    'rse_guest_bol82_ld8_s_survives_helper_switches_poison': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_bol82_ld8_s_deferred_nat_recovers_after_helper_switches': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_bol82_ld8_s_survives_precall_switch_poison': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_helper_ld8_s_r41_survives_nested_pressure': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_guest_helper_ld8_s_r41_survives_nested_switch': CaseMetadata(
-        expectation_evidence=CaseEvidence.EXTERNAL_GUEST_REGRESSION,
-        tags=frozenset({'external-guest-regression'}),
-    ),
-    'rse_physical_spill_fault_sets_isr_rs': CaseMetadata(
-        nonterminal_effect_loop=True),
-    'rse_physical_target_fill_fault_sets_isr_rs_ir': CaseMetadata(
-        nonterminal_effect_loop=True),
-    'rse_spill_fault_sets_isr_rs': CaseMetadata(nonterminal_effect_loop=True),
-    'rse_uses_rsc_pl_for_access_rights': CaseMetadata(nonterminal_effect_loop=True),
-}
-
-CASE_ALIASES = {
-    'rse_rfi_backward_context_ignores_stale_exception_frame': test_rfi_backward_context_ignores_stale_exception_frame,
-    'rse_rfi_cross_region_context_ignores_stale_exception_frame': test_rfi_cross_region_context_ignores_stale_exception_frame,
-    'rse_rfi_unmatched_context_keeps_guest_interruption_resources': test_rfi_unmatched_context_keeps_interruption_resources,
-}
-
-CASES = bind_cases(GROUP, CASE_NAMES, globals(),
-                   aliases=CASE_ALIASES,
-                   metadata=CASE_METADATA)
+CASES = bind_cases(GROUP, CASE_NAMES, globals())
