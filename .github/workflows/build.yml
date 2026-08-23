@@ -674,7 +674,7 @@ jobs:
 
           # Module caches must remain valid after extracting the artifact to
           # a location other than the MSYS2 installation prefix.
-          grep -Eq '^"lib[\\/]gdk-pixbuf-2\.0[\\/]' \
+          grep -Eq '^"lib(/|\\\\)gdk-pixbuf-2\.0(/|\\\\)' \
             "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
           ! grep -Eiq '(^|")([a-z]:[\\/]|/mingw64/)' \
             "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" \
