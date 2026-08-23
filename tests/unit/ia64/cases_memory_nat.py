@@ -1295,6 +1295,88 @@ test_normal_load_consumes_nat_base = require_exception(
          0),
     ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0x30, entry=0x10)
 
+
+test_nat_tracking_predicated_load_does_not_clear_base = require_exception(
+    "nat_tracking_predicated_load_does_not_clear_base", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0),
+         nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(3, 6, 0), nop_i(),
+         nop_i()),
+        # p1 is dynamically false.  Its skipped consumption check must not
+        # make the following unpredicated access treat r3 as NaT-clear.
+        (0x30, 0x00, ld8(4, 3, qp=1), nop_i(), nop_i()),
+        (0x40, 0x00, ld8(5, 3), nop_i(), nop_i()),
+        raw_bundle(0x200, 0, 0),
+    ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0x40, entry=0x10)
+
+
+test_nat_tracking_predicated_store_does_not_clear_source = require_exception(
+    "nat_tracking_predicated_store_does_not_clear_source", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0),
+         nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(5, 6, 0), addl(7, 0x100, 0),
+         nop_i()),
+        # As above, but cover the store-value consumption path as well as
+        # the load-address path.
+        (0x30, 0x00, st8(7, 5, qp=1), nop_i(), nop_i()),
+        (0x40, 0x00, st8(7, 5), nop_i(), nop_i()),
+        raw_bundle(0x200, 0, 0),
+    ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0x40, entry=0x10)
+
+
+test_nat_tracking_later_fill_overrides_clear = require_exception(
+    "nat_tracking_later_fill_overrides_clear", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(3, 0x100, 0),
+         nop_i()),
+        (0x20, 0x10, nop_m(), addl(6, 0x200, 0),
+         br_cond(0x20, 0x40)),
+        # The branch makes r3 unknown to this TB.  The first load proves it
+        # clear, then ld8.fill must replace that proof with its dynamic NaT.
+        (0x40, 0x00, ld8(4, 3), nop_i(), nop_i()),
+        (0x50, 0x08, ld8_fill_postinc(3, 6, 0), nop_i(), nop_i()),
+        (0x60, 0x00, ld8(5, 3), nop_i(), nop_i()),
+        raw_bundle(0x100, 0x1122334455667788, 0),
+        raw_bundle(0x200, 0, 0),
+    ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0x60, entry=0x10)
+
+
+test_nat_tracking_reg_postinc_reinvalidates_base = require_exception(
+    "nat_tracking_reg_postinc_reinvalidates_base", [
+        (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0),
+         nop_i()),
+        (0x20, 0x08, ld8_fill_postinc(5, 6, 0), addl(3, 0x100, 0),
+         nop_i()),
+        (0x30, 0x10, nop_m(), nop_i(), br_cond(0x30, 0x40)),
+        # r3 and r5 are both unknown at this TB entry.  The access proves
+        # the old base clear, but the register update assigns base.NaT |
+        # increment.NaT and must therefore invalidate that proof.
+        (0x40, 0x08, ld1_reg_postinc(4, 3, 5), nop_i(), nop_i()),
+        (0x50, 0x00, ld1(7, 3), nop_i(), nop_i()),
+        raw_bundle(0x100, 0x5a, 0),
+        raw_bundle(0x200, 1, 0),
+    ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0x50, entry=0x10)
+
+
+test_nat_tracking_load_destination_base_alias = require_registers(
+    "nat_tracking_load_destination_base_alias", [
+        (0x10, 0x00, nop_m(), addl(3, 0x100, 0), nop_i()),
+        (0x20, 0x10, nop_m(), nop_i(), br_cond(0x20, 0x40)),
+        # Marking the consumed base clear may elide the destination clear
+        # when r1 == r3.  That is safe only because the old bit just proved
+        # clear; verify the alias remains clear and usable by the next load.
+        (0x40, 0x00, ld8(3, 3), nop_i(), nop_i()),
+        (0x50, 0x00, ld8(4, 3), nop_i(), nop_i()),
+        (0x60, 0x10, nop_m(), nop_i(), br_cond(0x60, 0x60)),
+        raw_bundle(0x100, 0x108, 0x8877665544332211),
+    ], {
+        "ip": 0x60,
+        "exception": IA64_EXCP_NONE,
+        "r3": 0x108,
+        "r3_nat": 0,
+        "r4": 0x8877665544332211,
+    }, entry=0x10)
+
+
 test_nat_consumption_sets_ifa_isr = require_registers(
     "nat_consumption_sets_ifa_isr", [
         (0x10, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x200, 0),
@@ -1381,6 +1463,43 @@ test_speculative_load_defers_nat_base = require_registers(
          0),
     ], {"ip": 0x60, "exception": IA64_EXCP_NONE, "r4_nat": 1},
     entry=0x10)
+
+test_nat_clear_tb_speculative_exit_rechecks_flags = require_exception(
+    "nat_clear_tb_speculative_exit_rechecks_flags", [
+        (0x10, *movl_mlx(4, 0x200)),
+        (0x20, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_AC)),
+        (0x30, 0x00, mov_gr_psr_full(19), nop_i(), nop_i()),
+        (0x40, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0x50, 0x10, nop_m(), nop_i(), br_cond(0x50, 0x70)),
+        # Execute this TB twice.  Its first speculative load succeeds and
+        # reaches the all-NaT-clear target variant; its second load defers an
+        # unimplemented-address fault and must look up the generic variant.
+        (0x70, 0x00, ld8_s(3, 4), nop_i(), nop_i()),
+        (0x80, 0x10, nop_m(), nop_i(), br_cond(0x80, 0xa0)),
+        (0xa0, 0x00, ld1(5, 3), nop_i(), nop_i()),
+        (0xb0, *movl_mlx(4, 0x76520ec5b2369f9e)),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0x70)),
+        raw_bundle(0x200, 0x300, 0),
+        raw_bundle(0x300, 0x5a, 0),
+    ], IA64_EXCP_NAT_CONSUMPTION, fault_ip=0xa0, entry=0x10)
+
+test_nat_clear_self_loop_prefix_rechecks_facts = require_registers(
+    "nat_clear_self_loop_prefix_rechecks_facts", [
+        (0x10, *movl_mlx(3, 0x76520ec5b2369f9e)),
+        (0x20, 0x00, nop_m(), adds(8, 1, 0), nop_i()),
+        (0x30, 0x02, nop_m(), mov_lc_gr(8), nop_i()),
+        # The clear-specialized TB starts before this speculative load.  The
+        # self-loop must use the NaT facts at its label, not the TB entry flag.
+        (0x40, 0x00, ld8_s(34, 3), nop_i(), nop_i()),
+        (0x50, 0x10, adds(33, 0, 32), adds(32, 0, 34),
+         br_cloop(0x50, 0x50)),
+        (0x60, 0x10, nop_m(), nop_i(), br_cond(0x60, 0x60)),
+    ], {
+        "ip": 0x60,
+        "exception": IA64_EXCP_NONE,
+        "r32_nat": 1,
+        "r33_nat": 1,
+    }, entry=0x10)
 
 test_speculative_load_defers_psr_ed = require_registers(
     "speculative_load_defers_psr_ed", [
@@ -3521,9 +3640,16 @@ CASE_NAMES = (
     'montecito_store_crossing_16byte_window_faults',
     'montecito_store_within_16byte_window',
     'montecito_uc_fp_store_crossing_8byte_window_faults',
+    'nat_clear_tb_speculative_exit_rechecks_flags',
+    'nat_clear_self_loop_prefix_rechecks_facts',
     'nat_consumption_sets_ifa_isr',
     'nat_store_base_consumption_is_access',
     'nat_store_data_consumption_is_access',
+    'nat_tracking_later_fill_overrides_clear',
+    'nat_tracking_load_destination_base_alias',
+    'nat_tracking_predicated_load_does_not_clear_base',
+    'nat_tracking_predicated_store_does_not_clear_source',
+    'nat_tracking_reg_postinc_reinvalidates_base',
     'normal_load_clears_stale_nat',
     'normal_load_consumes_nat_base',
     'non_speculative_attribute_returns_failure_values',

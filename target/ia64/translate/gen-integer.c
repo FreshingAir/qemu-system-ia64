@@ -509,6 +509,45 @@ static void ia64_gen_native_integer_write(const Ia64Instruction *insn)
     }
 }
 
+static void ia64_gen_integer_nat_from_1(const Ia64Instruction *insn,
+                                        uint8_t dst, uint8_t src)
+{
+    /*
+     * These operations write the register value, but copying a register's
+     * NaT bit back to the same register is an identity operation.  Avoid the
+     * otherwise fairly long extract/clear/insert sequence while retaining
+     * the stacked-register dirty bookkeeping associated with the write.
+     */
+    if (dst == src) {
+        ia64_gen_note_stacked_gr_write(insn, dst);
+        return;
+    }
+    ia64_gen_gr_nat_from_1(insn, dst, src);
+}
+
+static void ia64_gen_integer_nat_from_2(const Ia64Instruction *insn,
+                                        uint8_t dst, uint8_t src1,
+                                        uint8_t src2)
+{
+    /* x.NaT | x.NaT is just x.NaT. */
+    if (src1 == src2) {
+        ia64_gen_integer_nat_from_1(insn, dst, src1);
+        return;
+    }
+
+    /* Preserve dst.NaT in place and OR in only the non-aliasing input. */
+    if (dst == src1) {
+        ia64_gen_gr_nat_or_from_1(insn, dst, src2);
+        return;
+    }
+    if (dst == src2) {
+        ia64_gen_gr_nat_or_from_1(insn, dst, src1);
+        return;
+    }
+
+    ia64_gen_gr_nat_from_2(insn, dst, src1, src2);
+}
+
 static void ia64_gen_native_integer_nat(const Ia64Instruction *insn)
 {
     const IA64IntegerOperands *op = &insn->operands.integer;
@@ -539,10 +578,10 @@ static void ia64_gen_native_integer_nat(const Ia64Instruction *insn)
     case IA64_OP_XOR_IMM:
     case IA64_OP_POPCNT:
     case IA64_OP_CLZ:
-        ia64_gen_gr_nat_from_1(insn, op->destination, op->source2);
+        ia64_gen_integer_nat_from_1(insn, op->destination, op->source2);
         break;
     case IA64_OP_DEPZ:
-        ia64_gen_gr_nat_from_1(insn, op->destination, op->source1);
+        ia64_gen_integer_nat_from_1(insn, op->destination, op->source1);
         break;
     case IA64_OP_DEPZ_IMM:
         ia64_gen_gr_nat_clear(insn, op->destination);
@@ -566,8 +605,8 @@ static void ia64_gen_native_integer_nat(const Ia64Instruction *insn)
     case IA64_OP_MPYSHL4:
     case IA64_OP_MPYSH:
     case IA64_OP_MPYUH:
-        ia64_gen_gr_nat_from_2(insn, op->destination,
-                               op->source1, op->source2);
+        ia64_gen_integer_nat_from_2(insn, op->destination,
+                                    op->source1, op->source2);
         break;
     case IA64_OP_MUX:
         ia64_gen_gr_nat_from_3(insn, op->destination, op->destination,

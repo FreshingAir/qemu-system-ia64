@@ -368,25 +368,53 @@ static void ia64_gen_getf(const Ia64Instruction *insn, uint32_t kind)
 static void ia64_gen_xma(const Ia64Instruction *insn, uint32_t mode)
 {
     const IA64FloatingOperands *op = &insn->operands.floating;
-    TCGv_i64 all_sig = tcg_temp_new_i64();
-    TCGv_i64 test = tcg_temp_new_i64();
+    uint64_t sig_mask[2] = { 0, 0 };
     TCGv_i64 low = tcg_temp_new_i64();
     TCGv_i64 high = tcg_temp_new_i64();
-    TCGLabel *slow = gen_new_label();
-    TCGLabel *done = gen_new_label();
+    TCGv_i64 missing = NULL;
+    TCGLabel *fast = NULL;
+    TCGLabel *done = NULL;
 
-    tcg_gen_and_i64(all_sig, ia64_gen_fr_sig_read(op->source2),
-                    ia64_gen_fr_sig_read(op->auxiliary1));
-    tcg_gen_or_i64(test, ia64_gen_fr_nat_read(op->source2),
-                   ia64_gen_fr_nat_read(op->auxiliary1));
-    if (mode != 3) {
-        tcg_gen_and_i64(all_sig, all_sig,
-                        ia64_gen_fr_sig_read(op->source1));
-        tcg_gen_or_i64(test, test, ia64_gen_fr_nat_read(op->source1));
+    if (op->source2 > 1) {
+        sig_mask[op->source2 / 64] |= 1ULL << (op->source2 % 64);
     }
-    tcg_gen_xori_i64(all_sig, all_sig, 1);
-    tcg_gen_or_i64(test, test, all_sig);
-    tcg_gen_brcondi_i64(TCG_COND_NE, test, 0, slow);
+    if (op->auxiliary1 > 1) {
+        sig_mask[op->auxiliary1 / 64] |=
+            1ULL << (op->auxiliary1 % 64);
+    }
+    if (mode != 3) {
+        if (op->source1 > 1) {
+            sig_mask[op->source1 / 64] |=
+                1ULL << (op->source1 % 64);
+        }
+    }
+    for (uint32_t word = 0; word < ARRAY_SIZE(sig_mask); word++) {
+        if (sig_mask[word] != 0) {
+            TCGv_i64 bits = ia64_gen_fr_sig_mask_read(word,
+                                                       sig_mask[word]);
+
+            /* A significand tag and a NaTVal tag are mutually exclusive. */
+            tcg_gen_xori_i64(bits, bits, sig_mask[word]);
+            if (missing == NULL) {
+                missing = bits;
+            } else {
+                tcg_gen_or_i64(missing, missing, bits);
+            }
+        }
+    }
+
+    if (missing != NULL) {
+        fast = gen_new_label();
+        done = gen_new_label();
+        tcg_gen_brcondi_i64(TCG_COND_EQ, missing, 0, fast);
+        gen_helper_xma(tcg_env, tcg_constant_i32(op->destination),
+                       tcg_constant_i32(mode == 3 ? 0 : op->source1),
+                       tcg_constant_i32(op->source2),
+                       tcg_constant_i32(op->auxiliary1),
+                       tcg_constant_i32(mode));
+        tcg_gen_br(done);
+        gen_set_label(fast);
+    }
 
     if (mode == 1) {
         tcg_gen_muls2_i64(low, high, ia64_fr_significand_src(op->source2),
@@ -401,14 +429,9 @@ static void ia64_gen_xma(const Ia64Instruction *insn, uint32_t mode)
                          tcg_constant_i64(0));
     }
     ia64_gen_fr_mov_sig(op->destination, mode == 0 ? low : high);
-    tcg_gen_br(done);
-
-    gen_set_label(slow);
-    gen_helper_xma(tcg_env, tcg_constant_i32(op->destination),
-                   tcg_constant_i32(mode == 3 ? 0 : op->source1),
-                   tcg_constant_i32(op->source2),
-                   tcg_constant_i32(op->auxiliary1), tcg_constant_i32(mode));
-    gen_set_label(done);
+    if (done != NULL) {
+        gen_set_label(done);
+    }
 }
 
 IA64GenResult ia64_gen_fp(DisasContext *ctx,

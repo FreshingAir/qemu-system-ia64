@@ -93,6 +93,9 @@ static TCGTBCPUState ia64_get_tb_cpu_state(CPUState *cs)
     flags |= (psr & IA64_PSR_TB) ? IA64_TB_FLAG_PSR_TB : 0;
     flags |= (psr & IA64_PSR_SS) ? IA64_TB_FLAG_PSR_SS : 0;
     flags |= (psr & IA64_PSR_DB) ? IA64_TB_FLAG_PSR_DB : 0;
+    if (likely((cpu->env.nat[0] | cpu->env.nat[1]) == 0)) {
+        flags |= IA64_TB_FLAG_NAT_CLEAR;
+    }
 
     return (TCGTBCPUState) {
         .pc = cpu->env.ip,

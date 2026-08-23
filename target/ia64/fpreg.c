@@ -11,7 +11,10 @@
 #define IA64_FP_SINGLE_EXP_BASE 0x0ff80
 #define IA64_FP_SINGLE_FRAC_MASK ((1ULL << 23) - 1)
 #define IA64_FP_DOUBLE_EXP_BASE 0x0fc00
+#define IA64_FP_DOUBLE_MAX_EXP 0x103fe
 #define IA64_FP_DOUBLE_FRAC_MASK ((1ULL << 52) - 1)
+#define IA64_FP_DOUBLE_LOW_MASK ((1ULL << 11) - 1)
+
 bool ia64_fpreg_get_extended(const CPUIA64State *env, unsigned reg,
                              bool *sign, uint32_t *exp, uint64_t *mant)
 {
@@ -98,24 +101,34 @@ static uint64_t register_format_to_binary64(uint64_t sig, uint32_t exp,
     return value;
 }
 
-static uint64_t extended_to_binary64(CPUIA64State *env, bool sign,
-                                     uint32_t exp, uint64_t mant)
+/*
+ * Return a compact binary64 value only when converting it back with
+ * binary64_to_register_format() reproduces every architected bit.  Special,
+ * wide-range, pseudo-zero, and arbitrary unnormal encodings must retain their
+ * exact extended metadata instead.  Keep binary64 denormals extended too:
+ * routing them through compact float64 conversions would report a SoftFloat
+ * input-denormal event and could change IA-64 exception priority.
+ */
+static bool register_format_to_binary64_exact(uint64_t sig, uint32_t exp,
+                                              bool sign, uint64_t *value)
 {
-    uint16_t ext_exp;
-    float_status status = env->fp.fp_status;
+    uint64_t result = (uint64_t)sign << 63;
 
-    if (exp == IA64_FP_REG_SPECIAL_EXP) {
-        ext_exp = 0x7fff;
-    } else if (exp == 0) {
-        ext_exp = 0;
-    } else if (exp > 0xc000 && exp - 0xc000 < 0x7fff) {
-        ext_exp = exp - 0xc000;
+    if (likely((sig & (IA64_FP_SIGNIFICAND_INTEGER_BIT |
+                       IA64_FP_DOUBLE_LOW_MASK)) ==
+                      IA64_FP_SIGNIFICAND_INTEGER_BIT &&
+               (uint32_t)(exp - (IA64_FP_DOUBLE_EXP_BASE + 1)) <=
+               IA64_FP_DOUBLE_MAX_EXP - (IA64_FP_DOUBLE_EXP_BASE + 1))) {
+        result |= (uint64_t)(exp - IA64_FP_DOUBLE_EXP_BASE) << 52;
+        result |= (sig >> 11) & IA64_FP_DOUBLE_FRAC_MASK;
+    } else if (sig == 0 && exp == 0) {
+        /* Canonical signed zero. */
     } else {
-        ext_exp = exp < 0xc000 ? 0 : 0x7fff;
+        return false;
     }
 
-    return floatx80_to_float64(
-        ia64_make_floatx80(((uint16_t)sign << 15) | ext_exp, mant), &status);
+    *value = result;
+    return true;
 }
 
 void ia64_fpreg_to_spill(const CPUIA64State *env, unsigned reg,
@@ -149,6 +162,7 @@ void ia64_fpreg_to_spill(const CPUIA64State *env, unsigned reg,
 void ia64_fpreg_from_spill(CPUIA64State *env, unsigned reg,
                            uint64_t low, uint64_t high)
 {
+    uint64_t compact;
     uint32_t exp;
     bool sign;
     uint64_t bit;
@@ -172,8 +186,15 @@ void ia64_fpreg_from_spill(CPUIA64State *env, unsigned reg,
         env->fp.fr_sig[reg / 64] |= bit;
         env->fp.fr_int_value[reg] = low;
         env->fp.fr_int_origin[reg / 64] |= bit;
+    } else if (register_format_to_binary64_exact(low, exp, sign, &compact)) {
+        env->fp.fr[reg] = compact;
     } else {
-        env->fp.fr[reg] = extended_to_binary64(env, sign, exp, low);
+        /*
+         * fr_ext_* is authoritative while fr_ext_valid is set.  Computing a
+         * rounded binary64 shadow here is both lossy and wasted: every reader
+         * checks the representation tag before consulting fr[].
+         */
+        env->fp.fr[reg] = 0;
         env->fp.fr_ext_mant[reg] = low;
         env->fp.fr_ext_exp[reg] = exp;
         if (sign) {

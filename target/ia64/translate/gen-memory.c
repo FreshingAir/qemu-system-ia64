@@ -207,9 +207,26 @@ static void ia64_gen_integer_load(DisasContext *ctx,
 static void ia64_gen_check_nat_access(const Ia64Instruction *insn,
                                       uint8_t reg, bool is_write)
 {
+    DisasContext *ctx = insn->ctx;
+    uint64_t bit;
+
     ia64_gen_check_nat_consumption(insn, reg,
                                    is_write ? IA64_ISR_W : IA64_ISR_R,
                                    IA64_NAT_ACCESS);
+
+    /*
+     * A faulting memory access can continue past the consumption check only
+     * when its address/value GR is not NaTed.  Preserve that fact for later
+     * instructions in the TB.  Do not infer anything across a dynamic
+     * predicate: its nullified path bypasses this check.
+     */
+    if (reg == 0 || !ctx->reg.current_qp_known ||
+        !ctx->reg.current_qp_value) {
+        return;
+    }
+    bit = UINT64_C(1) << (reg % 64);
+    ctx->memory.nat_known_clear[reg / 64] |= bit;
+    ctx->memory.nat_known_set[reg / 64] &= ~bit;
 }
 
 static void ia64_gen_check_nat_semaphore(const Ia64Instruction *insn,

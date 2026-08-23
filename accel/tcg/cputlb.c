@@ -146,6 +146,24 @@ static void tlb_window_reset(CPUTLBDesc *desc, int64_t ns,
     desc->window_max_entries = max_entries;
 }
 
+#define VICTIM_TLB_PINGPONG_THRESHOLD 16
+
+/*
+ * Reset the state used to recognize sustained two-page conflicts in the
+ * direct-mapped TLB.  This state is only advisory: every direct victim use
+ * revalidates both TLB entries before relying on it.
+ */
+static inline void victim_tlb_pingpong_reset(CPUTLBDesc *desc)
+{
+    desc->victim_tlb_pingpong_index = UINTPTR_MAX;
+    desc->victim_tlb_pingpong_last_page = 0;
+    desc->victim_tlb_pingpong_peer_page = 0;
+    desc->victim_tlb_pingpong_hits = 0;
+    desc->victim_tlb_pingpong_last_access = MMU_ACCESS_COUNT;
+    desc->victim_tlb_pingpong_vindex = UINT8_MAX;
+    desc->victim_tlb_pingpong_pinned = false;
+}
+
 static void tb_jmp_cache_clear_page(CPUState *cpu, vaddr page_addr)
 {
     CPUJumpCache *jc = cpu->tb_jmp_cache;
@@ -282,6 +300,7 @@ static void tlb_mmu_flush_locked(CPUTLBDesc *desc, CPUTLBDescFast *fast)
     desc->large_page_addr = -1;
     desc->large_page_mask = -1;
     desc->vindex = 0;
+    victim_tlb_pingpong_reset(desc);
     memset(fast->table, -1, sizeof_tlb(fast));
     memset(desc->vtable, -1, sizeof(desc->vtable));
 }
@@ -536,8 +555,11 @@ static inline void tlb_flush_vtlb_page_locked(CPUState *cpu, int mmu_idx,
 
 static void tlb_flush_page_locked(CPUState *cpu, int midx, vaddr page)
 {
-    vaddr lp_addr = cpu->neg.tlb.d[midx].large_page_addr;
-    vaddr lp_mask = cpu->neg.tlb.d[midx].large_page_mask;
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[midx];
+    vaddr lp_addr = desc->large_page_addr;
+    vaddr lp_mask = desc->large_page_mask;
+
+    victim_tlb_pingpong_reset(desc);
 
     /* Check if we need to flush due to large pages.  */
     if ((page & lp_mask) == lp_addr) {
@@ -707,19 +729,35 @@ static void tlb_flush_range_locked(CPUState *cpu, int midx,
 {
     CPUTLBDesc *d = &cpu->neg.tlb.d[midx];
     CPUTLBDescFast *f = cpu_tlb_fast(cpu, midx);
+    size_t n_entries = tlb_n_entries(f);
+    vaddr n_pages = len / TARGET_PAGE_SIZE +
+                    (len % TARGET_PAGE_SIZE != 0);
     vaddr mask = MAKE_64BIT_MASK(0, bits);
+    unsigned int index_bits;
+    bool range_wraps = addr + len - 1 < addr;
+
+    victim_tlb_pingpong_reset(d);
+    g_assert(is_power_of_2(n_entries));
+    index_bits = ctz64(n_entries);
 
     /*
-     * If @bits is smaller than the tlb size, there may be multiple entries
-     * within the TLB; otherwise all addresses that match under @mask hit
-     * the same TLB entry.
+     * The direct-mapped index consumes @index_bits immediately above the
+     * target page offset.  If @bits does not cover all of them, addresses
+     * that compare equal under @mask can occupy multiple entries.
      * TODO: Perhaps allow bits to be a few bits less than the size.
      * For now, just flush the entire TLB.
      *
-     * If @len is larger than the tlb size, then it will take longer to
-     * test all of the entries in the TLB than it will to flush it all.
+     * Likewise, once the range covers at least as many pages as the TLB has
+     * entries, testing them individually (and scanning the victim TLB for
+     * each page) cannot be cheaper than flushing the whole TLB.  Do not
+     * compare either quantity with f->mask: that is a host-byte offset mask,
+     * not an address-bit mask or a count of guest bytes.
+     *
+     * A wrapped range needs a full flush because the large-page overlap test
+     * below relies on a monotonically increasing range.
      */
-    if (mask < f->mask || len > f->mask) {
+    if (bits < TARGET_PAGE_BITS + index_bits ||
+        n_pages >= n_entries || range_wraps) {
         tlb_debug("forcing full flush midx %d ("
                   "%016" VADDR_PRIx "/%016" VADDR_PRIx "+%016" VADDR_PRIx ")\n",
                   midx, addr, mask, len);
@@ -845,6 +883,11 @@ void tlb_flush_range_by_mmuidx(CPUState *cpu, vaddr addr,
     TLBFlushRangeData d;
 
     assert_cpu_is_self(cpu);
+    g_assert(bits <= target_long_bits());
+
+    if (len == 0) {
+        return;
+    }
 
     /* If no page bits are significant, this devolves to tlb_flush. */
     if (bits < TARGET_PAGE_BITS) {
@@ -883,6 +926,14 @@ void tlb_flush_range_by_mmuidx_no_jmp_cache(CPUState *cpu, vaddr addr,
     };
 
     assert_cpu_is_self(cpu);
+    g_assert(bits <= target_long_bits());
+    if (len == 0) {
+        return;
+    }
+    if (bits < TARGET_PAGE_BITS) {
+        tlb_flush_by_mmuidx_work(cpu, idxmap, false);
+        return;
+    }
     tlb_flush_range_by_mmuidx_async_0(cpu, d);
 }
 
@@ -900,6 +951,11 @@ void tlb_flush_range_by_mmuidx_all_cpus_synced(CPUState *src_cpu,
 {
     TLBFlushRangeData d, *p;
     CPUState *dst_cpu;
+
+    g_assert(bits <= target_long_bits());
+    if (len == 0) {
+        return;
+    }
 
     /* If no page bits are significant, this devolves to tlb_flush. */
     if (bits < TARGET_PAGE_BITS) {
@@ -1216,6 +1272,9 @@ void tlb_set_page_full(CPUState *cpu, int mmu_idx,
         tlb->c.jmp_cache_dirty |= 1 << mmu_idx;
     }
 
+    /* A fill can replace either half of a tracked conflicting pair. */
+    victim_tlb_pingpong_reset(desc);
+
     /* Make sure there's no cached translation for the new page.  */
     tlb_flush_vtlb_page_locked(cpu, mmu_idx, addr_page);
 
@@ -1447,6 +1506,126 @@ static bool victim_tlb_hit(CPUState *cpu, size_t mmu_idx, size_t index,
     return false;
 }
 
+static bool victim_tlb_pingpong_clean_ram(const CPUTLBEntry *entry,
+                                          const CPUTLBEntryFull *full,
+                                          MMUAccessType access_type,
+                                          vaddr page)
+{
+    /* Exact equality rejects INVALID, NOTDIRTY, and FORCE_SLOW entries. */
+    return tlb_read_idx(entry, access_type) == page &&
+           full->slow_flags[access_type] == 0 &&
+           full->section != NULL && full->section->mr != NULL &&
+           memory_region_is_ram(full->section->mr);
+}
+
+/*
+ * Try to serve the peer of a pinned two-page conflict from its fixed victim
+ * slot.  The main and victim entries are both revalidated so that a fill,
+ * victim replacement, dirty reset, or other translation change can only
+ * disable this optimization, never expose a stale translation.
+ */
+static bool victim_tlb_pingpong_direct(CPUState *cpu, size_t mmu_idx,
+                                       size_t index,
+                                       MMUAccessType access_type, vaddr page,
+                                       CPUTLBEntry **entry,
+                                       CPUTLBEntryFull **full)
+{
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBEntry *main = &cpu_tlb_fast(cpu, mmu_idx)->table[index];
+    CPUTLBEntryFull *main_full = &desc->fulltlb[index];
+    size_t vindex = desc->victim_tlb_pingpong_vindex;
+    MMUAccessType main_access;
+
+    assert_cpu_is_self(cpu);
+    if (desc->victim_tlb_pingpong_index != index ||
+        desc->victim_tlb_pingpong_peer_page != page ||
+        vindex >= CPU_VTLB_SIZE ||
+        desc->victim_tlb_pingpong_last_access >= MMU_ACCESS_COUNT ||
+        tlb_index(cpu, mmu_idx, page) != index) {
+        goto fail;
+    }
+
+    main_access = desc->victim_tlb_pingpong_last_access;
+    if (!victim_tlb_pingpong_clean_ram(
+            main, main_full, main_access,
+            desc->victim_tlb_pingpong_last_page) ||
+        !victim_tlb_pingpong_clean_ram(
+            &desc->vtable[vindex], &desc->vfulltlb[vindex],
+            access_type, page)) {
+        goto fail;
+    }
+
+    *entry = &desc->vtable[vindex];
+    *full = &desc->vfulltlb[vindex];
+    return true;
+
+fail:
+    victim_tlb_pingpong_reset(desc);
+    return false;
+}
+
+/*
+ * Record a normal victim promotion.  Before the threshold this adds no scan
+ * and does not alter victim replacement.  On reaching the threshold, keep
+ * the current page in the direct-mapped entry and remember the exact victim
+ * slot holding its peer.  When the pair mixes access types, keep the store
+ * in the main TLB so only the load uses the helper-side direct victim path.
+ */
+static void victim_tlb_pingpong_record(CPUState *cpu, size_t mmu_idx,
+                                       size_t index,
+                                       MMUAccessType access_type, vaddr page,
+                                       bool alternating,
+                                       vaddr previous_page,
+                                       MMUAccessType previous_access)
+{
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    CPUTLBEntry *main = &cpu_tlb_fast(cpu, mmu_idx)->table[index];
+    CPUTLBEntryFull *main_full = &desc->fulltlb[index];
+    size_t vindex;
+
+    if (!alternating) {
+        victim_tlb_pingpong_reset(desc);
+        desc->victim_tlb_pingpong_index = index;
+        desc->victim_tlb_pingpong_last_page = page;
+        desc->victim_tlb_pingpong_hits = 1;
+        desc->victim_tlb_pingpong_last_access = access_type;
+        return;
+    }
+
+    if (desc->victim_tlb_pingpong_hits != UINT16_MAX) {
+        desc->victim_tlb_pingpong_hits++;
+    }
+    desc->victim_tlb_pingpong_peer_page = previous_page;
+    desc->victim_tlb_pingpong_last_page = page;
+    desc->victim_tlb_pingpong_last_access = access_type;
+
+    if (desc->victim_tlb_pingpong_hits <
+            VICTIM_TLB_PINGPONG_THRESHOLD ||
+        (access_type != MMU_DATA_STORE &&
+         access_type != previous_access)) {
+        return;
+    }
+
+    if (!victim_tlb_pingpong_clean_ram(main, main_full,
+                                        access_type, page)) {
+        goto fail;
+    }
+
+    /* The preceding promotion placed the old main page in a victim slot. */
+    for (vindex = 0; vindex < CPU_VTLB_SIZE; vindex++) {
+        if (victim_tlb_pingpong_clean_ram(
+                &desc->vtable[vindex], &desc->vfulltlb[vindex],
+                previous_access, previous_page)) {
+            desc->victim_tlb_pingpong_vindex = vindex;
+            desc->victim_tlb_pingpong_pinned = true;
+            return;
+        }
+    }
+
+fail:
+    victim_tlb_pingpong_reset(desc);
+}
+
 static void notdirty_write(CPUState *cpu, vaddr mem_vaddr, unsigned size,
                            CPUTLBEntryFull *full, uintptr_t retaddr)
 {
@@ -1486,6 +1665,7 @@ static int probe_access_internal(CPUState *cpu, vaddr addr,
     CPUTLBEntryFull *full;
 
     if (!tlb_hit_page(tlb_addr, page_addr)) {
+        victim_tlb_pingpong_reset(&cpu->neg.tlb.d[mmu_idx]);
         if (!victim_tlb_hit(cpu, mmu_idx, index, access_type, page_addr)) {
             if (!tlb_fill_align(cpu, addr, access_type, mmu_idx,
                                 0, fault_size, nonfault, retaddr)) {
@@ -1666,6 +1846,7 @@ bool tlb_lookup_full_no_fill(CPUArchState *env, vaddr addr,
          * target TLB fill.  Promote it now so that the caller validates the
          * translation that the subsequent access will actually consume.
          */
+        victim_tlb_pingpong_reset(&cpu->neg.tlb.d[mmu_idx]);
         if (!victim_tlb_hit(cpu, mmu_idx, index, access_type,
                             addr & TARGET_PAGE_MASK)) {
             *pfull = NULL;
@@ -1781,6 +1962,7 @@ typedef struct MMULookupLocals {
  * @memop: memory operation for the access, or 0
  * @mmu_idx: virtual address context
  * @access_type: load/store/code
+ * @allow_victim_direct: true if no later lookup can invalidate a victim entry
  * @ra: return address into tcg generated code, or 0
  *
  * Resolve the translation for the one page at @data.addr, filling in
@@ -1789,30 +1971,78 @@ typedef struct MMULookupLocals {
  * @mmu_idx may have resized.
  */
 static bool mmu_lookup1(CPUState *cpu, MMULookupPageData *data, MemOp memop,
-                        int mmu_idx, MMUAccessType access_type, uintptr_t ra)
+                        int mmu_idx, MMUAccessType access_type,
+                        bool allow_victim_direct, uintptr_t ra)
 {
     vaddr addr = data->addr;
+    vaddr page = addr & TARGET_PAGE_MASK;
     uintptr_t index = tlb_index(cpu, mmu_idx, addr);
     CPUTLBEntry *entry = tlb_entry(cpu, mmu_idx, addr);
     uint64_t tlb_addr = tlb_read_idx(entry, access_type);
+    CPUTLBDesc *desc = &cpu->neg.tlb.d[mmu_idx];
+    bool track_conflict =
+        allow_victim_direct &&
+        (access_type == MMU_DATA_LOAD || access_type == MMU_DATA_STORE) &&
+        !cpu_plugin_mem_cbs_enabled(cpu);
     bool maybe_resized = false;
-    CPUTLBEntryFull *full;
+    CPUTLBEntryFull *full = NULL;
     int flags;
+
+    /* A helper access at another index interrupts a tracked conflict. */
+    if (unlikely(desc->victim_tlb_pingpong_hits != 0 &&
+                 desc->victim_tlb_pingpong_index != index)) {
+        victim_tlb_pingpong_reset(desc);
+    }
 
     /* If the TLB entry is for a different page, reload and try again.  */
     if (!tlb_hit(tlb_addr, addr)) {
-        if (!victim_tlb_hit(cpu, mmu_idx, index, access_type,
-                            addr & TARGET_PAGE_MASK)) {
-            tlb_fill_align(cpu, addr, access_type, mmu_idx,
-                           memop, data->size, false, ra);
-            maybe_resized = true;
-            index = tlb_index(cpu, mmu_idx, addr);
-            entry = tlb_entry(cpu, mmu_idx, addr);
+        if (unlikely(track_conflict &&
+                     desc->victim_tlb_pingpong_pinned) &&
+            victim_tlb_pingpong_direct(cpu, mmu_idx, index, access_type,
+                                       page, &entry, &full)) {
+            /* Exact comparator validation above guarantees no TLB flags. */
+            tlb_addr = page;
+        } else {
+            bool alternating = false;
+            vaddr previous_page = 0;
+            MMUAccessType previous_access = MMU_ACCESS_COUNT;
+
+            if (track_conflict &&
+                desc->victim_tlb_pingpong_hits != 0 &&
+                !desc->victim_tlb_pingpong_pinned &&
+                desc->victim_tlb_pingpong_index == index &&
+                page != desc->victim_tlb_pingpong_last_page &&
+                (desc->victim_tlb_pingpong_hits == 1 ||
+                 page == desc->victim_tlb_pingpong_peer_page) &&
+                tlb_hit_page_anyprot(
+                    entry, desc->victim_tlb_pingpong_last_page)) {
+                alternating = true;
+                previous_page = desc->victim_tlb_pingpong_last_page;
+                previous_access =
+                    desc->victim_tlb_pingpong_last_access;
+            }
+
+            if (!victim_tlb_hit(cpu, mmu_idx, index, access_type, page)) {
+                victim_tlb_pingpong_reset(desc);
+                tlb_fill_align(cpu, addr, access_type, mmu_idx,
+                               memop, data->size, false, ra);
+                maybe_resized = true;
+                index = tlb_index(cpu, mmu_idx, addr);
+                entry = tlb_entry(cpu, mmu_idx, addr);
+            } else if (track_conflict) {
+                victim_tlb_pingpong_record(cpu, mmu_idx, index,
+                                           access_type, page, alternating,
+                                           previous_page, previous_access);
+            } else {
+                victim_tlb_pingpong_reset(desc);
+            }
+            tlb_addr = tlb_read_idx(entry, access_type) & ~TLB_INVALID_MASK;
         }
-        tlb_addr = tlb_read_idx(entry, access_type) & ~TLB_INVALID_MASK;
     }
 
-    full = &cpu->neg.tlb.d[mmu_idx].fulltlb[index];
+    if (full == NULL) {
+        full = &desc->fulltlb[index];
+    }
     flags = tlb_addr & (TLB_FLAGS_MASK & ~TLB_FORCE_SLOW);
     flags |= full->slow_flags[access_type];
 
@@ -1881,6 +2111,7 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
                        uintptr_t ra, MMUAccessType type, MMULookupLocals *l)
 {
     bool crosspage;
+    bool single_page;
     vaddr last;
     int flags;
 
@@ -1894,8 +2125,12 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     l->page[1].addr = 0;
     l->page[1].size = 0;
 
+    single_page = l->page[0].size <=
+                  TARGET_PAGE_SIZE - (addr & ~TARGET_PAGE_MASK);
+
     /* Lookup and recognize exceptions from the first page. */
-    mmu_lookup1(cpu, &l->page[0], l->memop, l->mmu_idx, type, ra);
+    mmu_lookup1(cpu, &l->page[0], l->memop, l->mmu_idx, type,
+                single_page, ra);
 
     last = addr + l->page[0].size - 1;
     crosspage = (addr ^ last) & TARGET_PAGE_MASK;
@@ -1921,7 +2156,7 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
          * If the lookup potentially resized the table, refresh the
          * first CPUTLBEntryFull pointer.
          */
-        if (mmu_lookup1(cpu, &l->page[1], 0, l->mmu_idx, type, ra)) {
+        if (mmu_lookup1(cpu, &l->page[1], 0, l->mmu_idx, type, false, ra)) {
             uintptr_t index = tlb_index(cpu, l->mmu_idx, addr);
             l->page[0].full = &cpu->neg.tlb.d[l->mmu_idx].fulltlb[index];
         }
@@ -1979,6 +2214,7 @@ static void *atomic_mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
     /* Check TLB entry and enforce page permissions.  */
     tlb_addr = tlb_addr_write(tlbe);
     if (!tlb_hit(tlb_addr, addr)) {
+        victim_tlb_pingpong_reset(&cpu->neg.tlb.d[mmu_idx]);
         if (!victim_tlb_hit(cpu, mmu_idx, index, MMU_DATA_STORE,
                             addr & TARGET_PAGE_MASK)) {
             tlb_fill_align(cpu, addr, MMU_DATA_STORE, mmu_idx,

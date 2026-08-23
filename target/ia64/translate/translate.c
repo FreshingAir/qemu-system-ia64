@@ -914,6 +914,44 @@ static void ia64_invalidate_nat_known_for_insn(
     }
 }
 
+/*
+ * Return true when executing insn cannot introduce a GR NaT into a state in
+ * which every GR NaT is clear.  This is deliberately stricter than the
+ * ordinary per-register dataflow: it protects both an internal TCG back edge
+ * and direct chaining to a TB keyed by IA64_TB_FLAG_NAT_CLEAR.
+ */
+static bool ia64_insn_preserves_all_nat_clear(
+    const DisasContext *ctx, const Ia64Instruction *insn)
+{
+    if (!insn->valid || insn->placement_illegal || insn->reserved_field ||
+        insn->opcode == IA64_OP_BREAK ||
+        ia64_insn_may_swap_banked_gr(insn) ||
+        ia64_insn_may_rewrite_stacked_gr_view(insn)) {
+        return false;
+    }
+
+    if (!ia64_insn_writes_gr_r1(insn)) {
+        return true;
+    }
+
+    switch (ia64_nat_result_policy(insn)) {
+    case IA64_NAT_RESULT_CLEAR:
+    case IA64_NAT_RESULT_SOURCE_R1:
+    case IA64_NAT_RESULT_SOURCE_R2:
+    case IA64_NAT_RESULT_SOURCE_R3:
+    case IA64_NAT_RESULT_SOURCES_R2_R3:
+    case IA64_NAT_RESULT_SOURCES_R1_R2_R3:
+    case IA64_NAT_RESULT_PRESERVE_ON_FULL_ALAT:
+        return true;
+    case IA64_NAT_RESULT_R3_OR_UNIMPLEMENTED_VA:
+        return ia64_env_cpu_class(ctx->env)->impl_va_msb >= 60;
+    case IA64_NAT_RESULT_SET_IF_R3_SET:
+    case IA64_NAT_RESULT_UNKNOWN:
+    default:
+        return false;
+    }
+}
+
 void ia64_update_nat_known(DisasContext *ctx,
                            const Ia64Instruction *insn)
 {
@@ -1153,6 +1191,16 @@ TCGv_i64 ia64_gen_fr_sig_read(uint8_t reg)
     tcg_gen_shri_i64(bit, cpu_fr_sig[reg / 64], reg % 64);
     tcg_gen_andi_i64(bit, bit, 1);
     return bit;
+}
+
+TCGv_i64 ia64_gen_fr_sig_mask_read(uint32_t word, uint64_t mask)
+{
+    TCGv_i64 bits;
+
+    g_assert(word < ARRAY_SIZE(cpu_fr_sig));
+    bits = tcg_temp_new_i64();
+    tcg_gen_andi_i64(bits, cpu_fr_sig[word], mask);
+    return bits;
 }
 
 TCGv_i64 ia64_fr_significand_src(uint8_t reg)
@@ -2485,6 +2533,7 @@ static bool ia64_analyze_self_counted_loop(
     uint8_t zero_st1_base = 0;
     uint8_t zero_st1_slot = 0;
     bool zero_st1_release = false;
+    bool nat_clear_preserving = true;
     int self_loop_slot = -1;
     int slot;
 
@@ -2500,6 +2549,8 @@ static bool ia64_analyze_self_counted_loop(
             bundle_ip, slot);
         ia64_apply_mlx_long_fixup(template_code, slots, slot, &insn,
                                   &skip_x_slot);
+        nat_clear_preserving &=
+            ia64_insn_preserves_all_nat_clear(ctx, &insn);
         if (insn.valid &&
             ((insn.opcode == IA64_OP_BR_CLOOP &&
               insn.address + insn.operands.common.immediate == bundle_ip) ||
@@ -2532,6 +2583,8 @@ static bool ia64_analyze_self_counted_loop(
         return false;
     }
 
+    ctx->branch.counted_self_preserves_nat_clear = nat_clear_preserving;
+
     if (zero_st1_exact && zero_st1_seen && zero_st1_slot < self_loop_slot) {
         ctx->branch.cloop_zero_st1_valid = true;
         ctx->branch.cloop_zero_st1_release = zero_st1_release;
@@ -2541,6 +2594,12 @@ static bool ia64_analyze_self_counted_loop(
     return true;
 }
 
+static bool ia64_all_gr_nats_known_clear(const DisasContext *ctx)
+{
+    return ctx->memory.nat_known_clear[0] == UINT64_MAX &&
+           ctx->memory.nat_known_clear[1] == UINT64_MAX;
+}
+
 void ia64_prepare_self_counted_loop(
     DisasContext *ctx, uint8_t template_code,
     const IA64TemplateInfo *template_info, uint64_t *slots,
@@ -2548,6 +2607,7 @@ void ia64_prepare_self_counted_loop(
 {
     ctx->branch.counted_self_label = NULL;
     ctx->branch.cloop_zero_st1_valid = false;
+    ctx->branch.counted_self_preserves_nat_clear = false;
 
     if (ctx->restart.start_slot != 0 ||
         ctx->base.plugin_enabled ||
@@ -2565,10 +2625,14 @@ void ia64_prepare_self_counted_loop(
      * state has changed.  Values learned before the loop therefore do not
      * necessarily describe later iterations.
      */
-    ctx->memory.nat_known_clear[0] = 1;
-    ctx->memory.nat_known_clear[1] = 0;
-    ctx->memory.nat_known_set[0] = 0;
-    ctx->memory.nat_known_set[1] = 0;
+    if (!(ctx->base.tb->flags & IA64_TB_FLAG_NAT_CLEAR) ||
+        !ctx->branch.counted_self_preserves_nat_clear ||
+        !ia64_all_gr_nats_known_clear(ctx)) {
+        ctx->memory.nat_known_clear[0] = 1;
+        ctx->memory.nat_known_clear[1] = 0;
+        ctx->memory.nat_known_set[0] = 0;
+        ctx->memory.nat_known_set[1] = 0;
+    }
     ctx->reg.cfm_sof_valid = false;
     ctx->reg.cfm_sof_checked = 0;
     ctx->reg.cpl_known = false;
@@ -2733,6 +2797,42 @@ void ia64_gen_gr_nat_set(const Ia64Instruction *insn, uint8_t reg)
                     1ULL << (reg % 64));
 }
 
+void ia64_gen_gr_nat_or_from_1(const Ia64Instruction *insn, uint8_t dst,
+                               uint8_t src)
+{
+    IA64KnownNat src_known;
+    TCGv_i64 set;
+    uint64_t dst_mask;
+    uint64_t src_mask;
+
+    if (dst == 0) {
+        return;
+    }
+    if (dst == src || ia64_insn_nat_known(insn, dst) == IA64_NAT_SET) {
+        ia64_gen_note_stacked_gr_write(insn, dst);
+        return;
+    }
+
+    src_known = ia64_insn_nat_known(insn, src);
+    if (src_known == IA64_NAT_CLEAR) {
+        ia64_gen_note_stacked_gr_write(insn, dst);
+        return;
+    }
+    if (src_known == IA64_NAT_SET) {
+        ia64_gen_gr_nat_set(insn, dst);
+        return;
+    }
+
+    ia64_gen_note_stacked_gr_write(insn, dst);
+    dst_mask = 1ULL << (dst % 64);
+    src_mask = 1ULL << (src % 64);
+    set = tcg_temp_new_i64();
+    tcg_gen_ori_i64(set, cpu_nat[dst / 64], dst_mask);
+    tcg_gen_movcond_i64(TCG_COND_TSTNE, cpu_nat[dst / 64],
+                        cpu_nat[src / 64], tcg_constant_i64(src_mask),
+                        set, cpu_nat[dst / 64]);
+}
+
 void ia64_gen_gr_write_nat_clear(const Ia64Instruction *insn, uint8_t reg,
                                  TCGv_i64 value)
 {
@@ -2743,22 +2843,42 @@ void ia64_gen_gr_write_nat_clear(const Ia64Instruction *insn, uint8_t reg,
     ia64_gen_gr_nat_clear(insn, reg);
 }
 
-void ia64_gen_gr_nat_assign(const Ia64Instruction *insn, uint8_t reg,
-                            TCGv_i64 bit)
+static void ia64_gen_gr_nat_assign_masked(const Ia64Instruction *insn,
+                                          uint8_t reg, TCGv_i64 source,
+                                          uint64_t source_mask)
 {
-    TCGv_i64 shifted;
+    IA64KnownNat old_known;
+    TCGv_i64 cleared;
+    TCGv_i64 set;
+    uint64_t dst_mask;
 
     if (reg == 0) {
         return;
     }
 
     ia64_gen_note_stacked_gr_write(insn, reg);
-    shifted = tcg_temp_new_i64();
-    tcg_gen_andi_i64(shifted, bit, 1);
-    tcg_gen_shli_i64(shifted, shifted, reg % 64);
-    tcg_gen_andi_i64(cpu_nat[reg / 64], cpu_nat[reg / 64],
-                     ~(1ULL << (reg % 64)));
-    tcg_gen_or_i64(cpu_nat[reg / 64], cpu_nat[reg / 64], shifted);
+    old_known = ia64_insn_nat_known(insn, reg);
+    dst_mask = 1ULL << (reg % 64);
+    if (old_known == IA64_NAT_CLEAR) {
+        cleared = cpu_nat[reg / 64];
+    } else {
+        cleared = tcg_temp_new_i64();
+        tcg_gen_andi_i64(cleared, cpu_nat[reg / 64], ~dst_mask);
+    }
+    if (old_known == IA64_NAT_SET) {
+        set = cpu_nat[reg / 64];
+    } else {
+        set = tcg_temp_new_i64();
+        tcg_gen_ori_i64(set, cpu_nat[reg / 64], dst_mask);
+    }
+    tcg_gen_movcond_i64(TCG_COND_TSTNE, cpu_nat[reg / 64],
+                        source, tcg_constant_i64(source_mask), set, cleared);
+}
+
+void ia64_gen_gr_nat_assign(const Ia64Instruction *insn, uint8_t reg,
+                            TCGv_i64 bit)
+{
+    ia64_gen_gr_nat_assign_masked(insn, reg, bit, 1);
 }
 
 TCGv_i64 ia64_gen_gr_nat_read(uint8_t reg)
@@ -2783,6 +2903,10 @@ void ia64_gen_gr_nat_from_1(const Ia64Instruction *insn, uint8_t dst,
     if (dst == 0) {
         return;
     }
+    if (dst == src) {
+        ia64_gen_note_stacked_gr_write(insn, dst);
+        return;
+    }
 
     known = ia64_insn_nat_known(insn, src);
     if (known == IA64_NAT_CLEAR) {
@@ -2790,7 +2914,8 @@ void ia64_gen_gr_nat_from_1(const Ia64Instruction *insn, uint8_t dst,
     } else if (known == IA64_NAT_SET) {
         ia64_gen_gr_nat_set(insn, dst);
     } else {
-        ia64_gen_gr_nat_assign(insn, dst, ia64_gen_gr_nat_read(src));
+        ia64_gen_gr_nat_assign_masked(
+            insn, dst, cpu_nat[src / 64], 1ULL << (src % 64));
     }
 }
 
@@ -2882,6 +3007,12 @@ void ia64_gen_gr_nat_from_2(const Ia64Instruction *insn, uint8_t dst,
         ia64_gen_gr_nat_from_1(insn, dst, src1);
         return;
     }
+    if (src1 / 64 == src2 / 64) {
+        ia64_gen_gr_nat_assign_masked(
+            insn, dst, cpu_nat[src1 / 64],
+            (1ULL << (src1 % 64)) | (1ULL << (src2 % 64)));
+        return;
+    }
     bit = ia64_gen_gr_nat_read(src1);
     src_bit = ia64_gen_gr_nat_read(src2);
     tcg_gen_or_i64(bit, bit, src_bit);
@@ -2895,6 +3026,9 @@ void ia64_gen_gr_nat_from_3(const Ia64Instruction *insn, uint8_t dst,
     IA64KnownNat known2;
     IA64KnownNat known3;
     TCGv_i64 bit = NULL;
+    uint64_t source_mask = 0;
+    int source_word = -1;
+    bool one_source_word = true;
 
     if (dst == 0) {
         return;
@@ -2910,29 +3044,56 @@ void ia64_gen_gr_nat_from_3(const Ia64Instruction *insn, uint8_t dst,
         return;
     }
     if (known1 == IA64_NAT_UNKNOWN) {
-        bit = ia64_gen_gr_nat_read(src1);
+        source_word = src1 / 64;
+        source_mask = 1ULL << (src1 % 64);
     }
     if (known2 == IA64_NAT_UNKNOWN) {
-        if (bit == NULL) {
-            bit = ia64_gen_gr_nat_read(src2);
+        if (source_word < 0) {
+            source_word = src2 / 64;
+            source_mask = 1ULL << (src2 % 64);
+        } else if (source_word == src2 / 64) {
+            source_mask |= 1ULL << (src2 % 64);
         } else {
-            TCGv_i64 src_bit = ia64_gen_gr_nat_read(src2);
-
-            tcg_gen_or_i64(bit, bit, src_bit);
+            one_source_word = false;
         }
     }
     if (known3 == IA64_NAT_UNKNOWN) {
-        if (bit == NULL) {
-            bit = ia64_gen_gr_nat_read(src3);
+        if (source_word < 0) {
+            source_word = src3 / 64;
+            source_mask = 1ULL << (src3 % 64);
+        } else if (source_word == src3 / 64) {
+            source_mask |= 1ULL << (src3 % 64);
         } else {
-            TCGv_i64 src_bit = ia64_gen_gr_nat_read(src3);
-
-            tcg_gen_or_i64(bit, bit, src_bit);
+            one_source_word = false;
         }
     }
-    if (bit == NULL) {
+    if (source_word < 0) {
         ia64_gen_gr_nat_clear(insn, dst);
+    } else if (one_source_word) {
+        ia64_gen_gr_nat_assign_masked(
+            insn, dst, cpu_nat[source_word], source_mask);
     } else {
+        if (known1 == IA64_NAT_UNKNOWN) {
+            bit = ia64_gen_gr_nat_read(src1);
+        }
+        if (known2 == IA64_NAT_UNKNOWN) {
+            TCGv_i64 src_bit = ia64_gen_gr_nat_read(src2);
+
+            if (bit == NULL) {
+                bit = src_bit;
+            } else {
+                tcg_gen_or_i64(bit, bit, src_bit);
+            }
+        }
+        if (known3 == IA64_NAT_UNKNOWN) {
+            TCGv_i64 src_bit = ia64_gen_gr_nat_read(src3);
+
+            if (bit == NULL) {
+                bit = src_bit;
+            } else {
+                tcg_gen_or_i64(bit, bit, src_bit);
+            }
+        }
         ia64_gen_gr_nat_assign(insn, dst, bit);
     }
 }
@@ -2945,7 +3106,6 @@ void ia64_gen_check_nat_consumption(const Ia64Instruction *insn,
     const DisasContext *ctx = insn->ctx;
     IA64KnownNat known = ctx ?
         ia64_nat_known(ctx, reg) : IA64_NAT_UNKNOWN;
-    TCGv_i64 nat;
     TCGLabel *ok;
 
     if (known == IA64_NAT_CLEAR) {
@@ -2963,9 +3123,9 @@ void ia64_gen_check_nat_consumption(const Ia64Instruction *insn,
         return;
     }
 
-    nat = ia64_gen_gr_nat_read(reg);
     ok = gen_new_label();
-    tcg_gen_brcondi_i64(TCG_COND_EQ, nat, 0, ok);
+    tcg_gen_brcondi_i64(TCG_COND_TSTEQ, cpu_nat[reg / 64],
+                        1ULL << (reg % 64), ok);
     tcg_gen_movi_i64(cpu_ip, insn->address);
     gen_helper_raise_nat_consumption(
         tcg_env, tcg_constant_i64(isr_access),
@@ -3994,8 +4154,14 @@ static void ia64_tr_init_disas_context(DisasContextBase *db, CPUState *cs)
     ctx->restart.instruction_debug_psr_dynamic = false;
     ctx->memory.be_data = ctx->base.tb->flags & IA64_TB_FLAG_BE;
     ctx->memory.full_alat = ctx->env->alat_state.alat_full;
-    ctx->memory.nat_known_clear[0] = 1;
-    ctx->memory.nat_known_clear[1] = 0;
+    ctx->memory.direct_chain_nat_safe = true;
+    if (flags & IA64_TB_FLAG_NAT_CLEAR) {
+        ctx->memory.nat_known_clear[0] = UINT64_MAX;
+        ctx->memory.nat_known_clear[1] = UINT64_MAX;
+    } else {
+        ctx->memory.nat_known_clear[0] = 1;
+        ctx->memory.nat_known_clear[1] = 0;
+    }
     ctx->memory.nat_known_set[0] = 0;
     ctx->memory.nat_known_set[1] = 0;
     ctx->reg.cfm_sof_valid = false;
@@ -4145,6 +4311,8 @@ static void ia64_tr_translate_insn(DisasContextBase *db, CPUState *cs)
         known_nullified =
             ia64_predicate_nullifies_insn(&insn) &&
             ia64_predicate_known(ctx, insn.qp) == IA64_PREDICATE_ZERO;
+        ctx->memory.direct_chain_nat_safe = known_nullified ||
+            ia64_insn_preserves_all_nat_clear(ctx, &insn);
         if (!known_nullified && ia64_insn_may_set_psr_ic(&insn)) {
             ctx->restart.track_iipa = true;
         }
@@ -4195,6 +4363,7 @@ static void ia64_tr_translate_insn(DisasContextBase *db, CPUState *cs)
         ia64_gen_advance_restart_point(ctx, bundle_ip, slot, skip_x_slot);
         ia64_update_nat_known(ctx, &insn);
         ia64_update_cached_register_state(ctx, &insn);
+        ctx->memory.direct_chain_nat_safe = true;
         ctx->restart.instruction_group_start =
             ctx->restart.next_instruction_group_start;
         if (track_iipa_for_insn && !psr_ic_modified) {
@@ -4228,7 +4397,9 @@ void ia64_gen_goto_tb_group(DisasContext *ctx, uint64_t dest,
     ia64_gen_save_fault_slot_for_exit(ctx);
     ia64_gen_clear_ri();
     tcg_gen_movi_i64(cpu_ip, dest);
-    if (slot < 2 && translator_use_goto_tb(&ctx->base, dest)) {
+    if (slot < 2 && ctx->memory.direct_chain_nat_safe &&
+        ia64_all_gr_nats_known_clear(ctx) &&
+        translator_use_goto_tb(&ctx->base, dest)) {
         ctx->branch.goto_tb_slots = slot + 1;
         tcg_gen_goto_tb(slot);
         tcg_gen_exit_tb(ctx->base.tb, slot);

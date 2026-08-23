@@ -298,6 +298,14 @@ typedef struct CPUTLBDesc {
     CPUTLBEntry vtable[CPU_VTLB_SIZE];
     CPUTLBEntryFull vfulltlb[CPU_VTLB_SIZE];
     CPUTLBEntryFull *fulltlb;
+    /* Sustained two-page conflict tracking for normal RAM accesses. */
+    uintptr_t victim_tlb_pingpong_index;
+    vaddr victim_tlb_pingpong_last_page;
+    vaddr victim_tlb_pingpong_peer_page;
+    uint16_t victim_tlb_pingpong_hits;
+    uint8_t victim_tlb_pingpong_last_access;
+    uint8_t victim_tlb_pingpong_vindex;
+    bool victim_tlb_pingpong_pinned;
 } CPUTLBDesc;
 
 /*

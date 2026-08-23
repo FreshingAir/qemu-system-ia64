@@ -113,6 +113,7 @@ from .encoding import (
     ld4_postinc,
     ld8,
     ld8_a,
+    ld8_fill_postinc,
     ld8_postinc,
     ld8_s_postinc,
     loadrs_enc,
@@ -916,6 +917,88 @@ test_depz_len64_decode = require_registers("depz_len64_decode", [
      br_cond(0x30, 0x30)),
 ], {"ip": 0x30, "r7": 0x8123456789abcdef,
     "r8": 0x123456789abcdef0}, entry=0x10)
+
+test_integer_nat_identity_updates = require_registers(
+    "integer_nat_identity_updates", [
+        # UNAT bit 0 supplies a NaT to the fill from address 0x200.
+        (0x10, 0x01, mov_m_imm_ar(36, 1), addl(4, 0x200, 0),
+         nop_i()),
+        (0x20, 0x01, ld8_fill_postinc(5, 4, 0), nop_i(),
+         nop_i()),
+        # Cover unary dst==src, binary dst==src with a clear second source,
+        # and duplicate binary sources copied to a different destination.
+        (0x30, 0x01, nop_m(), depz_reg(5, 5, 6, 26),
+         nop_i()),
+        (0x40, 0x01, nop_m(), shladd(5, 5, 2, 0),
+         nop_i()),
+        (0x50, 0x01, nop_m(), add(6, 5, 5),
+         nop_i()),
+        # Exercise the same in-place binary path with a clear NaT.
+        (0x60, 0x01, nop_m(), adds(7, 3, 0),
+         nop_i()),
+        (0x70, 0x01, nop_m(), shladd(7, 7, 2, 0),
+         nop_i()),
+        (0x80, 0x11, nop_m(), nop_i(),
+         br_cond(0x80, 0x80)),
+        (0x200, 0x00, 0, 0,
+         0),
+    ], {
+        "ip": 0x80,
+        "r5_nat": 1,
+        "r6_nat": 1,
+        "r7": 12,
+        "r7_nat": 0,
+    }, entry=0x10)
+
+test_integer_nat_inplace_or_updates = require_registers(
+    "integer_nat_inplace_or_updates", [
+        # Give r6 and r8 a NaT via UNAT bit 0.  Branch to a fresh TB so the
+        # translator must handle their NaT state dynamically.
+        (0x10, 0x01, mov_m_imm_ar(36, 1), addl(4, 0x200, 0),
+         nop_i()),
+        (0x20, 0x01, ld8_fill_postinc(6, 4, 0), adds(5, 3, 0),
+         adds(7, 5, 0)),
+        (0x30, 0x01, ld8_fill_postinc(8, 4, 0), adds(9, 7, 0),
+         nop_i()),
+        (0x40, 0x10, nop_m(), nop_i(), br_cond(0x40, 0x80)),
+        # Cover both destination aliases and preservation of an already-set
+        # destination NaT when the other operand is clear at run time.
+        (0x80, 0x00, nop_m(), add(5, 5, 6), add(7, 8, 7)),
+        (0x90, 0x01, nop_m(), add(8, 8, 9), nop_i()),
+        (0xa0, 0x10, nop_m(), nop_i(), br_cond(0xa0, 0xa0)),
+        (0x200, 0x00, 0, 0, 0),
+    ], {
+        "ip": 0xa0,
+        "r5_nat": 1,
+        "r7_nat": 1,
+        "r8_nat": 1,
+        "r9_nat": 0,
+    }, entry=0x10)
+
+test_integer_nat_inplace_or_crosses_word_boundary = require_registers(
+    "integer_nat_inplace_or_crosses_word_boundary", [
+        (0x10, 0x00, nop_m(), alloc(20, 96, 30, 0, 0), nop_i()),
+        (0x20, 0x01, mov_m_imm_ar(36, 1), addl(6, 0x400, 0),
+         nop_i()),
+        (0x30, 0x01, ld8_fill_postinc(62, 6, 0), adds(63, 3, 0),
+         adds(65, 5, 0)),
+        (0x40, 0x01, ld8_fill_postinc(64, 6, 0), nop_i(), nop_i()),
+        (0x50, 0x10, nop_m(), nop_i(), br_cond(0x50, 0x80)),
+        # Exercise both directions across cpu_nat[0]/cpu_nat[1].
+        (0x80, 0x00, nop_m(), add(63, 63, 64), add(65, 62, 65)),
+        # A call remaps and synchronizes the stacked output registers, also
+        # checking that the optimized path retained dirty bookkeeping.
+        (0x90, 0x10, nop_m(), nop_i(), br_call(0, 0x90, 0xc0)),
+        (0xc0, 0x10, nop_m(), nop_i(), br_cond(0xc0, 0xc0)),
+        (0x400, 0x00, 0, 0, 0),
+    ], {
+        "ip": 0xc0,
+        "exception": IA64_EXCP_NONE,
+        "cfm_sof": 66,
+        # Caller r63/r65 are callee r33/r35.
+        "r33_nat": 1,
+        "r35_nat": 1,
+    }, entry=0x10)
 
 test_sxt1_decode = require_registers("sxt1_decode", [
     (0x10, 0x00, addl(3, 0xff, 0), nop_i(),
@@ -3441,6 +3524,9 @@ CASE_NAMES = (
     'ia32_bound_uses_16_bit_bound_elements',
     'ia32_pvi_cli_clears_vif_and_preserves_if',
     'ia32_self_modifying_store_updates_current_translation_block',
+    'integer_nat_identity_updates',
+    'integer_nat_inplace_or_crosses_word_boundary',
+    'integer_nat_inplace_or_updates',
     'br_indirect_ignores_low_bits',
     'br_indirect_predicate_false_falls_through',
     'br_wexit_false_predicate_drains_epilog',

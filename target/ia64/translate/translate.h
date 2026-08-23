@@ -32,6 +32,7 @@
 #define IA64_TB_FLAG_PSR_TB       (1u << 18)
 #define IA64_TB_FLAG_PSR_SS       (1u << 19)
 #define IA64_TB_FLAG_PSR_DB       (1u << 20)
+#define IA64_TB_FLAG_NAT_CLEAR    (1u << 21)
 #define IA64_TB_FLAG_IA32_PSR_DB  (1u << 29)
 #define IA64_TB_FLAG_IA32_PSR_AC  (1u << 30)
 #define IA64_TB_FLAG_PSR_IS       (1u << 31)
@@ -40,6 +41,7 @@ typedef struct IA64TranslationMemoryState {
     int mmu_idx;
     bool be_data;
     bool full_alat;
+    bool direct_chain_nat_safe;
     uint64_t nat_known_clear[2];
     uint64_t nat_known_set[2];
 } IA64TranslationMemoryState;
@@ -64,6 +66,7 @@ typedef struct IA64TranslationBranchState {
     TCGv_i64 counted_self_budget;
     uint64_t counted_self_ip;
     bool cloop_zero_st1_valid;
+    bool counted_self_preserves_nat_clear;
     bool cloop_zero_st1_release;
     uint8_t cloop_zero_st1_base;
     uint8_t cloop_zero_st1_slot;
@@ -141,6 +144,7 @@ extern TCGv_i64 cpu_psr;
 
 TCGv_i64 ia64_gr_src(uint8_t reg);
 TCGv_i64 ia64_gen_fr_sig_read(uint8_t reg);
+TCGv_i64 ia64_gen_fr_sig_mask_read(uint32_t word, uint64_t mask);
 TCGv_i64 ia64_fr_significand_src(uint8_t reg);
 TCGv_i64 ia64_gen_fr_nat_read(uint8_t reg);
 TCGv_i64 ia64_gen_fr_special_read(uint8_t reg);
@@ -152,6 +156,8 @@ void ia64_gen_gr_nat_clear(const Ia64Instruction *insn, uint8_t reg);
 void ia64_gen_gr_nat_set(const Ia64Instruction *insn, uint8_t reg);
 void ia64_gen_gr_nat_assign(const Ia64Instruction *insn, uint8_t reg,
                             TCGv_i64 bit);
+void ia64_gen_gr_nat_or_from_1(const Ia64Instruction *insn, uint8_t dst,
+                               uint8_t src);
 void ia64_gen_gr_nat_from_1(const Ia64Instruction *insn, uint8_t dst,
                             uint8_t src);
 void ia64_gen_gr_nat_from_2(const Ia64Instruction *insn, uint8_t dst,
