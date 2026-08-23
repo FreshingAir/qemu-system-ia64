@@ -85,6 +85,25 @@ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
+static void sdl2_window_lock_size(struct sdl2_console *scon)
+{
+    int width, height;
+
+    if (!scon->real_window) {
+        return;
+    }
+
+    SDL_SetWindowResizable(scon->real_window, SDL_FALSE);
+    if (gui_fullscreen) {
+        return;
+    }
+
+    width = surface_width(scon->surface);
+    height = surface_height(scon->surface);
+    SDL_SetWindowMinimumSize(scon->real_window, width, height);
+    SDL_SetWindowMaximumSize(scon->real_window, width, height);
+}
+
 void sdl2_window_create(struct sdl2_console *scon)
 {
     int flags = 0;
@@ -96,8 +115,6 @@ void sdl2_window_create(struct sdl2_console *scon)
 
     if (gui_fullscreen) {
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
-    } else {
-        flags |= SDL_WINDOW_RESIZABLE;
     }
     if (scon->hidden) {
         flags |= SDL_WINDOW_HIDDEN;
@@ -113,6 +130,7 @@ void sdl2_window_create(struct sdl2_console *scon)
                                          surface_width(scon->surface),
                                          surface_height(scon->surface),
                                          flags);
+    sdl2_window_lock_size(scon);
     if (scon->opengl) {
         const char *driver = "opengl";
 
@@ -157,13 +175,30 @@ void sdl2_window_destroy(struct sdl2_console *scon)
 
 void sdl2_window_resize(struct sdl2_console *scon)
 {
+    int current_width, current_height;
+    int width, height;
+
     if (!scon->real_window) {
         return;
     }
 
-    SDL_SetWindowSize(scon->real_window,
-                      surface_width(scon->surface),
-                      surface_height(scon->surface));
+    width = surface_width(scon->surface);
+    height = surface_height(scon->surface);
+
+    /* Temporarily allow both sizes so a guest mode change is not clamped. */
+    if (!gui_fullscreen) {
+        SDL_GetWindowSize(scon->real_window,
+                          &current_width, &current_height);
+        SDL_SetWindowMinimumSize(scon->real_window,
+                                 MIN(current_width, width),
+                                 MIN(current_height, height));
+        SDL_SetWindowMaximumSize(scon->real_window,
+                                 MAX(current_width, width),
+                                 MAX(current_height, height));
+    }
+
+    SDL_SetWindowSize(scon->real_window, width, height);
+    sdl2_window_lock_size(scon);
 }
 
 static void sdl2_redraw(struct sdl2_console *scon)
@@ -604,12 +639,10 @@ static void handle_windowevent(SDL_Event *ev)
 
     switch (ev->window.event) {
     case SDL_WINDOWEVENT_RESIZED:
-        {
-            QemuUIInfo info = {
-                .width = ev->window.data1,
-                .height = ev->window.data2,
-            };
-            dpy_set_ui_info(scon->dcl.con, &info, true);
+        if (!gui_fullscreen &&
+            (ev->window.data1 != surface_width(scon->surface) ||
+             ev->window.data2 != surface_height(scon->surface))) {
+            sdl2_window_resize(scon);
         }
         sdl2_redraw(scon);
         break;

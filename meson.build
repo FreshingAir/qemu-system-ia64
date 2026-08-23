@@ -594,13 +594,27 @@ if get_option('tsan')
   qemu_ldflags = ['-fsanitize=thread'] + qemu_ldflags
 endif
 
-# Detect support for PT_GNU_RELRO + DT_BIND_NOW.
-# The combination is known as "full relro", because .got.plt is read-only too.
-qemu_ldflags += cc.get_supported_link_arguments('-Wl,-z,relro', '-Wl,-z,now')
+if get_option('hardening')
+  # Detect support for PT_GNU_RELRO + DT_BIND_NOW.
+  # The combination is known as "full relro", because .got.plt is read-only too.
+  qemu_ldflags += cc.get_supported_link_arguments('-Wl,-z,relro', '-Wl,-z,now')
 
-if host_os == 'windows'
-  qemu_ldflags += cc.get_supported_link_arguments('-Wl,--no-seh', '-Wl,--nxcompat')
-  qemu_ldflags += cc.get_supported_link_arguments('-Wl,--dynamicbase', '-Wl,--high-entropy-va')
+  if host_os == 'windows'
+    qemu_ldflags += cc.get_supported_link_arguments('-Wl,--no-seh', '-Wl,--nxcompat')
+    qemu_ldflags += cc.get_supported_link_arguments('-Wl,--dynamicbase', '-Wl,--high-entropy-va')
+  endif
+elif host_os == 'windows'
+  # GNU ld enables these PE hardening bits by default.  Explicitly clear them
+  # so --disable-hardening also reverses linker defaults.
+  qemu_ldflags += cc.get_supported_link_arguments(
+    '-Wl,--disable-no-seh',
+    '-Wl,--disable-nxcompat',
+    '-Wl,--disable-dynamicbase',
+    '-Wl,--disable-high-entropy-va',
+  )
+else
+  # GNU ld enables partial RELRO by default on several distributions.
+  qemu_ldflags += cc.get_supported_link_arguments('-Wl,-z,norelro', '-Wl,-z,lazy')
 endif
 
 if get_option('fuzzing')
@@ -679,23 +693,26 @@ endif
 
 # Check further flags that make QEMU more robust against malicious parties
 
-hardening_flags = [
-    # Initialize all stack variables to zero. This makes
-    # it harder to take advantage of uninitialized stack
-    # data to drive exploits
-    '-ftrivial-auto-var-init=zero',
-]
+hardening_flags = []
+if get_option('hardening')
+  hardening_flags += [
+      # Initialize all stack variables to zero. This makes
+      # it harder to take advantage of uninitialized stack
+      # data to drive exploits
+      '-ftrivial-auto-var-init=zero',
+  ]
 
-# Zero out registers used during a function call
-# upon its return. This makes it harder to assemble
-# ROP gadgets into something usable
-#
-# NB: Clang 17 is broken and SEGVs
-# https://github.com/llvm/llvm-project/issues/75168
-if cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
-               name: '-fzero-call-used-regs=used-gpr',
-               args: ['-O2', '-fzero-call-used-regs=used-gpr'])
-    hardening_flags += '-fzero-call-used-regs=used-gpr'
+  # Zero out registers used during a function call
+  # upon its return. This makes it harder to assemble
+  # ROP gadgets into something usable
+  #
+  # NB: Clang 17 is broken and SEGVs
+  # https://github.com/llvm/llvm-project/issues/75168
+  if cc.compiles('extern struct { void (*cb)(void); } s; void f(void) { s.cb(); }',
+                 name: '-fzero-call-used-regs=used-gpr',
+                 args: ['-O2', '-fzero-call-used-regs=used-gpr'])
+      hardening_flags += '-fzero-call-used-regs=used-gpr'
+  endif
 endif
 
 qemu_common_flags += hardening_flags
@@ -4726,6 +4743,7 @@ if 'simple' in get_option('trace_backends')
   summary_info += {'Trace output file': get_option('trace_file') + '-<pid>'}
 endif
 summary_info += {'QOM debugging':     get_option('qom_cast_debug')}
+summary_info += {'Compiler/linker hardening': get_option('hardening')}
 summary_info += {'Relocatable install': get_option('relocatable')}
 summary_info += {'vhost-kernel support': have_vhost_kernel}
 summary_info += {'vhost-net support': have_vhost_net}

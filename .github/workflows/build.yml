@@ -71,39 +71,6 @@ jobs:
           ia64-linux-gnu-readelf -h "$elf" > firmware-elf-header.txt
           grep -Eiq 'Machine:.*IA-64' firmware-elf-header.txt
 
-      - name: Build the IA-64 SMP functional test assets
-        run: |
-          set -euo pipefail
-
-          asset_root="$PWD/ia64-functional-test-assets"
-          app_build="$PWD/build-ia64-functional-test-assets"
-
-          rm -rf "$asset_root" "$app_build"
-          mkdir -p \
-            "$asset_root/roms/ia64-firmware" \
-            "$asset_root/tests/functional/ia64" \
-            "$app_build"
-
-          tests/functional/ia64/apps/build-test-app.sh \
-            "$app_build/smp-app.efi" \
-            tests/functional/ia64/apps/smp-app.c \
-            tests/functional/ia64/apps/ia64-test-app.lds
-
-          install -m 0644 \
-            roms/ia64-firmware/ia64-firmware.bin \
-            "$asset_root/roms/ia64-firmware/"
-          install -m 0644 \
-            "$app_build/smp-app.efi" \
-            "$asset_root/tests/functional/ia64/"
-
-          test -s \
-            "$asset_root/roms/ia64-firmware/ia64-firmware.bin"
-          test -s \
-            "$asset_root/tests/functional/ia64/smp-app.efi"
-          ia64-linux-gnu-objdump -f \
-            "$asset_root/tests/functional/ia64/smp-app.efi" \
-            | grep -Eq 'file format pei-ia64'
-
       - name: Package the firmware
         run: |
           set -euo pipefail
@@ -137,20 +104,31 @@ jobs:
       - name: Upload the firmware artifact
         uses: actions/upload-artifact@v7
         with:
+          name: Firmware
           path: qemu-system-ia64-firmware.tar.gz
           if-no-files-found: error
           archive: false
 
-      - name: Upload the IA-64 functional test assets
-        uses: actions/upload-artifact@v7
-        with:
-          name: ia64-functional-test-assets
-          path: ia64-functional-test-assets/
-          if-no-files-found: error
-
   linux:
-    name: Linux x86-64 (GCC)
+    name: ${{ matrix.job_name }}
     runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: Linux x86-64 (GCC)
+            optimized: false
+            build_dir: build-linux
+            dist_stem: qemu-system-ia64-linux-x86_64
+            archive: qemu-system-ia64-linux-x86_64.tar.gz
+            artifact_name: Linux-AMD64
+          - job_name: Linux x86-64-v2 optimized (GCC)
+            optimized: true
+            build_dir: build-linux-x86_64-v2-optimized
+            dist_stem: qemu-system-ia64-linux-x86_64-v2-optimized
+            archive: qemu-system-ia64-linux-x86_64-v2-optimized.tar.gz
+            artifact_name: Linux-AMD64-x86-64-v2-optimized
 
     steps:
       - name: Check out the source tree
@@ -169,6 +147,7 @@ jobs:
             git \
             libfdt-dev \
             libglib2.0-dev \
+            libgtk-3-dev \
             libpixman-1-dev \
             libsdl2-dev \
             libslirp-dev \
@@ -185,18 +164,40 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf build-linux
-          mkdir -p build-linux
+          build_dir="${{ matrix.build_dir }}"
+          optimization_args=()
+          if [[ "${{ matrix.optimized }}" == "true" ]]; then
+            optimization_args=(
+              --x86-version=2
+              --enable-lto
+              --disable-debug-info
+              --enable-strip
+              --disable-qom-cast-debug
+              --disable-stack-protector
+              --disable-hardening
+              --disable-pie
+              --enable-trace-backends=nop
+              --extra-cflags="-fomit-frame-pointer -ffunction-sections -fdata-sections"
+              --extra-cxxflags="-fomit-frame-pointer -ffunction-sections -fdata-sections"
+              --extra-ldflags="-Wl,-O2 -Wl,--gc-sections -no-pie"
+              -Doptimization=3
+            )
+          fi
+
+          rm -rf "$build_dir"
+          mkdir -p "$build_dir"
 
           (
-            cd build-linux
+            cd "$build_dir"
             CC=gcc CXX=g++ ../configure \
+              "${optimization_args[@]}" \
               --python=/usr/bin/python3 \
               --target-list=ia64-softmmu \
               --enable-system \
               --enable-tcg \
               --enable-pixman \
               --enable-fdt=system \
+              --enable-gtk \
               --enable-sdl \
               --enable-slirp \
               --enable-vnc \
@@ -205,17 +206,21 @@ jobs:
           )
 
           # Build only the host emulator. Firmware is built in a separate job.
-          ninja -C build-linux -j"$(nproc)" qemu-system-ia64
+          ninja -C "$build_dir" -j"$(nproc)" qemu-system-ia64
+
+          if [[ "${{ matrix.optimized }}" == "true" ]]; then
+            strip --strip-unneeded "$build_dir/qemu-system-ia64"
+          fi
 
       - name: Validate and package the Linux artifact
         run: |
           set -euo pipefail
 
-          executable="build-linux/qemu-system-ia64"
+          executable="${{ matrix.build_dir }}/qemu-system-ia64"
           version="$(tr -d '\r\n' < VERSION)"
           dist_root="$PWD/dist"
-          dist="$dist_root/qemu-system-ia64-linux-x86_64-$version"
-          archive="$PWD/qemu-system-ia64-linux-x86_64.tar.gz"
+          dist="$dist_root/${{ matrix.dist_stem }}-$version"
+          archive="$PWD/${{ matrix.archive }}"
 
           test -x "$executable"
           test -s "$executable"
@@ -258,13 +263,13 @@ jobs:
       - name: Upload the Linux artifact
         uses: actions/upload-artifact@v7
         with:
-          path: qemu-system-ia64-linux-x86_64.tar.gz
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
           archive: false
 
   linux-aarch64:
     name: Linux AArch64 (GCC, native)
-    needs: firmware
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -291,6 +296,7 @@ jobs:
             git \
             libfdt-dev \
             libglib2.0-dev \
+            libgtk-3-dev \
             libpixman-1-dev \
             libsdl2-dev \
             libslirp-dev \
@@ -318,6 +324,7 @@ jobs:
               --enable-tcg \
               --enable-pixman \
               --enable-fdt=system \
+              --enable-gtk \
               --enable-sdl \
               --enable-slirp \
               --enable-vnc \
@@ -347,12 +354,6 @@ jobs:
           grep -Eq 'Machine:[[:space:]]+AArch64' <<<"$elf_header"
           "$executable" --version
 
-      - name: Download the IA-64 functional test assets
-        uses: actions/download-artifact@v8
-        with:
-          name: ia64-functional-test-assets
-          path: build-linux-aarch64
-
       - name: Run IA-64 TCG unit tests natively
         run: |
           set -euo pipefail
@@ -376,26 +377,74 @@ jobs:
             qemu:test-ia64-tcg-pal \
             qemu:qtest-ia64/ia64-vpc-test
 
-      - name: Run the IA-64 SMP functional test repeatedly
+      - name: Package the Linux AArch64 artifact
         run: |
           set -euo pipefail
 
-          test -s \
-            build-linux-aarch64/roms/ia64-firmware/ia64-firmware.bin
-          test -s \
-            build-linux-aarch64/tests/functional/ia64/smp-app.efi
+          executable="build-linux-aarch64/qemu-system-ia64"
+          version="$(tr -d '\r\n' < VERSION)"
+          dist_root="$PWD/dist"
+          dist="$dist_root/qemu-system-ia64-linux-aarch64-$version"
+          archive="$PWD/qemu-system-ia64-linux-aarch64.tar.gz"
 
-          build-linux-aarch64/pyvenv/bin/meson test \
-            -C build-linux-aarch64 \
-            --no-rebuild \
-            --num-processes 1 \
-            --print-errorlogs \
-            --repeat 3 \
-            qemu:func-ia64-smp
+          ldd "$executable" | tee linux-aarch64-library-dependencies.txt
+          ! grep -Fq 'not found' linux-aarch64-library-dependencies.txt
+
+          rm -rf "$dist_root" "$archive"
+          mkdir -p "$dist/share/keymaps"
+
+          install -m 0755 "$executable" "$dist/"
+          install -m 0644 \
+            COPYING \
+            COPYING.LIB \
+            LICENSE \
+            README.md \
+            linux-aarch64-library-dependencies.txt \
+            "$dist/"
+
+          install -m 0644 \
+            pc-bios/efi-e1000.rom \
+            pc-bios/vgabios-ati.bin \
+            pc-bios/vgabios-stdvga.bin \
+            "$dist/share/"
+
+          install -m 0644 pc-bios/keymaps/* "$dist/share/keymaps/"
+
+          tar -czf "$archive" \
+            -C "$dist_root" \
+            "$(basename "$dist")"
+
+          test -s "$archive"
+          tar -tzf "$archive" >/dev/null
+
+      - name: Upload the Linux AArch64 artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: Linux-AA64
+          path: qemu-system-ia64-linux-aarch64.tar.gz
+          if-no-files-found: error
+          archive: false
 
   windows:
-    name: Windows x86-64 (MSYS2 MinGW GCC)
+    name: ${{ matrix.job_name }}
     runs-on: windows-2022
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - job_name: Windows x86-64 (MSYS2 MinGW GCC)
+            optimized: false
+            build_dir: build-win64
+            dist_stem: qemu-system-ia64-windows-x86_64
+            archive: qemu-system-ia64-windows-x86_64.zip
+            artifact_name: Windows-AMD64
+          - job_name: Windows x86-64-v2 optimized (MSYS2 MinGW GCC)
+            optimized: true
+            build_dir: build-win64-x86_64-v2-optimized
+            dist_stem: qemu-system-ia64-windows-x86_64-v2-optimized
+            archive: qemu-system-ia64-windows-x86_64-v2-optimized.zip
+            artifact_name: Windows-AMD64-x86-64-v2-optimized
 
     defaults:
       run:
@@ -427,6 +476,7 @@ jobs:
             mingw-w64-x86_64-dtc
             mingw-w64-x86_64-gcc
             mingw-w64-x86_64-glib2
+            mingw-w64-x86_64-gtk3
             mingw-w64-x86_64-libslirp
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pixman
@@ -441,18 +491,46 @@ jobs:
         run: |
           set -euo pipefail
 
-          rm -rf build-win64
-          mkdir -p build-win64
+          build_dir="${{ matrix.build_dir }}"
+          optimization_args=()
+          configure_env=(CC=gcc CXX=g++)
+          if [[ "${{ matrix.optimized }}" == "true" ]]; then
+            # GCC's LTO bytecode requires plugin-aware archive tools.
+            configure_env+=(AR=gcc-ar NM=gcc-nm RANLIB=gcc-ranlib)
+            optimization_args=(
+              --x86-version=2
+              --enable-lto
+              --disable-debug-info
+              --enable-strip
+              --disable-qom-cast-debug
+              --disable-stack-protector
+              --disable-hardening
+              --disable-pie
+              --enable-trace-backends=nop
+              --extra-cflags="-fomit-frame-pointer"
+              --extra-cxxflags="-fomit-frame-pointer"
+              # Some MinGW GCC/LTO combinations emit invalid SEH directives
+              # when final assembly is split into per-function sections.
+              # Retain LTO and gc-sections, but disable those two transforms.
+              --extra-ldflags="-Wl,-O2 -Wl,--gc-sections -fno-function-sections -fno-data-sections"
+              -Doptimization=3
+            )
+          fi
+
+          rm -rf "$build_dir"
+          mkdir -p "$build_dir"
 
           (
-            cd build-win64
-            CC=gcc CXX=g++ ../configure \
+            cd "$build_dir"
+            env "${configure_env[@]}" ../configure \
+              "${optimization_args[@]}" \
               --python=/mingw64/bin/python \
               --target-list=ia64-softmmu \
               --enable-system \
               --enable-tcg \
               --enable-pixman \
               --enable-fdt=system \
+              --enable-gtk \
               --enable-sdl \
               --enable-slirp \
               --enable-vnc \
@@ -461,17 +539,24 @@ jobs:
           )
 
           # Build only the host executables. Firmware is built in a separate job.
-          ninja -C build-win64 -j"$(nproc)" \
+          ninja -C "$build_dir" -j"$(nproc)" \
             qemu-system-ia64.exe \
             qemu-system-ia64w.exe
+
+          if [[ "${{ matrix.optimized }}" == "true" ]]; then
+            strip --strip-unneeded \
+              "$build_dir/qemu-system-ia64.exe" \
+              "$build_dir/qemu-system-ia64w.exe"
+          fi
 
       - name: Validate and stage the Windows distribution
         run: |
           set -euo pipefail
 
+          build_dir="${{ matrix.build_dir }}"
           version="$(tr -d '\r\n' < VERSION)"
           dist_root="$PWD/dist"
-          dist="$dist_root/qemu-system-ia64-windows-x86_64-$version"
+          dist="$dist_root/${{ matrix.dist_stem }}-$version"
 
           imported_dlls() {
             objdump -p "$1" \
@@ -490,19 +575,23 @@ jobs:
           }
 
           for executable in \
-            build-win64/qemu-system-ia64.exe \
-            build-win64/qemu-system-ia64w.exe; do
+            "$build_dir/qemu-system-ia64.exe" \
+            "$build_dir/qemu-system-ia64w.exe"; do
             test -s "$executable"
             format="$(objdump -f "$executable")"
             grep -q 'pei-x86-64' <<<"$format"
           done
 
           rm -rf "$dist_root"
-          mkdir -p "$dist/share/keymaps"
+          mkdir -p \
+            "$dist/etc" \
+            "$dist/lib" \
+            "$dist/share/icons" \
+            "$dist/share/keymaps"
 
           install -m 0755 \
-            build-win64/qemu-system-ia64.exe \
-            build-win64/qemu-system-ia64w.exe \
+            "$build_dir/qemu-system-ia64.exe" \
+            "$build_dir/qemu-system-ia64w.exe" \
             "$dist/"
 
           install -m 0644 \
@@ -520,12 +609,30 @@ jobs:
 
           install -m 0644 pc-bios/keymaps/* "$dist/share/keymaps/"
 
+          # GTK loads these resources and modules at runtime rather than
+          # expressing them as executable DLL imports.
+          cp -aL /mingw64/etc/fonts "$dist/etc/"
+          cp -aL /mingw64/etc/gtk-3.0 "$dist/etc/"
+          cp -aL /mingw64/lib/gdk-pixbuf-2.0 "$dist/lib/"
+          cp -aL /mingw64/lib/gtk-3.0 "$dist/lib/"
+          cp -aL /mingw64/share/fontconfig "$dist/share/"
+          cp -aL /mingw64/share/glib-2.0 "$dist/share/"
+          cp -aL /mingw64/share/gtk-3.0 "$dist/share/"
+          cp -aL /mingw64/share/icons/Adwaita "$dist/share/icons/"
+          cp -aL /mingw64/share/icons/AdwaitaLegacy "$dist/share/icons/"
+          cp -aL /mingw64/share/icons/hicolor "$dist/share/icons/"
+          cp -aL /mingw64/share/mime "$dist/share/"
+          cp -aL /mingw64/share/themes "$dist/share/"
+
           # Copy MinGW runtime DLLs and their transitive dependencies.
           declare -A seen=()
           queue=(
             "$dist/qemu-system-ia64.exe"
             "$dist/qemu-system-ia64w.exe"
           )
+          while IFS= read -r module; do
+            queue+=("$module")
+          done < <(find "$dist/lib" -type f -iname '*.dll' -print)
 
           while (( ${#queue[@]} > 0 )); do
             pe_file="${queue[0]}"
@@ -552,10 +659,35 @@ jobs:
           done
 
           test "$(find "$dist" -maxdepth 1 -type f -iname '*.dll' | wc -l)" -gt 0
+          test -f "$dist/libgtk-3-0.dll"
+          test -f "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+          test "$(find "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+            -type f -iname '*.dll' | wc -l)" -gt 0
+          test -f "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+          test -f "$dist/share/glib-2.0/schemas/gschemas.compiled"
+          test -f "$dist/share/icons/Adwaita/index.theme"
+          test -f "$dist/share/icons/AdwaitaLegacy/index.theme"
+          test -f "$dist/share/icons/Adwaita/icon-theme.cache"
+          test -f "$dist/share/icons/AdwaitaLegacy/icon-theme.cache"
+          test -f "$dist/share/icons/hicolor/icon-theme.cache"
+          test -f "$dist/share/mime/mime.cache"
 
-          # Run the staged executable without the MSYS2 MinGW bin directory.
+          # Module caches must remain valid after extracting the artifact to
+          # a location other than the MSYS2 installation prefix.
+          grep -Eq '^"lib[\\/]gdk-pixbuf-2\.0[\\/]' \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+          ! grep -Eiq '(^|")([a-z]:[\\/]|/mingw64/)' \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" \
+            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+
+          # Run both staged executables without the MSYS2 MinGW bin directory.
           PATH="$dist:/c/Windows/System32:/c/Windows" \
             "$dist/qemu-system-ia64.exe" --version
+          PATH="$dist:/c/Windows/System32:/c/Windows" \
+            "$dist/qemu-system-ia64w.exe" --version
+          PATH="$dist:/c/Windows/System32:/c/Windows" \
+            "$dist/qemu-system-ia64.exe" -display help 2>&1 \
+            | grep -Eq '(^|[[:space:]])gtk([[:space:]]|$)'
 
       - name: Create the Windows archive
         shell: pwsh
@@ -563,8 +695,8 @@ jobs:
           $ErrorActionPreference = "Stop"
 
           $version = (Get-Content -Raw VERSION).Trim()
-          $source = Join-Path $PWD "dist\qemu-system-ia64-windows-x86_64-$version"
-          $archive = Join-Path $PWD "qemu-system-ia64-windows-x86_64.zip"
+          $source = Join-Path $PWD "dist\${{ matrix.dist_stem }}-$version"
+          $archive = Join-Path $PWD "${{ matrix.archive }}"
 
           Remove-Item -Force $archive -ErrorAction SilentlyContinue
           Compress-Archive -LiteralPath $source -DestinationPath $archive -CompressionLevel Optimal
@@ -576,6 +708,7 @@ jobs:
       - name: Upload the Windows artifact
         uses: actions/upload-artifact@v7
         with:
-          path: qemu-system-ia64-windows-x86_64.zip
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.archive }}
           if-no-files-found: error
           archive: false

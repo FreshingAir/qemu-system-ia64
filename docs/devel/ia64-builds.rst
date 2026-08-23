@@ -159,7 +159,13 @@ Performance build
 -----------------
 
 For guest-performance measurements, use a dedicated IA-64-only build without
-compiler hardening passes that add overhead to TCG helper calls.
+compiler and linker hardening passes that add overhead to TCG helper calls.
+This example requires an x86-64-v2 host (SSE4.2 and POPCNT), retains QEMU's
+runtime dispatch to newer AVX implementations, and disables debug information,
+QOM cast checks, and tracing.  QEMU intentionally rejects ``NDEBUG`` builds,
+so its regular assertions remain enabled.  ``--disable-hardening`` also
+reverses linker defaults: it disables ELF RELRO or the Windows PE ASLR, DEP,
+and NO_SEH opt-in bits, as applicable.
 
 .. code-block:: sh
 
@@ -167,17 +173,29 @@ compiler hardening passes that add overhead to TCG helper calls.
    (
      cd build-ia64-perf
      ../configure --target-list=ia64-softmmu \
+       --x86-version=2 \
        --enable-lto \
+       --disable-debug-info \
+       --enable-strip \
        --disable-qom-cast-debug \
        --disable-stack-protector \
-       --extra-cflags='-fno-stack-protector -fzero-call-used-regs=skip -ftrivial-auto-var-init=uninitialized' \
-       -Doptimization=2 \
+       --disable-hardening \
+       --disable-pie \
+       --enable-trace-backends=nop \
+       --extra-cflags='-fomit-frame-pointer -ffunction-sections -fdata-sections' \
+       --extra-cxxflags='-fomit-frame-pointer -ffunction-sections -fdata-sections' \
+       --extra-ldflags='-Wl,-O2 -Wl,--gc-sections -no-pie' \
+       -Doptimization=3 \
        --enable-gtk
      ninja qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
+     strip --strip-unneeded qemu-system-ia64
    )
 
-Keep a separate debug build for correctness testing.  For a comparison build
-that will run only on x86-64-v3 hosts, add ``--x86-version=3``.
+Meson's ``--enable-strip`` applies when installing targets rather than when
+copying them directly from the build directory, hence the explicit ``strip``
+above.  Keep a separate hardened or debug build for untrusted guests and
+correctness testing.  For a comparison build that will run only on x86-64-v3
+hosts, use ``--x86-version=3`` instead.
 
 Profile-guided optimization
 ---------------------------
@@ -193,7 +211,7 @@ Use a dedicated build directory and the same compiler for both stages.
        --enable-lto \
        --disable-qom-cast-debug \
        --disable-stack-protector \
-       --extra-cflags='-fno-stack-protector -fzero-call-used-regs=skip -ftrivial-auto-var-init=uninitialized' \
+       --disable-hardening \
        -Doptimization=2 \
        -Db_pgo=generate
      ninja qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
