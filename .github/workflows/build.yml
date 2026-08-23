@@ -230,7 +230,10 @@ jobs:
           grep -Eq 'ELF 64-bit.*x86-64' linux-file.txt
 
           ldd "$executable" | tee linux-library-dependencies.txt
-          ! grep -Fq 'not found' linux-library-dependencies.txt
+          if grep -Fq 'not found' linux-library-dependencies.txt; then
+            echo "Linux x86-64 artifact has unresolved shared libraries" >&2
+            exit 1
+          fi
           "$executable" --version
 
           rm -rf "$dist_root" "$archive"
@@ -388,7 +391,10 @@ jobs:
           archive="$PWD/qemu-system-ia64-linux-aarch64.tar.gz"
 
           ldd "$executable" | tee linux-aarch64-library-dependencies.txt
-          ! grep -Fq 'not found' linux-aarch64-library-dependencies.txt
+          if grep -Fq 'not found' linux-aarch64-library-dependencies.txt; then
+            echo "Linux AArch64 artifact has unresolved shared libraries" >&2
+            exit 1
+          fi
 
           rm -rf "$dist_root" "$archive"
           mkdir -p "$dist/share/keymaps"
@@ -472,11 +478,18 @@ jobs:
             grep
             make
             sed
+            mingw-w64-x86_64-adwaita-icon-theme
+            mingw-w64-x86_64-adwaita-icon-theme-legacy
             mingw-w64-x86_64-binutils
             mingw-w64-x86_64-dtc
+            mingw-w64-x86_64-fontconfig
             mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-gdk-pixbuf2
             mingw-w64-x86_64-glib2
             mingw-w64-x86_64-gtk3
+            mingw-w64-x86_64-gtk-update-icon-cache
+            mingw-w64-x86_64-hicolor-icon-theme
+            mingw-w64-x86_64-librsvg
             mingw-w64-x86_64-libslirp
             mingw-w64-x86_64-ninja
             mingw-w64-x86_64-pixman
@@ -485,6 +498,7 @@ jobs:
             mingw-w64-x86_64-python-setuptools
             mingw-w64-x86_64-python-wheel
             mingw-w64-x86_64-SDL2
+            mingw-w64-x86_64-shared-mime-info
             mingw-w64-x86_64-zlib
 
       - name: Configure and build the Windows emulator
@@ -570,16 +584,25 @@ jobs:
 
             [[ "$lower" == api-ms-win-*.dll ||
                "$lower" == ext-ms-win-*.dll ||
-               -f "/c/Windows/System32/$dll" ||
-               -f "/c/Windows/SysWOW64/$dll" ]]
+               -f "/c/Windows/System32/$dll" ]]
           }
 
           for executable in \
             "$build_dir/qemu-system-ia64.exe" \
             "$build_dir/qemu-system-ia64w.exe"; do
-            test -s "$executable"
-            format="$(objdump -f "$executable")"
-            grep -q 'pei-x86-64' <<<"$format"
+            if [[ ! -s "$executable" ]]; then
+              echo "Missing or empty Windows executable: $executable" >&2
+              exit 1
+            fi
+            if ! format="$(objdump -f "$executable")"; then
+              echo "Unable to inspect Windows executable: $executable" >&2
+              exit 1
+            fi
+            if ! grep -q 'pei-x86-64' <<<"$format"; then
+              echo "Unexpected executable format: $executable" >&2
+              printf '%s\n' "$format" >&2
+              exit 1
+            fi
           done
 
           rm -rf "$dist_root"
@@ -592,6 +615,13 @@ jobs:
           install -m 0755 \
             "$build_dir/qemu-system-ia64.exe" \
             "$build_dir/qemu-system-ia64w.exe" \
+            "$dist/"
+
+          # GLib locates these helpers by name at runtime; they do not appear
+          # in the executable's PE import table.
+          install -m 0755 \
+            /mingw64/bin/gspawn-win64-helper.exe \
+            /mingw64/bin/gspawn-win64-helper-console.exe \
             "$dist/"
 
           install -m 0644 \
@@ -624,11 +654,33 @@ jobs:
           cp -aL /mingw64/share/mime "$dist/share/"
           cp -aL /mingw64/share/themes "$dist/share/"
 
+          # Generate relocatable module caches explicitly.  The Windows GTK3
+          # package currently has no external input-method DLLs, so its pacman
+          # hook does not create immodules.cache on a fresh installation.
+          /mingw64/bin/gdk-pixbuf-query-loaders.exe \
+            | tr -d '\r' \
+            > "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+          /mingw64/bin/gtk-query-immodules-3.0.exe \
+            | tr -d '\r' \
+            > "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+
+          # Rebuild every other package-hook-generated cache in the staged
+          # tree instead of relying on the state of the MSYS2 installation.
+          /mingw64/bin/glib-compile-schemas.exe \
+            "$dist/share/glib-2.0/schemas"
+          for icon_theme in Adwaita AdwaitaLegacy hicolor; do
+            /mingw64/bin/gtk-update-icon-cache.exe -f -q \
+              "$dist/share/icons/$icon_theme"
+          done
+          /mingw64/bin/update-mime-database.exe "$dist/share/mime"
+
           # Copy MinGW runtime DLLs and their transitive dependencies.
           declare -A seen=()
           queue=(
             "$dist/qemu-system-ia64.exe"
             "$dist/qemu-system-ia64w.exe"
+            "$dist/gspawn-win64-helper.exe"
+            "$dist/gspawn-win64-helper-console.exe"
           )
           while IFS= read -r module; do
             queue+=("$module")
@@ -638,6 +690,10 @@ jobs:
             pe_file="${queue[0]}"
             queue=("${queue[@]:1}")
 
+            if ! imports="$(imported_dlls "$pe_file")"; then
+              echo "Unable to inspect PE imports: $pe_file" >&2
+              exit 1
+            fi
             while IFS= read -r dll; do
               [[ -n "$dll" ]] || continue
 
@@ -655,39 +711,84 @@ jobs:
                 echo "Missing runtime DLL: $dll (required by $pe_file)" >&2
                 exit 1
               fi
-            done < <(imported_dlls "$pe_file")
+            done <<<"$imports"
           done
 
-          test "$(find "$dist" -maxdepth 1 -type f -iname '*.dll' | wc -l)" -gt 0
-          test -f "$dist/libgtk-3-0.dll"
-          test -f "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
-          test "$(find "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
-            -type f -iname '*.dll' | wc -l)" -gt 0
-          test -f "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
-          test -f "$dist/share/glib-2.0/schemas/gschemas.compiled"
-          test -f "$dist/share/icons/Adwaita/index.theme"
-          test -f "$dist/share/icons/AdwaitaLegacy/index.theme"
-          test -f "$dist/share/icons/Adwaita/icon-theme.cache"
-          test -f "$dist/share/icons/AdwaitaLegacy/icon-theme.cache"
-          test -f "$dist/share/icons/hicolor/icon-theme.cache"
-          test -f "$dist/share/mime/mime.cache"
+          runtime_dll_count="$(find "$dist" -maxdepth 1 \
+            -type f -iname '*.dll' | wc -l)"
+          if (( runtime_dll_count == 0 )); then
+            echo "No MinGW runtime DLLs were staged" >&2
+            exit 1
+          fi
+
+          loader_dll_count="$(find \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders" \
+            -type f -iname '*.dll' | wc -l)"
+          if (( loader_dll_count == 0 )); then
+            echo "No GDK Pixbuf loader DLLs were staged" >&2
+            exit 1
+          fi
+
+          required_runtime_files=(
+            "$dist/libgtk-3-0.dll"
+            "$dist/gspawn-win64-helper.exe"
+            "$dist/gspawn-win64-helper-console.exe"
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
+            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+            "$dist/share/glib-2.0/schemas/gschemas.compiled"
+            "$dist/share/icons/Adwaita/index.theme"
+            "$dist/share/icons/AdwaitaLegacy/index.theme"
+            "$dist/share/icons/Adwaita/icon-theme.cache"
+            "$dist/share/icons/AdwaitaLegacy/icon-theme.cache"
+            "$dist/share/icons/hicolor/icon-theme.cache"
+            "$dist/share/mime/mime.cache"
+          )
+          for required_file in "${required_runtime_files[@]}"; do
+            if [[ ! -f "$required_file" ]]; then
+              echo "Missing staged GTK runtime file: $required_file" >&2
+              exit 1
+            fi
+          done
 
           # Module caches must remain valid after extracting the artifact to
           # a location other than the MSYS2 installation prefix.
-          grep -Eq '^"lib(/|\\\\)gdk-pixbuf-2\.0(/|\\\\)' \
-            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"
-          ! grep -Eiq '(^|")([a-z]:[\\/]|/mingw64/)' \
+          if ! grep -Eiq '^"[^"]*libpixbufloader-[^"]+\.dll"$' \
+            "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache"; then
+            echo "GDK Pixbuf loader cache contains no loader entries" >&2
+            exit 1
+          fi
+          if grep -Eiq '(^|")([a-z]:[\\/]|/mingw64/)' \
             "$dist/lib/gdk-pixbuf-2.0/2.10.0/loaders.cache" \
-            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"
+            "$dist/lib/gtk-3.0/3.0.0/immodules.cache"; then
+            echo "GTK module cache contains an absolute MSYS2 path" >&2
+            exit 1
+          fi
 
           # Run both staged executables without the MSYS2 MinGW bin directory.
-          PATH="$dist:/c/Windows/System32:/c/Windows" \
-            "$dist/qemu-system-ia64.exe" --version
-          PATH="$dist:/c/Windows/System32:/c/Windows" \
-            "$dist/qemu-system-ia64w.exe" --version
-          PATH="$dist:/c/Windows/System32:/c/Windows" \
-            "$dist/qemu-system-ia64.exe" -display help 2>&1 \
-            | grep -Eq '(^|[[:space:]])gtk([[:space:]]|$)'
+          runtime_path="$dist:/c/Windows/System32:/c/Windows"
+          if ! PATH="$runtime_path" \
+            "$dist/qemu-system-ia64.exe" --version; then
+            echo "Staged console executable failed to start" >&2
+            exit 1
+          fi
+          if ! PATH="$runtime_path" \
+            "$dist/qemu-system-ia64w.exe" --version; then
+            echo "Staged GUI executable failed to start" >&2
+            exit 1
+          fi
+
+          if ! display_help="$(PATH="$runtime_path" \
+            "$dist/qemu-system-ia64.exe" -display help 2>&1)"; then
+            printf '%s\n' "$display_help" >&2
+            echo "Unable to query staged display backends" >&2
+            exit 1
+          fi
+          printf '%s\n' "$display_help"
+          if ! grep -Eq '(^|[[:space:]])gtk([[:space:]]|$)' \
+            <<<"$display_help"; then
+            echo "Staged executable does not expose the GTK display backend" >&2
+            exit 1
+          fi
 
       - name: Create the Windows archive
         shell: pwsh
