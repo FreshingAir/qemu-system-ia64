@@ -15,10 +15,13 @@ is the canonical source for current Windows AMD64 and Linux AMD64/AArch64 host
 archives and the separate firmware artifact. Download one host archive and the
 firmware, then pass the extracted `ia64-firmware.bin` path to `-bios`.
 
-The AMD64 jobs publish both a broadly compatible build and an
-`x86-64-v2-optimized` build.  The latter requires an x86-64-v2 host and trades
-debugging and hardening features for emulator speed; use it only with trusted
-guest software.
+> [!NOTE]
+> The AMD64 jobs publish both a broadly compatible build and an
+> `x86-64-v2-optimized` build.  The latter requires an x86-64-v2 host and trades
+> debugging and hardening features for emulator speed; use it only with trusted
+> guest software. Also, optimized versions can cause problems, so if you encounter
+> a problem with optimized build, please try it again with builds with the least and
+> basic optimizations.
 
 [GitHub Releases](https://github.com/syunnPC/qemu-system-ia64/releases)
 retains selected builds for convenience, but may lag behind or omit some host
