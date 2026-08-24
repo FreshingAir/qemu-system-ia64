@@ -151,15 +151,16 @@ typedef struct IA64RSEState {
      * rather than a contiguous range: incomplete-frame movement can make
      * stores non-contiguous.
      *
-     * RSE.BspLoad can walk a different collection from AR.BSPSTORE.  Its
-     * value and defined mask therefore live in a separate fill-side latch.
-     * Internal partition movement can also suspend more than one partial
-     * collection.  The shadow entries retain both their values and explicit
-     * defined masks until the store pointer returns to them.  These latches
-     * model externally visible RSE effects; they are not new architectural
-     * registers.  UINT64_MAX rse_rnat_addr denotes an entirely undefined
-     * spill-side RNAT after mov-to-BSPSTORE, loadrs, or an RNAT collection
-     * spill.
+     * RSE.BspLoad can walk a different collection from AR.BSPSTORE.  The
+     * fill-side latch models the NaT dispersal register described by SDM
+     * Vol.3, which need not be AR.RNAT.  Internal partition movement can also
+     * suspend more than one partial collection.  The shadow entries retain
+     * both their values and explicit defined masks until the store pointer
+     * returns to them; across loadrs they also hold the partial collection at
+     * the tear point that has no complete memory image.  These latches are
+     * implementation state, not new architectural registers.  UINT64_MAX
+     * rse_rnat_addr denotes an entirely undefined spill-side RNAT after
+     * mov-to-BSPSTORE, loadrs, or an RNAT collection spill.
      *
      * loadrs makes AR.RNAT architecturally undefined, but that permission
      * to hide its value does not permit a later partial collection store to

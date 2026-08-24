@@ -1088,6 +1088,71 @@ test_rse_merced_respill_preserves_filled_rnat_prefix = require_registers(
         "cfm_sol": 0,
     }, entry=0x10, cpu="merced")
 
+"""A fill-side NaT collection displaced by another collection remains part
+of the physical RSE state across loadrs.  The first synthetic return restores
+a NaT in a partial upper collection, then lower fills displace that collection
+from the one-entry load latch.  An interruption covers the frame and executes
+loadrs with a 30-word tear point, making the NaT-bearing physical register
+invalid before its partial collection word has reached memory.  Growing an
+80-register handler frame crosses that collection word and reuses its physical
+slot.  The writeback must merge the retained NaT image so rfi and the two
+ordinary returns restore the original NaT instead of silently clearing it."""
+test_rse_displaced_dispersal_survives_loadrs_physical_reuse = \
+    require_registers(
+        "rse_displaced_dispersal_survives_loadrs_physical_reuse", [
+        (0x10, *movl_mlx(2, IA64_PSR_IC)),
+        (0x20, 0x10, mov_gr_psr_full(2), nop_i(),
+         br_cond(0x20, 0x40)),
+        (0x40, *movl_mlx(3, 0x100100)),
+        (0x50, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x60, 0x00, nop_m(), alloc(39, 96, 88, 0, 0), nop_i()),
+        (0x70, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x400, 0),
+         nop_i()),
+        (0x80, 0x08, ld8_fill_postinc(127, 6, 0), nop_i(), nop_i()),
+        (0x90, 0x18, nop_m(), nop_m(), cover_b()),
+        (0xa0, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (0xb0, *movl_mlx(4, 96 | (88 << 7))),
+        (0xc0, 0x00, mov_m_gr_ar(4, 64), nop_i(), nop_i()),
+        (0xd0, *movl_mlx(5, 0x140)),
+        (0xe0, 0x09, nop_m(), nop_m(), mov_b_gr(0, 5)),
+        (0xf0, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        (0x140, 0x10, nop_m(), nop_i(), br_call(0, 0x140, 0x200)),
+        (0x150, 0x00, nop_m(), nop_i(), nop_i()),
+        (0x160, 0x10, nop_m(), nop_i(), br_cond(0x160, 0x160)),
+        (0x200, 0x00, nop_m(), alloc(40, 90, 80, 0, 0), nop_i()),
+        (0x210, 0x00, break_m(0x42), nop_i(), nop_i()),
+        (0x220, 0x10, nop_m(), nop_i(), br_ret(0)),
+
+        (IA64_BREAK_VECTOR, 0x18, nop_m(), nop_m(), cover_b()),
+        (IA64_BREAK_VECTOR + 0x10, *movl_mlx(20, (30 * 8) << 16)),
+        (IA64_BREAK_VECTOR + 0x20, 0x00, mov_m_gr_ar(20, 16),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x30, 0x00, loadrs_enc(), nop_i(),
+         nop_i()),
+        # Handler BOL is 90.  Its virtual offset five therefore reuses p95,
+        # the physical home of the interrupted frame's NaT-bearing r119.
+        (IA64_BREAK_VECTOR + 0x40, 0x00, nop_m(),
+         alloc(32, 80, 80, 0, 0), nop_i()),
+        (IA64_BREAK_VECTOR + 0x50, 0x01, mov_m_ar_gr(8, 19),
+         adds(37, 0, 0), nop_i()),
+        (IA64_BREAK_VECTOR + 0x60, 0x00, nop_m(),
+         alloc(14, 0, 0, 0, 0), nop_i()),
+        (IA64_BREAK_VECTOR + 0x70, *movl_mlx(20, 0x220)),
+        (IA64_BREAK_VECTOR + 0x80, 0x00, mov_m_gr_cr(20, 19),
+         nop_i(), nop_i()),
+        (IA64_BREAK_VECTOR + 0x90, 0x10, nop_m(), nop_i(), rfi_b()),
+        raw_bundle(0x400, 0x123456789abcdef0, 0),
+    ], {
+        "ip": 0x160,
+        "exception": IA64_EXCP_NONE,
+        "r8": 0,
+        "r119": 0x123456789abcdef0,
+        "r119_nat": 1,
+        "cfm_sof": 96,
+        "cfm_sol": 88,
+    }, entry=0x10, cpu="merced")
+
 test_rse_cover_flushrs_spills_covered_frame = require_registers(
     "rse_cover_flushrs_spills_covered_frame", [
         (0x10, *movl_mlx(3, 0x100000)),
@@ -5180,8 +5245,13 @@ test_rse_loadrs_preserves_clean_partial_rnat_collection = require_registers(
         "cfm_sol": 16,
     }, entry=0x800)
 
-test_rse_loadrs_reloads_same_collection_rnat = require_registers(
-    "rse_loadrs_reloads_same_collection_rnat", [
+"""The RNAT word for the collection containing BSPSTORE is not yet in
+memory.  loadrs makes AR.RNAT architecturally undefined, while the fill path
+uses separately modeled NaT dispersal state.  Retaining the known partial
+collection only in that state prevents the untouched word at 0x1001f8 from
+clearing the NaT when r35 is refilled."""
+test_rse_loadrs_retains_partial_dispersal_for_fill = require_registers(
+    "rse_loadrs_retains_partial_dispersal_for_fill", [
         *_empty_frame_prologue(0x800, 0x10),
         (0x10, *movl_mlx(3, 0x100120)),
         (0x20, *movl_mlx(4, 0xe000000087654321)),
@@ -5219,10 +5289,45 @@ test_rse_loadrs_reloads_same_collection_rnat = require_registers(
         "ip": 0x150,
         "exception": IA64_EXCP_NONE,
         "r10": 0xe000000087654321,
-        "r35_nat": 0,
+        "r35_nat": 1,
         "cfm_sof": 16,
         "cfm_sol": 16,
     }, entry=0x800)
+
+"""loadrs makes AR.RNAT undefined without making its value a fill source.
+The covered frame below spills a NaT-bearing r35, stops before its collection
+word, and reloads only the top six backing-store words.  The following return
+uses the separately modeled NaT dispersal state for the partial collection,
+rather than treating the untouched collection word in memory as authoritative.
+"""
+test_rse_loadrs_retains_dispersal_below_tear = require_registers(
+    "rse_loadrs_retains_dispersal_below_tear", [
+        (0x10, *movl_mlx(3, 0x100000)),
+        (0x20, 0x00, mov_ar(3, 18), nop_i(), nop_i()),
+        (0x30, 0x00, nop_m(), alloc(39, 40, 40, 0, 0), nop_i()),
+        (0x40, 0x00, mov_m_imm_ar(36, 1), addl(6, 0x400, 0),
+         nop_i()),
+        (0x50, 0x08, ld8_fill_postinc(35, 6, 0), nop_i(), nop_i()),
+        (0x60, 0x18, nop_m(), nop_m(), cover_b()),
+        (0x70, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (0x80, *movl_mlx(3, (6 * 8) << 16)),
+        (0x90, 0x00, mov_m_gr_ar(3, 16), nop_i(), nop_i()),
+        (0xa0, 0x00, loadrs_enc(), nop_i(), nop_i()),
+        (0xb0, *movl_mlx(4, 40 | (40 << 7))),
+        (0xc0, 0x00, mov_m_gr_ar(4, 64), nop_i(), nop_i()),
+        (0xd0, *movl_mlx(5, 0x100)),
+        (0xe0, 0x09, nop_m(), nop_m(), mov_b_gr(0, 5)),
+        (0xf0, 0x10, nop_m(), nop_i(), br_ret(0)),
+        (0x100, 0x10, nop_m(), nop_i(), br_cond(0x100, 0x100)),
+        raw_bundle(0x400, 0x123456789abcdef0, 0),
+    ], {
+        "ip": 0x100,
+        "exception": IA64_EXCP_NONE,
+        "r35": 0x123456789abcdef0,
+        "r35_nat": 1,
+        "cfm_sof": 40,
+        "cfm_sol": 40,
+    }, entry=0x10, cpu="merced")
 
 test_rse_return_growth_keeps_dirty_bsp_distance = require_registers(
     "rse_return_growth_keeps_dirty_bsp_distance", [
@@ -6072,8 +6177,9 @@ CASE_NAMES = (
     'rse_loadrs_cover_span_restores_embedded_frame',
     'rse_loadrs_cover_span_uses_preserved_sol',
     'rse_loadrs_partial_rnat_store_preserves_backed_prefix',
+    'rse_loadrs_retains_dispersal_below_tear',
     'rse_loadrs_preserves_clean_partial_rnat_collection',
-    'rse_loadrs_reloads_same_collection_rnat',
+    'rse_loadrs_retains_partial_dispersal_for_fill',
     'rse_loadrs_sets_tear_point',
     'rse_loadrs_writeback_preserves_defined_zero',
     'rse_loadrs_writeback_yields_to_bspstore_edit',
@@ -6083,6 +6189,7 @@ CASE_NAMES = (
     'rse_mandatory_target_fill_debug_sets_isr_rs_ir',
     'rse_merced_flushrs_invalidates_spilled_frame',
     'rse_merced_partial_rnat_store_preserves_backed_prefix',
+    'rse_displaced_dispersal_survives_loadrs_physical_reuse',
     'rse_merced_respill_preserves_filled_rnat_prefix',
     'rse_merced_return_publishes_filled_rnat_collection',
     'rse_manual_rfi_loadrs_restores_current_frame_base',

@@ -238,6 +238,10 @@ static const char *test_rnat_latches(void)
     env.rse.rse_rnat_shadow[1].defined = 2;
     EXPECT_LIVE("complete RNAT latch image", true, true);
 
+    env.rse.rse_rnat_shadow[0].addr = env.rse.rse_rnat_addr;
+    EXPECT_LIVE("dispersal shadow below active spill latch", true, true);
+    env.rse.rse_rnat_shadow[0].addr = 0x17f8;
+
     env.ar_rnat |= 4;
     EXPECT_LIVE("RNAT value outside defined mask", true, false);
     env.ar_rnat = 1;

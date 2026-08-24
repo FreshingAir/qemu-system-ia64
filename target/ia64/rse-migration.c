@@ -176,8 +176,7 @@ static bool ia64_rse_migration_view_valid(
         if (!entry->valid || entry->defined == 0 ||
             ((entry->value | entry->defined) & ~INT64_MAX) != 0 ||
             (entry->value & ~entry->defined) != 0 ||
-            !ia64_rnat_collection_address_valid(entry->addr) ||
-            entry->addr == state->rnat_addr) {
+            !ia64_rnat_collection_address_valid(entry->addr)) {
             return false;
         }
         for (j = i + 1; j < state->rnat_shadow_count; j++) {

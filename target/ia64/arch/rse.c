@@ -213,6 +213,18 @@ static uint64_t ia64_rse_compose_rnat(const CPUIA64State *env,
     uint64_t value = 0;
     uint64_t defined = 0;
 
+    /*
+     * With neither active latch present, materialize the architecturally
+     * undefined RNAT value as zero.  Retained shadows remain available to
+     * later fill and store operations, but are not sufficient by themselves
+     * to select a guest-visible collection.
+     */
+    if (env->rse.rse_rnat_addr == UINT64_MAX &&
+        !env->rse.rse_load_rnat_valid) {
+        *defined_out = 0;
+        return 0;
+    }
+
     if (env->rse.rse_load_rnat_valid &&
         env->rse.rse_load_rnat_addr == collection_addr) {
         defined = env->rse.rse_load_rnat_defined & INT64_MAX;
@@ -348,17 +360,21 @@ static void ia64_rse_rnat_shadow_overlay(const CPUIA64State *env,
     }
 }
 
-static void ia64_rse_rnat_shadow_stash(CPUIA64State *env)
+static void ia64_rse_rnat_shadow_merge(CPUIA64State *env, uint64_t addr,
+                                       uint64_t value, uint64_t defined,
+                                       bool incoming_newer,
+                                       const char *operation)
 {
     IA64RnatShadowEntry *entry;
-    uint64_t defined = env->rse.rse_rnat_defined & INT64_MAX;
     int slot;
 
-    if (env->rse.rse_rnat_addr == UINT64_MAX || defined == 0) {
+    defined &= INT64_MAX;
+    value &= defined;
+    if (addr == UINT64_MAX || defined == 0) {
         return;
     }
 
-    slot = ia64_rse_rnat_shadow_find(env, env->rse.rse_rnat_addr);
+    slot = ia64_rse_rnat_shadow_find(env, addr);
     if (slot < 0) {
         if (env->rse.rse_rnat_shadow_count ==
             IA64_RSE_RNAT_SHADOW_COUNT) {
@@ -378,21 +394,59 @@ static void ia64_rse_rnat_shadow_stash(CPUIA64State *env)
     }
 
     entry = &env->rse.rse_rnat_shadow[slot];
-    if (entry->valid && entry->addr == env->rse.rse_rnat_addr) {
-        entry->value = (entry->value & ~defined) |
-                       (env->ar_rnat & defined);
-        entry->defined |= defined;
+    if (entry->valid && entry->addr == addr) {
+        if (incoming_newer) {
+            entry->value = (entry->value & ~defined) | value;
+            entry->defined |= defined;
+        } else {
+            uint64_t missing = defined & ~entry->defined;
+
+            entry->value |= value & missing;
+            entry->defined |= missing;
+        }
     } else {
-        entry->value = env->ar_rnat & defined;
-        entry->addr = env->rse.rse_rnat_addr;
+        entry->value = value;
+        entry->addr = addr;
         entry->defined = defined;
         entry->valid = true;
     }
     entry->value &= entry->defined & INT64_MAX;
     entry->defined &= INT64_MAX;
-    trace_ia64_rse_rnat_shadow(env_cpu(env)->cpu_index, "stash", env->ip,
+    trace_ia64_rse_rnat_shadow(env_cpu(env)->cpu_index, operation, env->ip,
                                slot, entry->addr, entry->value,
                                entry->defined);
+}
+
+static void ia64_rse_rnat_shadow_stash(CPUIA64State *env)
+{
+    ia64_rse_rnat_shadow_merge(env, env->rse.rse_rnat_addr,
+                               env->ar_rnat,
+                               env->rse.rse_rnat_defined, true, "stash");
+}
+
+/*
+ * Mandatory fills can alternate between RNAT collections while registers
+ * from each collection are still resident in the physical stack.  Preserve
+ * the displaced fill-side image just like a suspended spill-side image; a
+ * later fill or spill must not depend on whichever collection happened to
+ * use the one-entry load latch most recently.
+ *
+ * A matching spill latch may coexist with the saved fill image.  Its
+ * explicitly defined bits are newer and overlay the shadow; retaining the
+ * older holes is necessary because internal pointer movement can later
+ * detach or clip the spill latch before all backed registers are refilled.
+ */
+static void ia64_rse_load_rnat_stash(CPUIA64State *env,
+                                     uint64_t next_addr)
+{
+    if (!env->rse.rse_load_rnat_valid ||
+        env->rse.rse_load_rnat_addr == next_addr) {
+        return;
+    }
+    ia64_rse_rnat_shadow_merge(env, env->rse.rse_load_rnat_addr,
+                               env->rse.rse_load_rnat,
+                               env->rse.rse_load_rnat_defined, false,
+                               "fill-stash");
 }
 
 static bool ia64_rse_rnat_shadow_take(CPUIA64State *env, uint64_t addr,
@@ -433,14 +487,52 @@ static void ia64_rse_rnat_shadow_clip(CPUIA64State *env, uint64_t addr,
     }
 }
 
+/* Keep only NaT bits for register words in [first, last). */
+static void ia64_rse_rnat_shadow_retain_range(CPUIA64State *env,
+                                              uint64_t first,
+                                              uint64_t last)
+{
+    unsigned slot = 0;
+
+    while (slot < env->rse.rse_rnat_shadow_count) {
+        IA64RnatShadowEntry *entry =
+            &env->rse.rse_rnat_shadow[slot];
+        uint64_t base = entry->addr & ~0x1ffULL;
+        uint64_t lower = MAX(first, base);
+        uint64_t upper = MIN(last, entry->addr);
+        uint64_t keep = 0;
+
+        if (lower < upper) {
+            uint32_t low_bit = (lower - base) >> 3;
+            uint32_t high_bit = (upper - base) >> 3;
+            uint64_t below_low = low_bit == 0 ? 0 :
+                                 (1ULL << low_bit) - 1;
+            uint64_t below_high = high_bit == 63 ? INT64_MAX :
+                                  (1ULL << high_bit) - 1;
+
+            keep = below_high & ~below_low;
+        }
+        entry->defined &= keep;
+        entry->value &= entry->defined;
+        if (entry->defined == 0) {
+            ia64_rse_rnat_shadow_delete(env, slot);
+        } else {
+            slot++;
+        }
+    }
+}
+
 /*
- * loadrs makes AR.RNAT undefined, but bits below its tear point can still
- * describe registers whose backing-store words remain valid.  Real hardware
- * can retain those physical RNAT bits without exposing them architecturally.
- * Save only explicitly known spill/shadow bits for that one partial
- * collection.  Do not seed this image from rse_load_rnat: a fill latch is
- * already derived from memory and the eventual store-side RMW can consult
- * the then-current memory image directly.
+ * SDM Vol.2 6.5.2 and 6.5.4 make AR.RNAT undefined at loadrs, while SDM
+ * Vol.3 models the collection used by rse_load as a separate NaT dispersal
+ * register.  Retain only explicitly known bits for the partial collection as
+ * internal RSE state.  Any value materialized by mov-from-RNAT remains within
+ * the architecturally undefined result permitted after loadrs.
+ *
+ * Do not seed this writeback-only image from rse_load_rnat: fill-visible
+ * dispersal state is staged separately before loadrs detaches the active
+ * latch, while an eventual store-side RMW can consult the then-current memory
+ * image directly.
  */
 static void ia64_rse_rnat_writeback_capture_loadrs(CPUIA64State *env)
 {
@@ -478,9 +570,9 @@ static void ia64_rse_rnat_writeback_capture_loadrs(CPUIA64State *env)
     image->addr = collection_addr;
     image->defined = defined;
     image->valid = true;
-    trace_ia64_rse_rnat_writeback(env_cpu(env)->cpu_index, "loadrs-capture",
-                                  env->ip, image->addr, image->value,
-                                  image->defined);
+    trace_ia64_rse_rnat_writeback(env_cpu(env)->cpu_index,
+                                  "loadrs-capture", env->ip, image->addr,
+                                  image->value, image->defined);
 }
 
 static void ia64_rse_rnat_bind(CPUIA64State *env, uint64_t collection_addr)
@@ -560,20 +652,20 @@ void ia64_rse_rnat_reloaded(CPUIA64State *env)
 }
 
 /*
- * mov-to-BSPSTORE and loadrs make AR.RNAT undefined (SDM Vol.2 6.5.2).
- * Detach the architected spill latch and invalidate the fill latch derived
- * from the previous backing-store context.  Undefined bits remain invisible
- * to mov-from-RNAT and mandatory fills.
+ * mov-to-BSPSTORE and loadrs make AR.RNAT undefined
+ * (SDM Vol.2 6.5.2 and 6.5.4).
+ * Detach the architected spill latch and invalidate the active fill latch.
+ * A loadrs caller may first retain explicitly known partial collections as
+ * the implementation's separate NaT dispersal state.  This state remains a
+ * fill source independent of the architecturally undefined AR.RNAT value.
  *
- * Both cached views of backing-store memory go with it.  SDM Vol.2 6.10
- * documents mov-to-BSPSTORE as a step of the sequence software uses to edit
- * the backing store below BSPSTORE ("read the RNAT application register,
- * update the backing store location in memory, rewrite BSPSTORE with the
- * original value, and then rewrite RNAT").  Rewriting BSPSTORE with a value it
- * already holds is only meaningful as an instruction to drop cached knowledge
- * of that memory, so mov-to-BSPSTORE also discards the writeback-only image.
- * loadrs instead captures that image before detaching: it is physical state,
- * not a source visible through either architectural path.
+ * SDM Vol.2 6.5.3 sets BSPSTORE and RSE.BspLoad to the supplied address and
+ * empties the clean partition.  Section 6.10 also uses a same-value BSPSTORE
+ * rewrite when software changes coherent backing-store memory before
+ * restoring RNAT.  Consequently mov-to-BSPSTORE discards all cached
+ * collection state, including the writeback-only image.  loadrs has distinct
+ * effects and retains only the internal dispersal and writeback state needed
+ * by subsequent fills or collection stores.
  */
 static void ia64_rse_rnat_detach(CPUIA64State *env, const char *site,
                                  bool discard_writeback)
@@ -582,8 +674,8 @@ static void ia64_rse_rnat_detach(CPUIA64State *env, const char *site,
     env->rse.rse_rnat_addr = UINT64_MAX;
     env->rse.rse_rnat_defined = 0;
     ia64_rse_invalidate_load_rnat(env);
-    ia64_rse_rnat_shadow_clear_all(env);
     if (discard_writeback) {
+        ia64_rse_rnat_shadow_clear_all(env);
         ia64_rse_rnat_writeback_clear(env, site);
     }
 }
@@ -1141,7 +1233,7 @@ static int ia64_rse_store_one(CPUIA64State *env, uintptr_t ra)
         /*
          * Writeback precedence is deliberate:
          *
-         *   current spill bits > loadrs physical image > backing memory.
+         *   current spill bits > loadrs writeback image > backing memory.
          *
          * Keeping the loadrs image out of ia64_rse_rnat_bind and
          * ia64_rse_fill_collection makes it mechanically impossible for an
@@ -1167,7 +1259,7 @@ static int ia64_rse_store_one(CPUIA64State *env, uintptr_t ra)
          * SDM Vol.2 6.5.2 makes some AR.RNAT bits undefined after loadrs or
          * mov-to-BSPSTORE, while 6.10 requires the backing store below
          * BSPSTORE to remain coherent.  The store-side helper resolves both:
-         * current spill bits win, loadrs-retained physical bits fill their
+         * current spill bits win, loadrs-retained writeback bits fill their
          * holes, all remaining positions retain the actual backing-memory
          * image, and bit 63 is always zero.  None of the retained positions
          * becomes an architectural RNAT or fill source before this complete
@@ -1178,6 +1270,7 @@ static int ia64_rse_store_one(CPUIA64State *env, uintptr_t ra)
         }
         ia64_rse_rnat_shadow_remove(env, collection_addr,
                                     "store-discard");
+        ia64_rse_load_rnat_stash(env, collection_addr);
         env->rse.rse_load_rnat = collection;
         env->rse.rse_load_rnat_addr = collection_addr;
         env->rse.rse_load_rnat_defined = INT64_MAX;
@@ -1279,6 +1372,7 @@ static uint64_t ia64_rse_fill_collection(CPUIA64State *env, uint64_t addr,
         defined |= spill_defined;
     }
     collection &= defined & INT64_MAX;
+    ia64_rse_load_rnat_stash(env, collection_addr);
     env->rse.rse_load_rnat = collection;
     env->rse.rse_load_rnat_addr = collection_addr;
     env->rse.rse_load_rnat_defined = defined;
@@ -1304,8 +1398,11 @@ static int ia64_rse_load_one(CPUIA64State *env, uint64_t bspload,
     uint32_t ncb = ia64_rse_collect_bit(bspload);
 
     if (ncb == 63) {
-        env->rse.rse_load_rnat =
+        uint64_t collection =
             ia64_rse_read_u64(env, bspload, ra) & INT64_MAX;
+
+        ia64_rse_load_rnat_stash(env, ia64_rse_collect_word(bspload));
+        env->rse.rse_load_rnat = collection;
         env->rse.rse_load_rnat_addr = ia64_rse_collect_word(bspload);
         env->rse.rse_load_rnat_defined = INT64_MAX;
         env->rse.rse_load_rnat_valid = true;
@@ -1730,7 +1827,6 @@ void ia64_rse_check(CPUIA64State *env, const char *site)
         bad |= entry->value & ~entry->defined;
         bad |= entry->defined == 0;
         bad |= ia64_rse_collect_word(entry->addr) != entry->addr;
-        bad |= entry->addr == env->rse.rse_rnat_addr;
         for (j = i + 1;
              j < MIN(shadow_count, IA64_RSE_RNAT_SHADOW_COUNT); j++) {
             bad |= env->rse.rse_rnat_shadow[j].valid &&
@@ -2339,11 +2435,20 @@ void ia64_rse_load(CPUIA64State *env, uint64_t fault_ip, uint64_t raw,
                            (env->cfm_sof + env->rse.rse_dirty);
     }
     /*
-     * SDM Vol.2 6.5.4 leaves AR.RNAT undefined.  Retain its known physical
-     * prefix solely so a later collection write cannot violate the backing
-     * store coherence guarantee in 6.10.
+     * SDM Vol.2 6.5.4 makes AR.RNAT undefined and places BSPSTORE and
+     * RSE.BspLoad at the tear point.  SDM Vol.3 defines rse_load as taking
+     * NaT bits from a dispersal register that need not be AR.RNAT.  The
+     * partial collection containing the tear point has no complete memory
+     * image, so retain its explicitly known bits as that internal dispersal
+     * state, together with collections in the dirty range up to BSP.  A
+     * mov-from-RNAT remains architecturally undefined after detachment.
      */
     ia64_rse_rnat_writeback_capture_loadrs(env);
+    ia64_rse_rnat_shadow_stash(env);
+    ia64_rse_load_rnat_stash(env, UINT64_MAX);
+    ia64_rse_rnat_shadow_retain_range(env,
+                                      env->ar_bspstore & ~0x1ffULL,
+                                      env->ar_bsp);
     ia64_rse_rnat_detach(env, "loadrs", false);
     ia64_rse_check(env, "loadrs");
     IA64_TRACE_RSE_STATE(env, "loadrs");
