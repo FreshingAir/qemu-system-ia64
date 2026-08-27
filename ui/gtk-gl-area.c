@@ -18,6 +18,14 @@
 
 #include "system/system.h"
 
+#ifdef __LIMBO__
+/* Injected by vm-executor-jni.c at VM start via set_qemu_var().
+ *   0 = stretch to fill the screen (ignore aspect ratio)
+ *   1 = keep the guest aspect ratio (letterbox, default)
+ *   2 = 1:1 pixel mapping (native guest resolution, centered) */
+extern int limbo_gtk_scale_mode;
+#endif
+
 static void gtk_gl_area_set_scanout_mode(VirtualConsole *vc, bool scanout)
 {
     if (vc->gfx.scanout_mode == scanout) {
@@ -53,11 +61,11 @@ void gd_gl_area_draw(VirtualConsole *vc)
     }
 
     gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
-    gs = gdk_window_get_scale_factor(gtk_widget_get_window(vc->gfx.drawing_area));
+    gs = gtk_widget_get_scale_factor(vc->gfx.drawing_area);
     fbw = surface_width(vc->gfx.ds);
     fbh = surface_height(vc->gfx.ds);
-    ww = gtk_widget_get_allocated_width(vc->gfx.drawing_area);
-    wh = gtk_widget_get_allocated_height(vc->gfx.drawing_area);
+    ww = gtk_widget_get_width(vc->gfx.drawing_area);
+    wh = gtk_widget_get_height(vc->gfx.drawing_area);
     pw = ww * gs;
     ph = wh * gs;
 
@@ -137,8 +145,42 @@ void gd_gl_area_draw(VirtualConsole *vc)
     } else {
         gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
 
+#ifdef __LIMBO__
+        {
+            int mode = limbo_gtk_scale_mode;
+            if (mode < 0) {
+                mode = 1;
+            }
+            /* Clear entire pixel buffer to black first */
+            glViewport(0, 0, pw, ph);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            switch (mode) {
+            case 0: /* stretch */
+                glViewport(0, 0, pw, ph);
+                break;
+            case 2: { /* 1:1 */
+                int fbw = surface_width(vc->gfx.ds);
+                int fbh = surface_height(vc->gfx.ds);
+                int vx = (pw - fbw) / 2;
+                int vy = (ph - fbh) / 2;
+                glViewport(MAX(vx, 0), MAX(vy, 0),
+                           MIN(fbw, pw), MIN(fbh, ph));
+                break;
+            }
+            case 1: /* aspect */
+            default:
+                surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
+                break;
+            }
+
+            surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
+        }
+#else
         surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
         surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
+#endif
     }
 }
 
@@ -199,6 +241,7 @@ void gd_gl_area_refresh(DisplayChangeListener *dcl)
 
     if (vc->gfx.glupdates) {
         vc->gfx.glupdates = 0;
+        gtk_gl_area_set_scanout_mode(vc, false);
         gtk_gl_area_queue_render(GTK_GL_AREA(vc->gfx.drawing_area));
     }
 }
@@ -250,15 +293,17 @@ QEMUGLContext gd_gl_area_create_context(DisplayGLCtx *dgc,
                                         QEMUGLParams *params)
 {
     VirtualConsole *vc = container_of(dgc, VirtualConsole, gfx.dgc);
-    GdkGLContext *ctx, *current_ctx;
-    GdkWindow *window;
+    GdkSurface *surface;
+    GdkGLContext *ctx;
     GError *err = NULL;
     int major, minor;
 
-    current_ctx = gdk_gl_context_get_current();
-
-    window = gtk_widget_get_window(vc->gfx.drawing_area);
-    ctx = gdk_window_create_gl_context(window, &err);
+    surface = gtk_widget_get_native(vc->gfx.drawing_area) ?
+        gtk_native_get_surface(gtk_widget_get_native(vc->gfx.drawing_area)) : NULL;
+    if (!surface) {
+        return NULL;
+    }
+    ctx = gdk_surface_create_gl_context(surface, &err);
     if (err) {
         g_printerr("Create gdk gl context failed: %s\n", err->message);
         g_error_free(err);
@@ -277,12 +322,8 @@ QEMUGLContext gd_gl_area_create_context(DisplayGLCtx *dgc,
 
     gdk_gl_context_make_current(ctx);
     gdk_gl_context_get_version(ctx, &major, &minor);
-
-    if (current_ctx) {
-        gdk_gl_context_make_current(current_ctx);
-    } else {
-        gdk_gl_context_clear_current();
-    }
+    gdk_gl_context_clear_current();
+    gtk_gl_area_make_current(GTK_GL_AREA(vc->gfx.drawing_area));
 
     if (gd_cmp_gl_context_version(major, minor, params) == -1) {
         /* created ctx version < requested version */

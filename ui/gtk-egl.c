@@ -24,6 +24,14 @@
 
 #include "system/system.h"
 
+#ifdef __LIMBO__
+/* Injected by vm-executor-jni.c at VM start via set_qemu_var().
+ *   0 = stretch to fill the screen (ignore aspect ratio)
+ *   1 = keep the guest aspect ratio (letterbox, default)
+ *   2 = 1:1 pixel mapping (native guest resolution, centered) */
+extern int limbo_gtk_scale_mode;
+#endif
+
 static void gtk_egl_set_scanout_mode(VirtualConsole *vc, bool scanout)
 {
     if (vc->gfx.scanout_mode == scanout) {
@@ -115,8 +123,42 @@ void gd_egl_draw(VirtualConsole *vc)
         eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
                        vc->gfx.esurface, vc->gfx.ectx);
 
+#ifdef __LIMBO__
+        {
+            int mode = limbo_gtk_scale_mode;
+            if (mode < 0) {
+                mode = 1;
+            }
+            /* Clear entire pixel buffer to black first */
+            glViewport(0, 0, pw, ph);
+            glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+
+            switch (mode) {
+            case 0: /* stretch */
+                glViewport(0, 0, pw, ph);
+                break;
+            case 2: { /* 1:1 */
+                int fbw = surface_width(vc->gfx.ds);
+                int fbh = surface_height(vc->gfx.ds);
+                int vx = (pw - fbw) / 2;
+                int vy = (ph - fbh) / 2;
+                glViewport(MAX(vx, 0), MAX(vy, 0),
+                           MIN(fbw, pw), MIN(fbh, ph));
+                break;
+            }
+            case 1: /* aspect */
+            default:
+                surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
+                break;
+            }
+
+            surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
+        }
+#else
         surface_gl_setup_viewport(vc->gfx.gls, vc->gfx.ds, pw, ph);
         surface_gl_render_texture(vc->gfx.gls, vc->gfx.ds);
+#endif
 
         eglSwapBuffers(qemu_egl_display, vc->gfx.esurface);
 
@@ -152,6 +194,12 @@ void gd_egl_refresh(DisplayChangeListener *dcl)
     gd_update_monitor_refresh_rate(
             vc, vc->window ? vc->window : vc->gfx.drawing_area);
 
+    if (vc->gfx.guest_fb.dmabuf &&
+        qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {
+        gd_egl_draw(vc);
+        return;
+    }
+
     if (!vc->gfx.esurface) {
         gd_egl_init(vc);
         if (!vc->gfx.esurface) {
@@ -170,16 +218,11 @@ void gd_egl_refresh(DisplayChangeListener *dcl)
 #endif
     }
 
-    if (vc->gfx.guest_fb.dmabuf &&
-        qemu_dmabuf_get_draw_submitted(vc->gfx.guest_fb.dmabuf)) {
-        gd_egl_draw(vc);
-        return;
-    }
-
     graphic_hw_update(dcl->con);
 
     if (vc->gfx.glupdates) {
         vc->gfx.glupdates = 0;
+        gtk_egl_set_scanout_mode(vc, false);
         gd_egl_draw(vc);
     }
 }
@@ -219,7 +262,9 @@ QEMUGLContext gd_egl_create_context(DisplayGLCtx *dgc,
 {
     VirtualConsole *vc = container_of(dgc, VirtualConsole, gfx.dgc);
 
-    return qemu_egl_create_context(dgc, params, vc->gfx.ectx);
+    eglMakeCurrent(qemu_egl_display, vc->gfx.esurface,
+                   vc->gfx.esurface, vc->gfx.ectx);
+    return qemu_egl_create_context(dgc, params);
 }
 
 void gd_egl_scanout_disable(DisplayChangeListener *dcl)

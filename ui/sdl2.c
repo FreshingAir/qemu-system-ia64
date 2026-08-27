@@ -35,10 +35,6 @@
 #include "qemu/log.h"
 #include "qemu-main.h"
 
-#ifdef CONFIG_X11
-#include <X11/Xlib.h>
-#endif
-
 static int sdl2_num_outputs;
 static struct sdl2_console *sdl2_console;
 
@@ -67,11 +63,6 @@ static Notifier mouse_mode_notifier;
 #define SDL_HINT_RENDER_BATCHING "SDL_RENDER_BATCHING"
 #endif
 
-/* introduced in SDL 2.24.0 */
-#ifndef SDL_HINT_WINDOWS_DPI_AWARENESS
-#define SDL_HINT_WINDOWS_DPI_AWARENESS "SDL_WINDOWS_DPI_AWARENESS"
-#endif
-
 static void sdl_update_caption(struct sdl2_console *scon);
 
 static struct sdl2_console *get_scon_from_window(uint32_t window_id)
@@ -85,25 +76,6 @@ static struct sdl2_console *get_scon_from_window(uint32_t window_id)
     return NULL;
 }
 
-static void sdl2_window_lock_size(struct sdl2_console *scon)
-{
-    int width, height;
-
-    if (!scon->real_window) {
-        return;
-    }
-
-    SDL_SetWindowResizable(scon->real_window, SDL_FALSE);
-    if (gui_fullscreen) {
-        return;
-    }
-
-    width = surface_width(scon->surface);
-    height = surface_height(scon->surface);
-    SDL_SetWindowMinimumSize(scon->real_window, width, height);
-    SDL_SetWindowMaximumSize(scon->real_window, width, height);
-}
-
 void sdl2_window_create(struct sdl2_console *scon)
 {
     int flags = 0;
@@ -115,6 +87,8 @@ void sdl2_window_create(struct sdl2_console *scon)
 
     if (gui_fullscreen) {
         flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    } else {
+        flags |= SDL_WINDOW_RESIZABLE;
     }
     if (scon->hidden) {
         flags |= SDL_WINDOW_HIDDEN;
@@ -130,7 +104,6 @@ void sdl2_window_create(struct sdl2_console *scon)
                                          surface_width(scon->surface),
                                          surface_height(scon->surface),
                                          flags);
-    sdl2_window_lock_size(scon);
     if (scon->opengl) {
         const char *driver = "opengl";
 
@@ -143,15 +116,17 @@ void sdl2_window_create(struct sdl2_console *scon)
 
         scon->winctx = SDL_GL_CreateContext(scon->real_window);
         SDL_GL_SetSwapInterval(0);
-
-#ifdef CONFIG_OPENGL
-        qemu_egl_display = eglGetCurrentDisplay();
-#endif
     } else {
         /* The SDL renderer is only used by sdl2-2D, when OpenGL is disabled */
+        
+#if defined(__LIMBO_SDL_FORCE_SOFTWARE_RENDERING__)
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, SDL_RENDERER_SOFTWARE);
+#elif defined(__LIMBO_SDL_FORCE_HARDWARE_RENDERING__)
+        scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, SDL_RENDERER_ACCELERATED);
+#else
         scon->real_renderer = SDL_CreateRenderer(scon->real_window, -1, 0);
+#endif
     }
-
     sdl_update_caption(scon);
 }
 
@@ -175,30 +150,21 @@ void sdl2_window_destroy(struct sdl2_console *scon)
 
 void sdl2_window_resize(struct sdl2_console *scon)
 {
-    int current_width, current_height;
-    int width, height;
-
     if (!scon->real_window) {
         return;
     }
 
-    width = surface_width(scon->surface);
-    height = surface_height(scon->surface);
-
-    /* Temporarily allow both sizes so a guest mode change is not clamped. */
-    if (!gui_fullscreen) {
-        SDL_GetWindowSize(scon->real_window,
-                          &current_width, &current_height);
-        SDL_SetWindowMinimumSize(scon->real_window,
-                                 MIN(current_width, width),
-                                 MIN(current_height, height));
-        SDL_SetWindowMaximumSize(scon->real_window,
-                                 MAX(current_width, width),
-                                 MAX(current_height, height));
-    }
-
-    SDL_SetWindowSize(scon->real_window, width, height);
-    sdl2_window_lock_size(scon);
+#ifdef __ANDROID__
+    /* On Android the SDL window always covers the screen and its size is
+     * reported by the Java surface (see Android_CreateWindow in the SDL2
+     * android backend).  Calling SDL_SetWindowSize() here would desync the
+     * SDL window size from the real surface size and break the letterbox
+     * rendering and the input coordinate mapping. */
+    return;
+#endif
+    SDL_SetWindowSize(scon->real_window,
+                      surface_width(scon->surface),
+                      surface_height(scon->surface));
 }
 
 static void sdl2_redraw(struct sdl2_console *scon)
@@ -361,6 +327,13 @@ static void sdl_send_mouse_event(struct sdl2_console *scon, int dx, int dy,
         [INPUT_BUTTON_EXTRA]      = SDL_BUTTON(SDL_BUTTON_X2)
     };
     static uint32_t prev_state;
+
+#ifdef __LIMBO__
+// LIMBO: the console can be NULL when the mouse moves outside of the window 
+// and it crashes the app
+    if(scon==NULL)
+        return;
+#endif
 
     if (prev_state != state) {
         qemu_input_update_buttons(scon->dcl.con, bmap, prev_state, state);
@@ -533,37 +506,89 @@ static void handle_textinput(SDL_Event *ev)
     }
 }
 
+#ifdef __LIMBO__
+/*
+ * Map window (pixel) coordinates back into the guest framebuffer for the
+ * non-letterboxed scale modes.
+ *
+ * Works for both the 2D path (SDL_RenderSetLogicalSize applied) and the
+ * GL path (raw window coordinates).  In aspect mode (1) the viewport
+ * coordinate mapping is already correct, so no conversion is needed.
+ * In stretch (0) and 1:1 (2) modes the raw window coordinates are
+ * converted using the same math the renderer applies.
+ */
+static void sdl2_map_to_guest(struct sdl2_console *scon, int *x, int *y)
+{
+    int gw, gh, ww, wh, vx, vy;
+    int mode = limbo_sdl_scale_mode;
+
+    if (mode < 0) {
+        mode = 1; /* default: aspect */
+    }
+    if (mode == 1 || !scon->surface) {
+        return;
+    }
+
+    SDL_GetWindowSize(scon->real_window, &ww, &wh);
+    if (ww <= 0 || wh <= 0) {
+        return;
+    }
+
+    gw = surface_width(scon->surface);
+    gh = surface_height(scon->surface);
+
+    if (mode == 0) {
+        /* stretch: viewport fills the entire window */
+        *x = *x * gw / ww;
+        *y = *y * gh / wh;
+    } else {
+        /* 1:1: viewport is centered at native resolution */
+        vx = (ww - gw) / 2;
+        vy = (wh - gh) / 2;
+        *x -= vx;
+        *y -= vy;
+    }
+
+    *x = MIN(MAX(*x, 0), gw - 1);
+    *y = MIN(MAX(*y, 0), gh - 1);
+}
+#endif
+
 static void handle_mousemotion(SDL_Event *ev)
 {
     int max_x, max_y;
     struct sdl2_console *scon = get_scon_from_window(ev->motion.windowID);
-    int scr_w, scr_h, surf_w, surf_h, x, y, dx, dy;
+    int surf_w, surf_h, x, y, dx, dy;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
     }
 
-    SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
+    surf_w = surface_width(scon->surface);
+    surf_h = surface_height(scon->surface);
+    /* SDL converts mouse events into logical (guest) coordinates when a
+     * logical size is set (see sdl2_2d_switch), so the position and the
+     * relative deltas are already scaled for the letterboxed display. */
+    x = ev->motion.x;
+    y = ev->motion.y;
+#ifdef __LIMBO__
+    sdl2_map_to_guest(scon, &x, &y);
+#endif
     if (qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
-        max_x = scr_w - 1;
-        max_y = scr_h - 1;
+        max_x = surf_w - 1;
+        max_y = surf_h - 1;
         if (gui_grab && !gui_fullscreen
-            && (ev->motion.x == 0 || ev->motion.y == 0 ||
-                ev->motion.x == max_x || ev->motion.y == max_y)) {
+            && (x == 0 || y == 0 || x == max_x || y == max_y)) {
             sdl_grab_end(scon);
         }
-        if (!gui_grab &&
-            (ev->motion.x > 0 && ev->motion.x < max_x &&
-             ev->motion.y > 0 && ev->motion.y < max_y)) {
+        if (!gui_grab && x > 0 && x < max_x && y > 0 && y < max_y) {
             sdl_grab_start(scon);
         }
     }
-    surf_w = surface_width(scon->surface);
-    surf_h = surface_height(scon->surface);
-    x = (int64_t)ev->motion.x * surf_w / scr_w;
-    y = (int64_t)ev->motion.y * surf_h / scr_h;
-    dx = (int64_t)ev->motion.xrel * surf_w / scr_w;
-    dy = (int64_t)ev->motion.yrel * surf_h / scr_h;
+    x = MIN(MAX(x, 0), surf_w - 1);
+    y = MIN(MAX(y, 0), surf_h - 1);
+    dx = ev->motion.xrel;
+    dy = ev->motion.yrel;
     if (gui_grab || qemu_input_is_absolute(scon->dcl.con) || absolute_enabled) {
         sdl_send_mouse_event(scon, dx, dy, x, y, ev->motion.state);
     }
@@ -574,16 +599,22 @@ static void handle_mousebutton(SDL_Event *ev)
     int buttonstate = SDL_GetMouseState(NULL, NULL);
     SDL_MouseButtonEvent *bev;
     struct sdl2_console *scon = get_scon_from_window(ev->button.windowID);
-    int scr_w, scr_h, x, y;
+    int x, y;
 
     if (!scon || !qemu_console_is_graphic(scon->dcl.con)) {
         return;
     }
 
     bev = &ev->button;
-    SDL_GetWindowSize(scon->real_window, &scr_w, &scr_h);
-    x = (int64_t)bev->x * surface_width(scon->surface) / scr_w;
-    y = (int64_t)bev->y * surface_height(scon->surface) / scr_h;
+    /* SDL converts mouse events into logical (guest) coordinates when a
+     * logical size is set (see sdl2_2d_switch). */
+    x = bev->x;
+    y = bev->y;
+#ifdef __LIMBO__
+    sdl2_map_to_guest(scon, &x, &y);
+#endif
+    x = MIN(MAX(x, 0), surface_width(scon->surface) - 1);
+    y = MIN(MAX(y, 0), surface_height(scon->surface) - 1);
 
     if (!gui_grab && !qemu_input_is_absolute(scon->dcl.con)) {
         if (ev->type == SDL_MOUSEBUTTONUP && bev->button == SDL_BUTTON_LEFT) {
@@ -639,11 +670,23 @@ static void handle_windowevent(SDL_Event *ev)
 
     switch (ev->window.event) {
     case SDL_WINDOWEVENT_RESIZED:
-        if (!gui_fullscreen &&
-            (ev->window.data1 != surface_width(scon->surface) ||
-             ev->window.data2 != surface_height(scon->surface))) {
-            sdl2_window_resize(scon);
+        {
+            QemuUIInfo info;
+            memset(&info, 0, sizeof(info));
+            info.width = ev->window.data1;
+            info.height = ev->window.data2;
+            dpy_set_ui_info(scon->dcl.con, &info, true);
         }
+#ifdef __LIMBO__
+        /* The Android backend never sends SDL_WINDOWEVENT_SIZE_CHANGED, so
+         * SDL does not refresh the logical-size viewport on its own.  Re-apply
+         * the scale-mode logical size here, otherwise the letterbox/stretch
+         * math is still based on the old screen size after an orientation or
+         * screen-size change. */
+        if (!scon->opengl) {
+            sdl2_2d_update_logical_size(scon);
+        }
+#endif
         sdl2_redraw(scon);
         break;
     case SDL_WINDOWEVENT_EXPOSED:
@@ -710,6 +753,10 @@ void sdl2_poll_events(struct sdl2_console *scon)
     }
 
     while (SDL_PollEvent(ev)) {
+#ifdef __LIMBO__
+        if(!ev)
+            continue;
+#endif
         switch (ev->type) {
         case SDL_KEYDOWN:
             idle = 0;
@@ -855,12 +902,6 @@ static const DisplayChangeListenerOps dcl_gl_ops = {
     .dpy_gl_scanout_disable  = sdl2_gl_scanout_disable,
     .dpy_gl_scanout_texture  = sdl2_gl_scanout_texture,
     .dpy_gl_update           = sdl2_gl_scanout_flush,
-
-#ifdef CONFIG_GBM
-    .dpy_gl_scanout_dmabuf   = sdl2_gl_scanout_dmabuf,
-    .dpy_gl_release_dmabuf   = sdl2_gl_release_dmabuf,
-    .dpy_has_dmabuf          = sdl2_gl_has_dmabuf,
-#endif
 };
 
 static bool
@@ -888,34 +929,17 @@ static void sdl2_display_early_init(DisplayOptions *o)
     }
 }
 
-static void sdl2_set_hint_x11_force_egl(void)
-{
-#if defined(SDL_HINT_VIDEO_X11_FORCE_EGL) && defined(CONFIG_OPENGL) && \
-    defined(CONFIG_X11)
-    Display *x_disp = XOpenDisplay(NULL);
-    EGLDisplay egl_display;
+#ifdef __LIMBO__
+int limbo_sdl_scale_hint = -1;
 
-    if (!x_disp) {
-        return;
-    }
-
-    /* Prefer EGL over GLX to get dma-buf support. */
-    egl_display = eglGetDisplay((EGLNativeDisplayType)x_disp);
-
-    if (egl_display != EGL_NO_DISPLAY) {
-        /*
-         * Setting X11_FORCE_EGL hint doesn't make SDL to prefer X11 over
-         * Wayland. SDL will use Wayland driver even if XWayland presents.
-         * It's always safe to set the hint even if X11 is not used by SDL.
-         * SDL will work regardless of the hint.
-         */
-        SDL_SetHint(SDL_HINT_VIDEO_X11_FORCE_EGL, "1");
-        eglTerminate(egl_display);
-    }
-
-    XCloseDisplay(x_disp);
+/* Display scale mode selected from the app UI (Limbo):
+ *   0 = stretch to fill the screen (ignore aspect ratio)
+ *   1 = keep the guest aspect ratio (letterbox, default)
+ *   2 = 1:1 pixel mapping (native guest resolution, centered)
+ * The mode is injected at VM start by vm-executor-jni.c via set_qemu_var(),
+ * so this global must stay a dlsym-visible non-static symbol. */
+int limbo_sdl_scale_mode = -1;
 #endif
-}
 
 static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 {
@@ -927,14 +951,11 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 
     assert(o->type == DISPLAY_TYPE_SDL);
 
-#ifdef SDL_VIDEO_DRIVER_WINDOWS
-    /*
-     * Prevent Windows from bitmap-scaling SDL windows, which makes the guest
-     * display blurry on monitors using high-DPI scaling.  Default priority
-     * preserves an explicit SDL_WINDOWS_DPI_AWARENESS environment setting.
-     */
-    SDL_SetHintWithPriority(SDL_HINT_WINDOWS_DPI_AWARENESS,
-                            "permonitorv2", SDL_HINT_DEFAULT);
+#ifdef __ANDROID__
+    if(limbo_sdl_scale_hint == 1) {
+        SDL_bool res = SDL_SetHint(SDL_HINT_RENDER_SCALE_QUALITY, "1");
+        LOGI("Setting SDL_HINT_RENDER_SCALE_QUALITY to %d, code = %d", limbo_sdl_scale_hint, res);
+    }
 #endif
 
     if (SDL_GetHintBoolean("QEMU_ENABLE_SDL_LOGGING", SDL_FALSE)) {
@@ -954,7 +975,6 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
     SDL_SetHint(SDL_HINT_ALLOW_ALT_TAB_WHILE_GRABBED, "0");
 #endif
     SDL_SetHint(SDL_HINT_WINDOWS_NO_CLOSE_ON_ALT_F4, "1");
-    sdl2_set_hint_x11_force_egl();
     SDL_EnableScreenSaver();
     memset(&info, 0, sizeof(info));
     SDL_VERSION(&info.version);
@@ -999,12 +1019,9 @@ static void sdl2_display_init(DisplayState *ds, DisplayOptions *o)
 #endif
         sdl2_console[i].dcl.con = con;
         sdl2_console[i].kbd = qkbd_state_init(con);
-#ifdef CONFIG_OPENGL
         if (display_opengl) {
             qemu_console_set_display_gl_ctx(con, &sdl2_console[i].dgc);
-            sdl2_gl_console_init(&sdl2_console[i]);
         }
-#endif
         register_displaychangelistener(&sdl2_console[i].dcl);
 
 #if defined(SDL_VIDEO_DRIVER_WINDOWS) || defined(SDL_VIDEO_DRIVER_X11)

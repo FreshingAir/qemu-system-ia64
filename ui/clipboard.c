@@ -47,7 +47,6 @@ static void qemu_clipboard_change_state(void *opaque, bool running, RunState sta
     }
 
     if (cb_reset_serial_on_resume) {
-        cb_reset_serial_on_resume = false;
         qemu_clipboard_reset_serial();
     }
 
