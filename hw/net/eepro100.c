@@ -21,25 +21,7 @@
  * You should have received a copy of the GNU General Public License
  * along with this program.  If not, see <http://www.gnu.org/licenses/>.
  *
- * Tested features (i82559):
- *      PXE boot (i386 guest, i386 / mips / mipsel / ppc host) ok
- *      Linux networking (i386) ok
- *
- * Untested:
- *      Windows networking
- *
- * References:
- *
- * Intel 8255x 10/100 Mbps Ethernet Controller Family
- * Open Source Software Developer Manual
- *
- * TODO:
- *      * PHY emulation should be separated from nic emulation.
- *        Most nic emulations could share the same phy code.
- *      * i82550 is untested. It is programmed like the i82559.
- *      * i82562 is untested. It is programmed like the i82559.
- *      * Power management (i82558 and later) is not implemented.
- *      * Wake-on-LAN is not implemented.
+ * Power management and Wake-on-LAN are not implemented.
  */
 
 #include "qemu/osdep.h"
@@ -118,11 +100,13 @@
 #define  CU_NOP         0x0000  /* No operation. */
 #define  CU_START       0x0010  /* CU start. */
 #define  CU_RESUME      0x0020  /* CU resume. */
+#define  CU_HP_START    0x0030  /* CU high-priority queue start. */
 #define  CU_STATSADDR   0x0040  /* Load dump counters address. */
 #define  CU_SHOWSTATS   0x0050  /* Dump statistical counters. */
 #define  CU_CMD_BASE    0x0060  /* Load CU base address. */
 #define  CU_DUMPSTATS   0x0070  /* Dump and reset statistical counters. */
 #define  CU_SRESUME     0x00a0  /* CU static resume. */
+#define  CU_HP_RESUME   0x00b0  /* CU high-priority queue resume. */
 
 #define  RU_NOP         0x0000
 #define  RX_START       0x0001
@@ -164,6 +148,7 @@ typedef enum {
     SCBpmdr = 27,               /* Power Management Driver. */
     SCBgctrl = 28,              /* General Control. */
     SCBgstat = 29,              /* General Status. */
+    SCBeepromSemaphore = 30,
 } E100RegisterOffset;
 
 /* A speedo3 transmit buffer descriptor with two buffers... */
@@ -320,6 +305,10 @@ static const uint16_t eepro100_mdi_default[] = {
     0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
 };
 
+#define E100_MII_BMSR                    1U
+#define E100_MII_BMSR_LINK_STATUS        0x0004U
+#define E100_MII_BMSR_AUTONEG_COMPLETE   0x0020U
+
 /* Readonly mask for MDI (PHY) registers */
 static const uint16_t eepro100_mdi_mask[] = {
     0x0000, 0xffff, 0xffff, 0xffff, 0xc01f, 0xffff, 0xffff, 0x0000,
@@ -329,6 +318,19 @@ static const uint16_t eepro100_mdi_mask[] = {
 };
 
 static E100PCIDeviceInfo *eepro100_get_class(EEPRO100State *s);
+
+static void eepro100_update_link_status(EEPRO100State *s, bool link_down)
+{
+    if (link_down) {
+        s->mdimem[E100_MII_BMSR] &=
+            ~(E100_MII_BMSR_LINK_STATUS |
+              E100_MII_BMSR_AUTONEG_COMPLETE);
+    } else {
+        s->mdimem[E100_MII_BMSR] |=
+            E100_MII_BMSR_LINK_STATUS |
+            E100_MII_BMSR_AUTONEG_COMPLETE;
+    }
+}
 
 /* Read a 16 bit control/status (CSR) register. */
 static uint16_t e100_read_reg2(EEPRO100State *s, E100RegisterOffset addr)
@@ -589,7 +591,11 @@ static void nic_selective_reset(EEPRO100State * s)
 #if 0
     eeprom93xx_reset(s->eeprom);
 #endif
-    memcpy(eeprom_contents, s->conf.macaddr.a, 6);
+    /* The serial EEPROM stores the MAC as little-endian words. */
+    for (i = 0; i < 3; i++) {
+        eeprom_contents[i] = s->conf.macaddr.a[2 * i] |
+                             s->conf.macaddr.a[2 * i + 1] << 8;
+    }
     eeprom_contents[EEPROM_ID] = EEPROM_ID_VALID;
     if (s->device == i82557B || s->device == i82557C)
         eeprom_contents[5] = 0x0100;
@@ -606,12 +612,17 @@ static void nic_selective_reset(EEPRO100State * s)
 
     assert(sizeof(s->mdimem) == sizeof(eepro100_mdi_default));
     memcpy(&s->mdimem[0], &eepro100_mdi_default[0], sizeof(s->mdimem));
+    if (s->nic != NULL) {
+        eepro100_update_link_status(s, qemu_get_queue(s->nic)->link_down);
+    }
 }
 
 static void nic_reset(void *opaque)
 {
     EEPRO100State *s = opaque;
     TRACE(OTHER, logout("%p\n", s));
+    disable_interrupt(s);
+    s->scb_stat = 0;
     /* TODO: Clearing of hash register for selective reset, too? */
     memset(&s->mult[0], 0, sizeof(s->mult));
     nic_selective_reset(s);
@@ -951,17 +962,19 @@ static void eepro100_cu_command(EEPRO100State * s, uint8_t val)
         /* No operation. */
         break;
     case CU_START:
+    case CU_HP_START:
         cu_state = get_cu_state(s);
         if (cu_state != cu_idle && cu_state != cu_suspended) {
             /* Intel documentation says that CU must be idle or suspended
              * for the CU start command. */
             logout("unexpected CU state is %u\n", cu_state);
         }
-        set_cu_state(s, cu_active);
+        set_cu_state(s, val == CU_HP_START ? cu_hqp_active : cu_lpq_active);
         s->cu_offset = e100_read_reg4(s, SCBPointer);
         action_command(s);
         break;
     case CU_RESUME:
+    case CU_HP_RESUME:
         if (get_cu_state(s) != cu_suspended) {
             logout("bad CU resume from CU state %u\n", get_cu_state(s));
             /* Workaround for bad Linux eepro100 driver which resumes
@@ -973,7 +986,8 @@ static void eepro100_cu_command(EEPRO100State * s, uint8_t val)
         }
         if (get_cu_state(s) == cu_suspended) {
             TRACE(OTHER, logout("CU resuming\n"));
-            set_cu_state(s, cu_active);
+            set_cu_state(s,
+                         val == CU_HP_RESUME ? cu_hqp_active : cu_lpq_active);
             action_command(s);
         }
         break;
@@ -1067,7 +1081,7 @@ static void eepro100_ru_command(EEPRO100State * s, uint8_t val)
 
 static void eepro100_write_command(EEPRO100State * s, uint8_t val)
 {
-    eepro100_ru_command(s, val & 0x0f);
+    eepro100_ru_command(s, val & 0x07);
     eepro100_cu_command(s, val & 0xf0);
     if ((val) == 0) {
         TRACE(OTHER, logout("val=0x%02x\n", val));
@@ -1239,7 +1253,8 @@ static void eepro100_write_mdi(EEPRO100State *s)
                 }
                 break;
             case 1:            /* Status Register */
-                s->mdimem[reg] |= 0x0020;
+                eepro100_update_link_status(
+                    s, qemu_get_queue(s->nic)->link_down);
                 break;
             case 2:            /* PHY Identification Register (Word 1) */
             case 3:            /* PHY Identification Register (Word 2) */
@@ -1395,6 +1410,9 @@ static uint16_t eepro100_read2(EEPRO100State * s, uint32_t addr)
         val = (uint16_t)(eepro100_read_mdi(s) >> (8 * (addr & 3)));
         TRACE(OTHER, logout("addr=%s val=0x%04x\n", regname(addr), val));
         break;
+    case SCBeepromSemaphore:
+        TRACE(OTHER, logout("addr=%s val=0x%04x\n", regname(addr), val));
+        break;
     default:
         logout("addr=%s val=0x%04x\n", regname(addr), val);
         missing("unknown word read");
@@ -1539,6 +1557,9 @@ static void eepro100_write2(EEPRO100State * s, uint32_t addr, uint16_t val)
     case SCBCtrlMDI + 2:
         TRACE(OTHER, logout("addr=%s val=0x%04x\n", regname(addr), val));
         eepro100_write_mdi(s);
+        break;
+    case SCBeepromSemaphore:
+        TRACE(OTHER, logout("addr=%s val=0x%04x\n", regname(addr), val));
         break;
     default:
         logout("addr=%s val=0x%04x\n", regname(addr), val);
@@ -1769,6 +1790,13 @@ static ssize_t nic_receive(NetClientState *nc, const uint8_t * buf, size_t size)
     return size;
 }
 
+static void nic_link_status_changed(NetClientState *nc)
+{
+    EEPRO100State *s = qemu_get_nic_opaque(nc);
+
+    eepro100_update_link_status(s, nc->link_down);
+}
+
 static const VMStateDescription vmstate_eepro100 = {
     .version_id = 3,
     .minimum_version_id = 2,
@@ -1785,8 +1813,7 @@ static const VMStateDescription vmstate_eepro100 = {
         VMSTATE_UNUSED(19*4),
         VMSTATE_UINT16_ARRAY(mdimem, EEPRO100State, 32),
         /* The eeprom should be saved and restored by its own routines. */
-        VMSTATE_UINT32(device, EEPRO100State),
-        /* TODO check device. */
+        VMSTATE_UINT32_EQUAL(device, EEPRO100State),
         VMSTATE_UINT32(cu_base, EEPRO100State),
         VMSTATE_UINT32(cu_offset, EEPRO100State),
         VMSTATE_UINT32(ru_base, EEPRO100State),
@@ -1824,6 +1851,8 @@ static void pci_nic_uninit(PCIDevice *pci_dev)
 {
     EEPRO100State *s = DO_UPCAST(EEPRO100State, dev, pci_dev);
 
+    qemu_unregister_reset(nic_reset, s);
+    disable_interrupt(s);
     vmstate_unregister(VMSTATE_IF(&pci_dev->qdev), s->vmstate, s);
     g_free(s->vmstate);
     eeprom93xx_free(&pci_dev->qdev, s->eeprom);
@@ -1834,6 +1863,7 @@ static NetClientInfo net_eepro100_info = {
     .type = NET_CLIENT_DRIVER_NIC,
     .size = sizeof(NICState),
     .receive = nic_receive,
+    .link_status_changed = nic_link_status_changed,
 };
 
 static void e100_nic_realize(PCIDevice *pci_dev, Error **errp)
@@ -1877,6 +1907,7 @@ static void e100_nic_realize(PCIDevice *pci_dev, Error **errp)
                           object_get_typename(OBJECT(pci_dev)),
                           pci_dev->qdev.id,
                           &pci_dev->qdev.mem_reentrancy_guard, s);
+    eepro100_update_link_status(s, qemu_get_queue(s->nic)->link_down);
 
     qemu_format_nic_info_str(qemu_get_queue(s->nic), s->conf.macaddr.a);
     TRACE(OTHER, logout("%s\n", qemu_get_queue(s->nic)->info_str));

@@ -29,6 +29,8 @@ class Ia64FirmwareTest(QemuSystemTest):
                     drive_args: tuple[str, ...] | None = None):
         vm = self.get_vm(name=name)
         machine = "ia64-vpc"
+        if "nvram=" not in machine_options:
+            machine += ",nvram=none"
         if machine_options:
             machine += "," + machine_options
         vm.set_machine(machine)

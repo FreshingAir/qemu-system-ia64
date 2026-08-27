@@ -27,5 +27,6 @@ ia64_firmware_bin = custom_target(
   ],
   depfile: 'ia64-firmware.d',
   build_by_default: true,
-  install: false,
+  install: get_option('install_blobs'),
+  install_dir: [qemu_datadir, false, false, false],
 )

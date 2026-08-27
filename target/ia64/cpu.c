@@ -13,6 +13,7 @@
 #include "qemu/log.h"
 #include "qemu/rcu.h"
 #include "qemu/timer.h"
+#include "qemu/units.h"
 #include "cpu.h"
 #include "arch/arch.h"
 #include "ia32/ia32.h"
@@ -668,7 +669,14 @@ static bool ia64_cpu_tlb_fill(CPUState *cs, vaddr addr, int size,
         }
     }
 raise_exception:
-    if ((cpu->env.psr & IA64_PSR_IS) && retaddr) {
+    /*
+     * A softmmu access can fault after translated code has advanced beyond
+     * the last architecturally synchronized bundle.  Restore the precise
+     * instruction before deriving IA-64 state such as IPSR.ri and ISR.ed.
+     * cpu_loop_exit_restore() would otherwise do this only after those
+     * fields had already been computed.
+     */
+    if (retaddr) {
         cpu_restore_state(cs, retaddr);
         retaddr = 0;
     }
@@ -838,7 +846,8 @@ static void ia64_cpu_apply_boot_info(IA64CPU *cpu)
      */
     env->cr_pta = 15ULL << IA64_PTA_SIZE_SHIFT;
     env->cr_dcr = IA64_DCR_DM | IA64_DCR_DP;
-    env->ar_kr0 =
+    env->ar_kr0 = info->platform_addresses_valid ?
+        info->io_port_base :
         ia64_cpu_default_io_block_pa(IA64_CPU_GET_CLASS(cpu));
     env->ar_kr7 = 0;
     env->ar_rsc = info->rsc;
@@ -848,6 +857,15 @@ static void ia64_cpu_apply_boot_info(IA64CPU *cpu)
     ia64_rse_rnat_undefined(env, "reset");
     env->gr[IA64_GR_STACK_POINTER] = info->stack_pointer;
     env->gr[IA64_GR_GLOBAL_POINTER] = info->global_pointer;
+    if (info->firmware_args_valid) {
+        env->gr[IA64_GR_RETURN0] = info->firmware_arg0;
+        env->gr[IA64_GR_RETURN1] = info->firmware_arg1;
+        env->gr[IA64_GR_RETURN2] = info->firmware_arg2;
+    }
+    if (info->platform_addresses_valid) {
+        env->pal.pal_io_block_addr = info->io_port_base;
+        env->pal.pal_interrupt_block_addr = info->interrupt_block_base;
+    }
     env->interrupt.pal_halt_wake = info->powered_off;
     env->ar_fpsr = IA64_FPSR_DEFAULT;
     set_float_rounding_mode(float_round_nearest_even, &env->fp.fp_status);
@@ -1058,6 +1076,28 @@ static void ia64_cpu_realize(DeviceState *dev, Error **errp)
     icc->parent_realize(dev, errp);
 }
 
+static void ia64_cpu_finalize(Object *obj)
+{
+    IA64CPU *cpu = IA64_CPU(obj);
+
+    if (cpu->itm_timer != NULL) {
+        timer_free(cpu->itm_timer);
+        cpu->itm_timer = NULL;
+    }
+}
+
+static void ia64_cpu_unrealize(DeviceState *dev)
+{
+    IA64CPU *cpu = IA64_CPU(dev);
+    IA64CPUClass *icc = IA64_CPU_GET_CLASS(dev);
+
+    if (cpu->itm_timer != NULL) {
+        timer_free(cpu->itm_timer);
+        cpu->itm_timer = NULL;
+    }
+    icc->parent_unrealize(dev);
+}
+
 static const struct SysemuCPUOps ia64_sysemu_ops = {
     .has_work = ia64_cpu_has_work,
     .get_phys_page_debug = ia64_cpu_get_phys_page_debug,
@@ -1118,6 +1158,8 @@ static void ia64_cpu_class_init(ObjectClass *oc, const void *data)
 
     device_class_set_parent_realize(dc, ia64_cpu_realize,
                                     &icc->parent_realize);
+    device_class_set_parent_unrealize(dc, ia64_cpu_unrealize,
+                                      &icc->parent_unrealize);
     resettable_class_set_parent_phases(rc, NULL, ia64_cpu_reset_hold, NULL,
                                        &icc->parent_phases);
 
@@ -1136,8 +1178,12 @@ static void ia64_cpu_class_init(ObjectClass *oc, const void *data)
     icc->cpuid_version = 0x0000000020000704ULL;
     icc->cpuid_features = IA64_CPUID4_LB | IA64_CPUID4_AO;
     icc->pal_version = 0x0000096801000968ULL;
+    icc->pal_brand =
+        "QEMU Montecito-compatible IA-64 CPU 1.60GHz 24MB";
     icc->frequency_base_hz = 100000000;
     icc->itc_frequency_hz = 400000000;
+    icc->pal_l3_cache_size = 12 * MiB;
+    icc->pal_package_cache_size = 24 * MiB;
     icc->processor_frequency_ratio = IA64_FREQUENCY_RATIO(16, 1);
     icc->bus_frequency_ratio = IA64_FREQUENCY_RATIO(16, 3);
     icc->itc_frequency_ratio = IA64_FREQUENCY_RATIO(4, 1);
@@ -1157,6 +1203,9 @@ static void ia64_cpu_class_init(ObjectClass *oc, const void *data)
     icc->unique_tcs = 4;
     icc->tc_levels = 2;
     icc->perf_counter_width = 48;
+    icc->pal_l3_associativity = 12;
+    icc->pal_l3_load_latency = 14;
+    icc->pal_l3_tag_lsb = 20;
     /*
      * The Madison model implements WB, UC, UCE, and WC.  TCG has no
      * physical write-coalescing buffer, so WC does not promise physical
@@ -1180,8 +1229,11 @@ typedef struct IA64CPUModelDef {
     uint64_t cpuid_version;
     uint64_t cpuid_features;
     uint64_t pal_version;
+    const char *pal_brand;
     uint32_t frequency_base_hz;
     uint32_t itc_frequency_hz;
+    uint32_t pal_l3_cache_size;
+    uint32_t pal_package_cache_size;
     uint64_t processor_frequency_ratio;
     uint64_t bus_frequency_ratio;
     uint64_t itc_frequency_ratio;
@@ -1202,6 +1254,9 @@ typedef struct IA64CPUModelDef {
     uint8_t tc_levels;
     uint8_t perf_counter_width;
     uint8_t memory_attribute_mask;
+    uint8_t pal_l3_associativity;
+    uint8_t pal_l3_load_latency;
+    uint8_t pal_l3_tag_lsb;
     uint16_t fc_line_size;
     uint64_t implemented_pmc_mask;
     uint64_t implemented_pmd_mask;
@@ -1223,8 +1278,11 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
     icc->cpuid_version = model->cpuid_version;
     icc->cpuid_features = model->cpuid_features;
     icc->pal_version = model->pal_version;
+    icc->pal_brand = model->pal_brand;
     icc->frequency_base_hz = model->frequency_base_hz;
     icc->itc_frequency_hz = model->itc_frequency_hz;
+    icc->pal_l3_cache_size = model->pal_l3_cache_size;
+    icc->pal_package_cache_size = model->pal_package_cache_size;
     icc->processor_frequency_ratio = model->processor_frequency_ratio;
     icc->bus_frequency_ratio = model->bus_frequency_ratio;
     icc->itc_frequency_ratio = model->itc_frequency_ratio;
@@ -1246,6 +1304,9 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
     icc->tc_levels = model->tc_levels;
     icc->perf_counter_width = model->perf_counter_width;
     icc->memory_attribute_mask = model->memory_attribute_mask;
+    icc->pal_l3_associativity = model->pal_l3_associativity;
+    icc->pal_l3_load_latency = model->pal_l3_load_latency;
+    icc->pal_l3_tag_lsb = model->pal_l3_tag_lsb;
     icc->fc_line_size = model->fc_line_size;
     icc->implemented_pmc_mask = model->implemented_pmc_mask;
     icc->implemented_pmd_mask = model->implemented_pmd_mask;
@@ -1273,6 +1334,12 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
              model->itc_frequency_hz);
     g_assert(model->fc_line_size >= 32 &&
              is_power_of_2(model->fc_line_size));
+    g_assert(model->pal_brand != NULL);
+    g_assert(model->pal_l3_cache_size > 0);
+    g_assert(model->pal_package_cache_size >= model->pal_l3_cache_size);
+    g_assert(model->pal_l3_associativity > 0);
+    g_assert(model->pal_l3_load_latency > 0);
+    g_assert(model->pal_l3_tag_lsb > 0);
 }
 
 static const IA64CPUModelDef ia64_cpu_model_merced = {
@@ -1283,12 +1350,15 @@ static const IA64CPUModelDef ia64_cpu_model_merced = {
      * PAL_A model 8 and PAL_B model 8 use revision 30 for this release.
      */
     .pal_version = 0x0000883001008830ULL,
+    .pal_brand = "QEMU Itanium-compatible IA-64 CPU",
     /*
      * The selected 800 MHz part advances ITC at the processor rate.  Keep
      * this ratio explicit because the dual-core model uses a divided ITC.
      */
     .frequency_base_hz = 100000000,
     .itc_frequency_hz = 800000000,
+    .pal_l3_cache_size = 4 * MiB,
+    .pal_package_cache_size = 4 * MiB,
     .processor_frequency_ratio = IA64_FREQUENCY_RATIO(8, 1),
     .bus_frequency_ratio = IA64_FREQUENCY_RATIO(4, 3),
     .itc_frequency_ratio = IA64_FREQUENCY_RATIO(8, 1),
@@ -1337,6 +1407,9 @@ static const IA64CPUModelDef ia64_cpu_model_merced = {
                              (1U << IA64_PTE_MA_UC) |
                              (1U << IA64_PTE_MA_WC) |
                              (1U << IA64_PTE_MA_NATPAGE),
+    .pal_l3_associativity = 4,
+    .pal_l3_load_latency = 21,
+    .pal_l3_tag_lsb = 20,
     /* The first-generation L2/L3 cache line is 64 bytes. */
     .fc_line_size = 64,
     .implemented_pmc_mask = 0x3fffULL,
@@ -1364,8 +1437,11 @@ static const IA64CPUModelDef ia64_cpu_model_madison = {
     .cpuid_features = IA64_CPUID4_LB,
     /* Latest documented PAL release for the selected B1 model. */
     .pal_version = 0x0000057301000573ULL,
+    .pal_brand = "QEMU Madison-compatible IA-64 CPU",
     .frequency_base_hz = 100000000,
     .itc_frequency_hz = 1600000000,
+    .pal_l3_cache_size = 3 * MiB,
+    .pal_package_cache_size = 3 * MiB,
     .processor_frequency_ratio = IA64_FREQUENCY_RATIO(16, 1),
     .bus_frequency_ratio = IA64_FREQUENCY_RATIO(4, 1),
     .itc_frequency_ratio = IA64_FREQUENCY_RATIO(16, 1),
@@ -1388,6 +1464,9 @@ static const IA64CPUModelDef ia64_cpu_model_madison = {
     .tc_levels = 2,
     .perf_counter_width = 48,
     .memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK,
+    .pal_l3_associativity = 12,
+    .pal_l3_load_latency = 12,
+    .pal_l3_tag_lsb = 18,
     /* Intel order 251110-003, section 5.8: each fc invalidates 128 bytes. */
     .fc_line_size = 128,
     .implemented_pmc_mask = 0x3fffULL,
@@ -1409,6 +1488,7 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
     .cpuid_features = IA64_CPUID4_LB | IA64_CPUID4_AO,
     /* Latest documented PAL release for the selected C2 model. */
     .pal_version = 0x0000096801000968ULL,
+    .pal_brand = "QEMU Montecito-compatible IA-64 CPU 1.60GHz 24MB",
     /*
      * This model's ITC is one quarter of its 1.6 GHz processor clock.
      * Advertising a 4:1 ratio while advancing a different host-side rate
@@ -1416,6 +1496,8 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
      */
     .frequency_base_hz = 100000000,
     .itc_frequency_hz = 400000000,
+    .pal_l3_cache_size = 12 * MiB,
+    .pal_package_cache_size = 24 * MiB,
     .processor_frequency_ratio = IA64_FREQUENCY_RATIO(16, 1),
     .bus_frequency_ratio = IA64_FREQUENCY_RATIO(16, 3),
     .itc_frequency_ratio = IA64_FREQUENCY_RATIO(4, 1),
@@ -1441,6 +1523,9 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
      * 16-byte operations.
      */
     .memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK,
+    .pal_l3_associativity = 12,
+    .pal_l3_load_latency = 14,
+    .pal_l3_tag_lsb = 20,
     /* Montecito's L2 and L3 cache lines are 128 bytes. */
     .fc_line_size = 128,
     .implemented_pmc_mask = 0x3fffULL,
@@ -1467,12 +1552,48 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
     .is_montecito = true,
 };
 
+static void ia64_cpu_madison_zx6000_class_init(ObjectClass *oc,
+                                                const void *data)
+{
+    IA64CPUClass *icc = IA64_CPU_CLASS(oc);
+
+    /* 1.5 GHz Madison with a 6 MiB, 24-way, 128-byte-line L3 cache. */
+    icc->model = IA64_CPU_MODEL_MADISON;
+    icc->cpuid_version = 0x000000001f010504ULL;
+    icc->cpuid_features = IA64_CPUID4_LB;
+    icc->pal_version = 0x0000057301000573ULL;
+    icc->pal_brand =
+        "QEMU Madison zx6000-compatible IA-64 CPU 1.50GHz 6MB";
+    icc->frequency_base_hz = 100000000;
+    icc->itc_frequency_hz = 1500000000;
+    icc->pal_l3_cache_size = 6 * MiB;
+    icc->pal_package_cache_size = 6 * MiB;
+    icc->processor_frequency_ratio = IA64_FREQUENCY_RATIO(15, 1);
+    icc->bus_frequency_ratio = IA64_FREQUENCY_RATIO(4, 1);
+    icc->itc_frequency_ratio = IA64_FREQUENCY_RATIO(15, 1);
+    icc->ia32_cpuid_version = 0x00000673;
+    icc->ia32_cpuid_leaf2[0] = 0x7e776701;
+    icc->ia32_cpuid_leaf2[1] = 0x0000008d;
+    icc->ia32_cpuid_leaf2[2] = 0;
+    icc->ia32_cpuid_leaf2[3] = 0x80000000;
+    icc->pal_l3_associativity = 24;
+    icc->pal_l3_load_latency = 14;
+    icc->pal_l3_tag_lsb = 18;
+    icc->has_native_ia32 = true;
+
+    g_assert((uint64_t)icc->frequency_base_hz *
+             (icc->itc_frequency_ratio >> 32) /
+             (uint32_t)icc->itc_frequency_ratio ==
+             icc->itc_frequency_hz);
+}
+
 static const TypeInfo ia64_cpu_type_info[] = {
     {
         .name = TYPE_IA64_CPU,
         .parent = TYPE_CPU,
         .instance_size = sizeof(IA64CPU),
         .instance_align = __alignof__(IA64CPU),
+        .instance_finalize = ia64_cpu_finalize,
         .class_size = sizeof(IA64CPUClass),
         .class_init = ia64_cpu_class_init,
         .abstract = true,
@@ -1488,6 +1609,11 @@ static const TypeInfo ia64_cpu_type_info[] = {
         .parent = TYPE_IA64_CPU,
         .class_init = ia64_cpu_model_class_init,
         .class_data = &ia64_cpu_model_madison,
+    },
+    {
+        .name = IA64_CPU_TYPE_NAME("madison-zx6000"),
+        .parent = IA64_CPU_TYPE_NAME("madison"),
+        .class_init = ia64_cpu_madison_zx6000_class_init,
     },
     {
         .name = IA64_CPU_TYPE_NAME("montecito"),

@@ -1046,6 +1046,7 @@ static void machine_class_init(ObjectClass *oc, const void *data)
 
     /* Default 128 MB as guest ram size */
     mc->default_ram_size = 128 * MiB;
+    mc->block_default_cdrom_type = IF_DEFAULT;
     mc->rom_file_has_mr = true;
     /*
      * SMBIOS 3.1.0 7.18.5 Memory Device — Extended Size

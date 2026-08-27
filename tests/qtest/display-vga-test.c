@@ -8,6 +8,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 #include "hw/ia64/ia64_vpc_abi.h"
 
@@ -85,7 +86,21 @@
 static const char *machine_args(void)
 {
     return g_str_equal(qtest_get_arch(), "ia64") ?
-           "-machine ia64-vpc " : "";
+           "-machine ia64-vpc,nvram=none " : "";
+}
+
+/* ISA I/O-port words are little-endian, independent of target byte order. */
+static void legacy_outw_le(QTestState *qts, uint16_t addr, uint16_t value)
+{
+    qtest_outw(qts, addr,
+               qtest_big_endian(qts) ? bswap16(value) : value);
+}
+
+static uint16_t legacy_inw_le(QTestState *qts, uint16_t addr)
+{
+    uint16_t value = qtest_inw(qts, addr);
+
+    return qtest_big_endian(qts) ? bswap16(value) : value;
 }
 
 static void pci_multihead(void)
@@ -112,7 +127,7 @@ static void vbe_legacy_data_port(void)
     uint16_t id;
 
     if (g_str_equal(qtest_get_arch(), "ia64")) {
-        qts = qtest_init("-machine ia64-vpc -vga std");
+        qts = qtest_init("-machine ia64-vpc,nvram=none -vga std");
         qtest_writew(qts, IA64_LEGACY_IO_PORT_PA(VBE_DISPI_IOPORT_INDEX),
                      VBE_DISPI_INDEX_ID);
         id = qtest_readw(
@@ -134,10 +149,10 @@ static void vbe_legacy_data_port(void)
             qts, IA64_LEGACY_IO_PORT_PA(VBE_DISPI_IOPORT_INDEX + 2)), ==, 0);
     } else {
         qts = qtest_init("-vga none -device VGA");
-        qtest_outw(qts, VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_ID);
-        id = qtest_inw(qts, VBE_DISPI_IOPORT_INDEX + 2);
+        legacy_outw_le(qts, VBE_DISPI_IOPORT_INDEX, VBE_DISPI_INDEX_ID);
+        id = legacy_inw_le(qts, VBE_DISPI_IOPORT_INDEX + 2);
         g_assert_cmphex(id, ==, VBE_DISPI_ID5);
-        g_assert_cmphex(qtest_inw(qts, VBE_DISPI_IOPORT_DATA), ==, id);
+        g_assert_cmphex(legacy_inw_le(qts, VBE_DISPI_IOPORT_DATA), ==, id);
     }
     qtest_quit(qts);
 }
@@ -157,7 +172,7 @@ static void vga_wide_planar_access(void)
     QTestState *qts;
     unsigned plane;
 
-    qts = qtest_init("-machine ia64-vpc -vga std -S");
+    qts = qtest_init("-machine ia64-vpc,nvram=none -vga std -S");
 
     qtest_writeb(qts, IA64_LEGACY_IO_PORT_PA(VGA_SEQ_INDEX),
                  VGA_SEQ_MEMORY_MODE);
@@ -346,7 +361,7 @@ static void ati_blit_visible_intersection(void)
     g_autofree char *after = NULL;
     g_autoptr(GError) error = NULL;
 
-    qts = qtest_init("-machine ia64-vpc -m 256M -S");
+    qts = qtest_init("-machine ia64-vpc,nvram=none -m 256M -S");
     qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_CRTC_H_TOTAL_DISP,
                  ((width / 8) - 1) << 16);
     qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_CRTC_V_TOTAL_DISP,
@@ -419,7 +434,7 @@ static void ati_reverse_overlap_blit(void)
     memcpy(expected, initial, sizeof(expected));
     memmove(&expected[4], &expected[0], 16);
 
-    qts = qtest_init("-machine ia64-vpc -m 256M -S");
+    qts = qtest_init("-machine ia64-vpc,nvram=none -m 256M -S");
     qtest_memwrite(qts, IA64_ATI_FB_BASE, initial, sizeof(initial));
     qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_OFFSET, 0);
     qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_PITCH, pitch / 8);
@@ -460,7 +475,7 @@ static void ati_stride(void)
     g_autofree char *ppm = NULL;
     g_autoptr(GError) error = NULL;
 
-    qts = qtest_init("-machine ia64-vpc -m 256M -S");
+    qts = qtest_init("-machine ia64-vpc,nvram=none -m 256M -S");
     /*
      * Program the ATI CRTC, not the generic VBE ports.  ati_vga_switch_mode()
      * must translate the Rage128 pitch (eight-pixel units) into the VBE

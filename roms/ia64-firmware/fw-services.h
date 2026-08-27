@@ -8,6 +8,8 @@
 #define IA64_FIRMWARE_FW_SERVICES_H
 
 #include "fw-base.h"
+#include "fw-uart-policy.h"
+#include "hw/ia64/ia64_platform_abi.h"
 #include "hw/ia64/ia64_vpc_abi.h"
 
 #define IA64_PSR_IC (1ULL << 13)
@@ -26,6 +28,7 @@
 #define UART_MCR      0x04U
 #define UART_LSR      0x05U
 #define UART_MSR      0x06U
+#define UART_REGISTER_COUNT 8U
 #define UART_LSR_DR   0x01U
 #define UART_LSR_THRE 0x20U
 #define UART_LCR_DLAB 0x80U
@@ -56,6 +59,25 @@
 void fw_copy_mem(VOID *destination, const VOID *source, UINTN length);
 UINT64 fw_read_itc(void);
 UINT64 fw_itc_ticks_per_100ns(void);
+BOOLEAN fw_platform_descriptor_init(UINT64 descriptor_gpa,
+                                    UINT64 descriptor_size,
+                                    UINT64 platform_id);
+BOOLEAN fw_vpc_devices_enabled(void);
+BOOLEAN fw_i2000_profile_enabled(void);
+const FW_UART_POLICY *fw_i2000_uart_policy(void);
+UINT64 fw_platform_legacy_io_base(void);
+UINT64 fw_platform_legacy_io_size(void);
+UINT64 fw_platform_legacy_io_port(UINTN port);
+UINT64 fw_platform_local_sapic_base(void);
+UINT64 fw_platform_local_sapic_size(void);
+UINT64 fw_platform_console_base(void);
+UINT32 fw_platform_console_stride(void);
+UINT64 fw_platform_console_clock_hz(void);
+UINT64 fw_platform_console_default_baud(void);
+UINT64 fw_platform_nvram_base(void);
+UINT64 fw_platform_nvram_size(void);
+UINT64 fw_platform_rtc_base(void);
+UINT64 fw_platform_rtc_size(void);
 volatile UINT8 *fw_uart_reg(UINTN offset);
 UINT64 fw_read_psr(void);
 UINT64 fw_read_ivr(void);

@@ -1452,11 +1452,11 @@ test_lfetch_fault_checks_translation = require_registers(
     }, entry=0x10)
 
 def test_high_ram_above_4g_physical_and_translated_access(qemu):
-    # Match the physical address of the PFN accounting word from the crash
-    # dump and cover it with a supported large CPU translation.  The word is
-    # in the upper 4 KiB half of an 8 KiB guest page.  Keep a distinct value
-    # at the corresponding address below 4 GiB so that a truncating physical
-    # address path cannot pass merely by reading back its own aliased write.
+    # Use an address above 4 GiB and cover it with a supported large
+    # CPU translation.  The word is in the upper 4 KiB half of an 8 KiB guest
+    # page.  Keep a distinct value at the corresponding address below 4 GiB
+    # so that a truncating physical-address path cannot pass merely by reading
+    # back its own aliased write.
     count_pa = 0x000000010368f84c
     low_count_pa = count_pa & 0xffffffff
     page_pa = 0x000000019b502000
@@ -1509,10 +1509,10 @@ def test_high_ram_above_4g_physical_and_translated_access(qemu):
 
 
 def test_long_vhpt_large_page_high_ram_subword_remap(qemu):
-    # Reproduce the mapping which contained the corrupt PFN count in the
-    # crash dump.  Unlike the pinned-DTR coverage above, install the 16 MiB
-    # mapping through a long-format VHPT walk, update its leaf translation,
-    # purge the old TC, and refill it at the same virtual address.
+    # Exercise a high-RAM subword mapping.  Unlike the pinned-DTR
+    # coverage above, install the 16 MiB mapping through a long-format VHPT
+    # walk, update its leaf translation, purge the old TC, and refill it at
+    # the same virtual address.
     page_shift = 24
     page_mask = (1 << page_shift) - 1
     rid = 7
@@ -2165,8 +2165,9 @@ def test_itc_d_merced_main_tlb_capacity(qemu):
     }, name="itc_d_merced_main_tlb_capacity", cpu="merced")
 
 
-def test_itc_d_merced_dtlb1_micro_hit_updates_lru(qemu):
-    fill_base = 0x100000
+def _run_itc_d_merced_dtlb1_lru(qemu, name, hot_access):
+    # Keep translated data outside the firmware identity range.
+    fill_base = 0x200000
     page_size = 0x4000
     data_offset = 0x1000
     cursor = 0x10000
@@ -2189,13 +2190,13 @@ def test_itc_d_merced_dtlb1_micro_hit_updates_lru(qemu):
         ])
         cursor += 0x30
 
-    def append_load(index, dest=30):
+    def append_access(index, access=ld8, dest=30):
         nonlocal cursor
         va = fill_base + index * page_size + data_offset
 
         bundles.extend([
             (cursor, *movl_mlx(2, va)),
-            (cursor + 0x10, 0x00, ld8(dest, 2), nop_i(), nop_i()),
+            (cursor + 0x10, 0x00, access(dest, 2), nop_i(), nop_i()),
         ])
         cursor += 0x20
 
@@ -2208,23 +2209,23 @@ def test_itc_d_merced_dtlb1_micro_hit_updates_lru(qemu):
     ])
     cursor += 0x20
     for index in range(32):
-        append_load(index)
+        append_access(index)
 
     # Keep page zero in the direct touch cache while every other page is made
     # newer.  Its repeated hits must still update the modeled DTLB1 LRU;
     # otherwise the 33rd fill below incorrectly chooses page zero as victim.
-    append_load(0)
+    append_access(0, hot_access)
     for index in range(1, 32):
-        append_load(index)
-        append_load(0)
-    append_load(32)
+        append_access(index)
+        append_access(0, hot_access)
+    append_access(32)
 
     # Rotate the page-zero and page-one sources out of Merced's 96-entry
     # DTLB2.  Page zero must remain accessible solely through its recently
     # touched, non-inclusive DTLB1 copy.
     for index in range(33, MERCED_DTLB_ENTRIES + 2):
         append_itc(index)
-    append_load(0, dest=31)
+    append_access(0, dest=31)
     terminal_ip = cursor
     bundles.append((terminal_ip, 0x10, nop_m(), nop_i(),
                     br_cond(terminal_ip, terminal_ip)))
@@ -2233,7 +2234,20 @@ def test_itc_d_merced_dtlb1_micro_hit_updates_lru(qemu):
         "ip": terminal_ip,
         "exception": IA64_EXCP_NONE,
         "r31": 0,
-    }, name="itc_d_merced_dtlb1_micro_hit_updates_lru", cpu="merced")
+    }, name=name, cpu="merced")
+
+
+def test_itc_d_merced_dtlb1_micro_hit_updates_lru(qemu):
+    _run_itc_d_merced_dtlb1_lru(
+        qemu, "itc_d_merced_dtlb1_micro_hit_updates_lru", ld8)
+
+
+def test_itc_d_merced_dtlb1_cmpxchg_hit_updates_lru(qemu):
+    def cmpxchg_zero(dest, base):
+        return cmpxchg4_acq(dest, base, 0)
+
+    _run_itc_d_merced_dtlb1_lru(
+        qemu, "itc_d_merced_dtlb1_cmpxchg_hit_updates_lru", cmpxchg_zero)
 
 
 def test_itc_d_full_tc_replacement_rotates(qemu):
@@ -7863,6 +7877,7 @@ CASE_NAMES = (
     'itc_d_evicted_refill_flushes_host_tlb',
     'itc_d_key_permission_store_raises_permission_vector',
     'itc_d_matching_pkr_allows_keyed_load',
+    'itc_d_merced_dtlb1_cmpxchg_hit_updates_lru',
     'itc_d_merced_dtlb1_micro_hit_updates_lru',
     'itc_d_merced_main_tlb_capacity',
     'itc_d_nat_pte_consumes',

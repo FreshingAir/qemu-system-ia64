@@ -1373,6 +1373,17 @@ static bool ia64_instruction_breakpoint_match(CPUIA64State *env,
     return false;
 }
 
+static bool ia64_data_breakpoint_control_enabled(uint64_t control,
+                                                 uint64_t isr_access,
+                                                 uint8_t access_level)
+{
+    bool access_match =
+        ((isr_access & IA64_ISR_R) && (control & (1ULL << 63))) ||
+        ((isr_access & IA64_ISR_W) && (control & (1ULL << 62)));
+
+    return access_match && ia64_debug_plm_match(control, access_level);
+}
+
 static bool ia64_data_breakpoint_register_match(CPUIA64State *env,
                                                 uint64_t address,
                                                 uint32_t size,
@@ -1387,12 +1398,10 @@ static bool ia64_data_breakpoint_register_match(CPUIA64State *env,
         uint64_t control = env->dbr[pair * 2 + 1];
         uint64_t mask = fixed_mask |
                         (control & UINT64_C(0x00ffffffffffffff));
-        bool access_match =
-            ((isr_access & IA64_ISR_R) && (control & (1ULL << 63))) ||
-            ((isr_access & IA64_ISR_W) && (control & (1ULL << 62)));
         uint32_t byte;
 
-        if (!access_match || !ia64_debug_plm_match(control, access_level)) {
+        if (!ia64_data_breakpoint_control_enabled(
+                control, isr_access, access_level)) {
             continue;
         }
         for (byte = 0; byte < size; byte++) {
@@ -1404,19 +1413,32 @@ static bool ia64_data_breakpoint_register_match(CPUIA64State *env,
     return false;
 }
 
+static bool ia64_data_breakpoint_enabled(CPUIA64State *env,
+                                         uint64_t isr_access,
+                                         uint8_t access_level)
+{
+    unsigned pair;
+
+    for (pair = 0; pair < IA64_DBR_IMPLEMENTED_COUNT / 2; pair++) {
+        if (ia64_data_breakpoint_control_enabled(
+                env->dbr[pair * 2 + 1], isr_access, access_level)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool ia64_data_breakpoint_match(CPUIA64State *env,
                                        uint64_t address, uint32_t size,
                                        uint64_t isr_access,
                                        uint8_t access_level)
 {
     /*
-     * Itanium 2 reports a Data Debug fault for every memory datum that
-     * crosses a 16-byte boundary while PSR.db enables breakpoints, even
-     * when no programmed DBR address matches.  PSR.db and PSR.dd are
-     * checked by the callers; this helper supplies the model-specific
-     * match condition to both ordinary and speculative references.
+     * The model-specific cross-boundary condition ignores DBR addresses,
+     * but still requires an enabled access type and privilege level.
      */
     if (ia64_env_cpu_class(env)->data_debug_cross_16byte &&
+        ia64_data_breakpoint_enabled(env, isr_access, access_level) &&
         (address & 0xf) + size > 16) {
         return true;
     }

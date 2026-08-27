@@ -6,7 +6,7 @@ DefinitionBlock ("", "SSDT", 2, "QEMU  ", "IA64SSDT", 0x00000001)
 
     Scope (\_SB)
     {
-        // Keep these as AML BytePrefix objects; firmware patches the payload.
+        // Firmware patches these AML BytePrefix payloads.
         Name (C0EN, 0x0F)
         Processor (CPU0, 0, 0, 0)
         {
@@ -586,24 +586,8 @@ DefinitionBlock ("", "SSDT", 2, "QEMU  ", "IA64SSDT", 0x00000001)
 
     Scope (\_SB.PCI0)
     {
+        // Firmware patches this AML BytePrefix payload.
         Name (P2EN, 0x0F)
-
-        Device (UAR0)
-        {
-            Name (_HID, "PNP0501")
-            Name (_UID, 0)
-            Name (_CRS, ResourceTemplate ()
-            {
-                QWordIO (ResourceConsumer, MinFixed, MaxFixed, PosDecode,
-                    EntireRange, 0, 0x03F8, 0x03FF, 0, 8,
-                    , , , TypeStatic, DenseTranslation)
-                // COM1 is wired to the IOSAPIC's ISA-compatible GSI 4 input.
-                Interrupt (ResourceConsumer, Edge, ActiveHigh, Exclusive, ,,)
-                {
-                    4
-                }
-            })
-        }
 
         Device (PS2K)
         {
@@ -633,4 +617,5 @@ DefinitionBlock ("", "SSDT", 2, "QEMU  ", "IA64SSDT", 0x00000001)
             })
         }
     }
+
 }

@@ -224,6 +224,7 @@ MADISON_PAL_VM_SUMMARY_INFO_1 = (
     ((MADISON_TR_COUNT - 1) << 40) | (4 << 48) | (2 << 56))
 PAL_RATIO_16_1 = (16 << 32) | 1
 PAL_RATIO_16_3 = (16 << 32) | 3
+PAL_RATIO_15_1 = (15 << 32) | 1
 PAL_RATIO_8_1 = (8 << 32) | 1
 PAL_RATIO_4_3 = (4 << 32) | 3
 PAL_RATIO_4_1 = (4 << 32) | 1
@@ -244,6 +245,16 @@ PAL_CACHE_INFO_L2_U_1 = (1 | (1 << 1) | (12 << 8) | (7 << 16) |
                          (7 << 24) | (1 << 32) | (14 << 40))
 PAL_CACHE_INFO_L2_U_2 = (12 * 1024 * 1024 | (12 << 32) | (20 << 40) |
                           (49 << 48))
+MADISON_PAL_CACHE_INFO_L2_U_1 = (
+    1 | (1 << 1) | (12 << 8) | (7 << 16) | (7 << 24) |
+    (1 << 32) | (12 << 40))
+MADISON_PAL_CACHE_INFO_L2_U_2 = (
+    3 * 1024 * 1024 | (12 << 32) | (18 << 40) | (49 << 48))
+MADISON_ZX6000_PAL_CACHE_INFO_L2_U_1 = (
+    1 | (1 << 1) | (24 << 8) | (7 << 16) | (7 << 24) |
+    (1 << 32) | (14 << 40))
+MADISON_ZX6000_PAL_CACHE_INFO_L2_U_2 = (
+    6 * 1024 * 1024 | (12 << 32) | (18 << 40) | (49 << 48))
 PAL_VM_INFO_L0 = 1 | (32 << 8) | (32 << 16)
 PAL_VM_INFO_L1 = (1 | (128 << 8) | (128 << 16) |
                   (1 << 32) | (1 << 34))
@@ -534,6 +545,7 @@ __all__ = (
     'MADISON_PAL_VM_SUMMARY_INFO_1',
     'PAL_RATIO_16_1',
     'PAL_RATIO_16_3',
+    'PAL_RATIO_15_1',
     'PAL_RATIO_8_1',
     'PAL_RATIO_4_3',
     'PAL_RATIO_4_1',
@@ -548,6 +560,10 @@ __all__ = (
     'PAL_CACHE_INFO_L1_D_2',
     'PAL_CACHE_INFO_L2_U_1',
     'PAL_CACHE_INFO_L2_U_2',
+    'MADISON_PAL_CACHE_INFO_L2_U_1',
+    'MADISON_PAL_CACHE_INFO_L2_U_2',
+    'MADISON_ZX6000_PAL_CACHE_INFO_L2_U_1',
+    'MADISON_ZX6000_PAL_CACHE_INFO_L2_U_2',
     'PAL_VM_INFO_L0',
     'PAL_VM_INFO_L1',
     'MERCED_INSERTABLE_PAGE_SIZE_MASK',

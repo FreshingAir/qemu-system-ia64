@@ -54,6 +54,35 @@ tests = {
     migration,
     pixman,
   ],
+  'test-hp-lba-config': [
+    meson.project_source_root() / 'hw/pci-host/hp-lba-config.c',
+  ],
+  'test-hp-io-sapic': [
+    meson.project_source_root() / 'hw/pci-host/hp-io-sapic.c',
+  ],
+  'test-hp-sba-iommu': [
+    meson.project_source_root() / 'hw/pci-host/hp-sba-iommu.c',
+  ],
+  'test-hp-sba-routing': [
+    meson.project_source_root() / 'hw/pci-host/hp-sba-routing.c',
+  ],
+  'test-hp-zx1-mio': [
+    meson.project_source_root() / 'hw/pci-host/hp-zx1-mio-regs.c',
+  ],
+  'test-hp-zx1-iommu': [
+    meson.project_source_root() / 'hw/pci-host/hp-zx1-iommu.c',
+    meson.project_source_root() / 'hw/pci-host/hp-sba-iommu.c',
+  ],
+  'test-hp-zx1-ioa-regs': [
+    meson.project_source_root() / 'hw/pci-host/hp-zx1-ioa-regs.c',
+    meson.project_source_root() / 'hw/pci-host/hp-io-sapic.c',
+  ],
+  'test-isp12160-activation': [
+    meson.project_source_root() / 'hw/scsi/isp12160_activation.c',
+  ],
+  'test-isp12160-iocb': [
+    meson.project_source_root() / 'hw/scsi/isp12160_iocb.c',
+  ],
 }
 
 if have_system or have_tools
@@ -140,6 +169,17 @@ if have_system
     'test-util-sockets': ['socket-helpers.c'],
     'test-base64': [],
     'test-bufferiszero': [],
+    'test-isa-i8259-multi-instance': [
+      meson.project_source_root() / 'hw/isa/isa-bus.c',
+      meson.project_source_root() / 'hw/intc/intc.c',
+      meson.project_source_root() / 'hw/intc/i8259_common.c',
+      meson.project_source_root() / 'hw/intc/i8259.c',
+      qom,
+      hwcore,
+    ],
+    'test-lpc47b27-config': [
+      meson.project_source_root() / 'hw/isa/lpc47b27_config.c',
+    ],
     'test-smp-parse': [qom, meson.project_source_root() / 'hw/core/machine-smp.c'],
     'test-vmstate': [migration, io],
     'test-yank': ['socket-helpers.c', qom, io, chardev]
@@ -274,6 +314,114 @@ if 'ia64-softmmu' in target_dirs
        timeout: 30,
        suite: ['unit', 'ia64'])
 
+  ia64_platform_test = executable(
+    'test-ia64-platform',
+    [
+      'test-ia64-platform.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-platform', ia64_platform_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_platform_rom_test = executable(
+    'test-ia64-platform-rom',
+    [
+      'test-ia64-platform-rom.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform_rom.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-platform-rom', ia64_platform_rom_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_platform_device_test = executable(
+    'test-ia64-platform-device',
+    [
+      'test-ia64-platform-device.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform_rom.c',
+      meson.project_source_root() / 'hw/ia64/ia64_platform_device.c',
+    ],
+    dependencies: [qemuutil, qom, hwcore],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-platform-device', ia64_platform_device_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_i2000_460gx_layout_test = executable(
+    'test-ia64-i2000-460gx-layout',
+    [
+      'test-ia64-i2000-460gx-layout.c',
+      meson.project_source_root() / 'hw/ia64/ia64_i2000_460gx_test_layout.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-i2000-460gx-layout', ia64_i2000_460gx_layout_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_i2000_io_layout_test = executable(
+    'test-ia64-i2000-io-layout',
+    [
+      'test-ia64-i2000-io-layout.c',
+      meson.project_source_root() / 'hw/ia64/ia64_i2000_io_test_layout.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-i2000-io-layout', ia64_i2000_io_layout_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_zx6000_zx1_test_layout_test = executable(
+    'test-ia64-zx6000-zx1-layout',
+    [
+      'test-ia64-zx6000-zx1-layout.c',
+      meson.project_source_root() / 'hw/ia64/ia64_zx6000_zx1_test_layout.c',
+      meson.project_source_root() / 'hw/pci-host/hp-sba-iommu.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-ia64-zx6000-zx1-layout', ia64_zx6000_zx1_test_layout_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  intel_460gx_host_test = executable(
+    'test-intel-460gx-host',
+    [
+      'test-intel-460gx-host.c',
+      meson.project_source_root() / 'hw/ia64/intel_460gx_host_cfg.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-intel-460gx-host', intel_460gx_host_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  intel_460gx_dma_test = executable(
+    'test-intel-460gx-dma',
+    [
+      'test-intel-460gx-dma.c',
+      meson.project_source_root() / 'hw/ia64/intel_460gx_dma.c',
+    ],
+    dependencies: [qemuutil],
+    include_directories: include_directories('../..'))
+
+  test('test-intel-460gx-dma', intel_460gx_dma_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
   test('test-ia64-fpmodel',
        python,
        args: [files('ia64/test_fpmodel.py')],
@@ -295,6 +443,92 @@ if 'ia64-softmmu' in target_dirs
          meson.project_build_root() / 'roms/ia64-firmware/ia64-firmware.elf',
        ],
        protocol: 'tap',
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_pci_config_test = executable(
+    'test-ia64-firmware-pci-config',
+    'test-ia64-firmware-pci-config.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-pci-config', ia64_firmware_pci_config_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_acpi_aml_test = executable(
+    'test-ia64-firmware-acpi-aml',
+    [
+      'test-ia64-firmware-acpi-aml.c',
+      meson.project_source_root() / 'roms/ia64-firmware/fw-acpi-aml.c',
+    ],
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-acpi-aml', ia64_firmware_acpi_aml_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_uart_policy_test = executable(
+    'test-ia64-firmware-uart-policy',
+    'test-ia64-firmware-uart-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-uart-policy', ia64_firmware_uart_policy_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_ide_policy_test = executable(
+    'test-ia64-firmware-ide-policy',
+    'test-ia64-firmware-ide-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-ide-policy', ia64_firmware_ide_policy_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_isp12160_policy_test = executable(
+    'test-ia64-firmware-isp12160-policy',
+    'test-ia64-firmware-isp12160-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-isp12160-policy',
+       ia64_firmware_isp12160_policy_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_scsi_policy_test = executable(
+    'test-ia64-firmware-scsi-policy',
+    'test-ia64-firmware-scsi-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-scsi-policy', ia64_firmware_scsi_policy_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_runtime_policy_test = executable(
+    'test-ia64-firmware-runtime-policy',
+    'test-ia64-firmware-runtime-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-runtime-policy',
+       ia64_firmware_runtime_policy_test,
+       timeout: 30,
+       suite: ['unit', 'ia64'])
+
+  ia64_firmware_allocation_policy_test = executable(
+    'test-ia64-firmware-allocation-policy',
+    'test-ia64-firmware-allocation-policy.c',
+    include_directories: include_directories(
+      '../..', '../../roms/ia64-firmware'))
+
+  test('test-ia64-firmware-allocation-policy',
+       ia64_firmware_allocation_policy_test,
        timeout: 30,
        suite: ['unit', 'ia64'])
 

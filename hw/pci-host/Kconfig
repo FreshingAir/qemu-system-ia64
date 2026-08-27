@@ -100,9 +100,39 @@ config DINO
     bool
     select PCI
 
+config HP_SBA_IOMMU
+    bool
+
+config HP_SBA_ROUTING
+    bool
+
+config HP_LBA_CONFIG
+    bool
+
+config HP_IO_SAPIC
+    bool
+
+config HP_ZX1_IOMMU
+    bool
+    select HP_SBA_IOMMU
+
+config HP_ZX1_MIO
+    bool
+    default y if IA64 && TEST_DEVICES
+    select HP_ZX1_IOMMU
+
+config HP_ZX1_IOA
+    bool
+    default y if IA64 && TEST_DEVICES
+    select HP_IO_SAPIC
+
 config ASTRO
     bool
     select PCI
+    select HP_IO_SAPIC
+    select HP_LBA_CONFIG
+    select HP_SBA_IOMMU
+    select HP_SBA_ROUTING
 
 config PCI_EXPRESS_FSL_IMX8M_PHY
     bool

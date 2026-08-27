@@ -14,6 +14,8 @@
 
 #include "hw/pci/pci.h"
 
+#define TYPE_IOMMU_TESTDEV          "iommu-testdev"
+
 #define IOMMU_TESTDEV_VENDOR_ID     PCI_VENDOR_ID_REDHAT
 #define IOMMU_TESTDEV_DEVICE_ID     PCI_DEVICE_ID_REDHAT_TEST
 
@@ -64,6 +66,9 @@
 #define ITD_DMA_ERR_NOT_ARMED  0xdead0005u
 #define ITD_DMA_ERR_BAD_ATTRS  0xdead0006u
 
+/* No DMA write has produced a raw MemTxResult since reset/arming. */
+#define ITD_DMA_MEMTX_NOT_RUN   UINT32_MAX
+
 #define ITD_DMA_WRITE_VAL     0x12345678u
 
 /* DMA doorbell bits */
@@ -81,6 +86,8 @@ enum {
     ITD_REG_DMA_ATTRS       = 0x18,
     ITD_REG_DMA_GPA_LO      = 0x1c,
     ITD_REG_DMA_GPA_HI      = 0x20,
+    /* Raw MemTxResult returned by dma_memory_write(), read-only. */
+    ITD_REG_DMA_MEMTX_RESULT = 0x24,
     BAR0_SIZE               = 0x1000,
 };
 

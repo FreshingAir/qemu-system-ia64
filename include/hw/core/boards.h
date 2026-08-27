@@ -283,6 +283,8 @@ struct MachineClass {
     bool (*get_kernel_irqchip_default) (const MachineState *machine);
 
     BlockInterfaceType block_default_type;
+    /* IF_DEFAULT means to use block_default_type for CD-ROM media too. */
+    BlockInterfaceType block_default_cdrom_type;
     int units_per_default_bus;
     int max_cpus;
     int min_cpus;

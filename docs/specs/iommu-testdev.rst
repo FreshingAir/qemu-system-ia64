@@ -5,25 +5,11 @@ iommu-testdev — IOMMU test device for bare-metal testing
 
 Overview
 --------
-``iommu-testdev`` is a minimal, test-only PCI device designed to exercise
+``iommu-testdev`` is a minimal PCI device designed to exercise
 IOMMU translation (such as ARM SMMUv3) without requiring firmware or a guest
 OS. Tests can populate IOMMU translation tables with known values and trigger
-DMA operations that flow through the IOMMU translation path. It is **not** a
-faithful PCIe endpoint and must be considered a QEMU-internal test vehicle.
-
-Key Features
-------------
-* **Bare-metal IOMMU testing**: No guest kernel or firmware required
-* **Configurable DMA attributes**: Supports address space configuration via
-  MMIO registers
-* **Deterministic verification**: Write-then-read DMA pattern with automatic
-  result checking
-
-Status
-------
-* Location: ``hw/misc/iommu-testdev.c``
-* Header: ``include/hw/misc/iommu-testdev.h``
-* Build guard: ``CONFIG_IOMMU_TESTDEV``
+DMA operations that flow through the IOMMU translation path. It implements
+only the test interface described below.
 
 Device Interface
 ----------------
@@ -38,9 +24,11 @@ The device exposes a single PCI BAR0 with 32-bit MMIO registers:
 * ``ITD_REG_DMA_LEN`` (0x0C): DMA transfer length
 * ``ITD_REG_DMA_RESULT`` (0x10): DMA result
   (0=success, 0xffffffff=idle, 0xfffffffe=armed)
+* ``ITD_REG_DMA_MEMTX_RESULT`` (0x24): Raw ``MemTxResult`` from the last DMA
+  write; 0xffffffff means no write was attempted.
 * ``ITD_REG_DMA_DBELL`` (0x14): Write 1 to arm DMA, write 0 to disarm.
-  Arming only marks the request and sets BUSY (no latch/check), but it
-  provides an explicit gate for qtests and leaves room for async/latching.
+  Arming marks the request and sets BUSY without latching or validating the
+  other register values.
 * ``ITD_REG_DMA_ATTRS`` (0x18): DMA attributes which shadow some fields in
   MemTxAttrs:
 
@@ -49,8 +37,7 @@ The device exposes a single PCI BAR0 with 32-bit MMIO registers:
   - bit[3]: space_valid (1=space is valid, 0=ignore space and default to Non-Secure)
     ``space`` field in MemTxAttrs is consumed only when ``space_valid`` is set.
     For Secure/Non-Secure, ``secure`` and ``space`` must match; mismatches
-    return ``ITD_DMA_ERR_BAD_ATTRS``. Other bits are reserved but can be wired
-    up easily if future tests need to pass extra attributes.
+    return ``ITD_DMA_ERR_BAD_ATTRS``. All other bits are reserved.
 
 Translation Setup Workflow
 --------------------------
@@ -66,18 +53,16 @@ DMA Operation Flow
 ------------------
 Arming semantics:
 
-* Writing ``DMA_DBELL`` with bit0=1 marks the request armed and sets
-  ``DMA_RESULT`` to BUSY. It does not latch GVA/LEN/ATTRS; values are sampled
-  when ``DMA_TRIGGERING`` is read.
+* Writing ``DMA_DBELL`` with bit0=1 marks the request armed, sets
+  ``DMA_RESULT`` to BUSY, and resets ``DMA_MEMTX_RESULT`` to 0xffffffff.
+  It does not latch GVA/LEN/ATTRS; values are sampled when
+  ``DMA_TRIGGERING`` is read.
 * Writing ``DMA_DBELL`` with bit0=0 disarms the request and sets
   ``DMA_RESULT`` to IDLE.
 * Reading ``DMA_TRIGGERING`` consumes the armed request and clears the armed
   state, even on error.
 
-The flow would be split into these steps, mainly for timing control and
-debuggability: qtests can easily exercise and assert distinct paths
-(NOT_ARMED, BAD_LEN, TX/RD failures, mismatch) instead of having all side
-effects hidden behind a single step:
+The DMA operation consists of these steps:
 1. Test programs IOMMU translation tables
 2. Test configures DMA IOVA (GVA_LO/HI), GPA for readback, length, and attributes
 3. Test writes 1 to DMA_DBELL to arm the operation
@@ -87,8 +72,11 @@ effects hidden behind a single step:
    - 0x00000000: Success
    - 0xFFFFFFFE: Armed (waiting for trigger). DMA runs synchronously, so
      BUSY is not observed once the trigger read completes.
-   - 0xDEAD0006: Bad attrs (secure/space mismatch for S/NS)
-   - 0xDEAD000X: Various error codes
+   - 0xDEAD0001 through 0xDEAD0006: Bad length, DMA write failure, DMA read
+     failure, data mismatch, unarmed trigger, or bad attributes
+
+   ``DMA_MEMTX_RESULT`` reports the raw outcome; validation failures before
+   the write leave it at 0xffffffff.
 
 The device performs a write-then-read sequence using a known pattern
 (0x12345678) and verifies data integrity automatically.
@@ -124,10 +112,9 @@ explicitly.
 
 Limitations
 -----------
-* No realistic PCIe enumeration, MSI/MSI-X, or interrupt handling
-* No ATS/PRI support
-* No actual device functionality beyond DMA test pattern
-* Test-only; not suitable for production or machine realism
+* PCI Express capabilities, MSI/MSI-X, interrupts, and ATS/PRI are not
+  implemented
+* The device implements only the DMA test pattern
 * Address space support (Secure/Root/Realm) is architecture-dependent and
   gated by ``space_valid``
 * Readback uses the programmed GPA and reads via system memory, avoiding a

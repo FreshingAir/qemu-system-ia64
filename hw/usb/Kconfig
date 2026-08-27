@@ -30,6 +30,12 @@ config USB_EHCI_PCI
     default y if PCI_DEVICES
     select USB_EHCI
 
+config USB_NEC_PCI
+    bool
+    depends on PCI
+    select USB_OHCI_PCI
+    select USB_EHCI_PCI
+
 config USB_EHCI_SYSBUS
     bool
     select USB_EHCI

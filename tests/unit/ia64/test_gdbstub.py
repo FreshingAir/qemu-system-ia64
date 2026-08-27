@@ -158,7 +158,7 @@ def _rse_state(qmp: QmpClient) -> tuple[int, ...]:
 def test_gdbstub(qemu: str) -> None:
     proc = subprocess.Popen([
         qemu,
-        "-machine", "ia64-vpc,alat=full",
+        "-machine", "ia64-vpc,alat=full,nvram=none",
         "-nodefaults",
         "-display", "none",
         "-monitor", "none",

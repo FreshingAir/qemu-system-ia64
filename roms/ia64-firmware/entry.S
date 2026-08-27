@@ -40,32 +40,12 @@ pal_proc_entry:
     .size pal_proc_entry, . - pal_proc_entry
 
     /*
-     * SAL 3.0 requires a virtual-mode caller to put the virtual SAL GP in
-     * r1.  One released IA-64 HAL instead relocates the advertised GP with
-     * the runtime-code mapping even when the MDT gives runtime data a
-     * different mapping.  The public SAL and EFI specifications found so
-     * far do not describe that historical mapping rule.
+     * Derive SAL code relocation from IP, then enter C code with physical GP
+     * and instruction, data, and RSE translation disabled.
      *
-     * The compatibility firmware profile advertises the anchor below,
-     * whereas the standards-oriented profile advertises the real data GP.
-     * Derive the SAL code relocation from the current IP instead of assuming
-     * that the caller's r1 uses either profile.  The stub then runs the
-     * ordinary linked C image with instruction, data, and RSE translation
-     * disabled and its real physical GP.
-     *
-     * A physical SAL call must not retain the caller's virtual RSE as the
-     * previous bridge did: alloc or br.ret can otherwise raise an RSE TLB
-     * miss after PSR.ic/it/dt no longer describe the OS exception context.
-     * Follow SDM Vol. 2 section 6.11.3 instead.  Flush the caller's dirty
-     * partition while its translations are live, enter enforced-lazy mode,
-     * and switch BSPSTORE/RNAT to a private physical backing store.  The
-     * reverse sequence restores the caller's backing store before its
-     * translation state and RSC are reinstated.
-     *
-     * Each processor gets a 32 KiB slot in the CPU-assist area: 16 KiB for
-     * the RSE backing store followed by a 16 KiB memory stack.  Interrupts
-     * and interruption collection stay disabled while the private physical
-     * context is active.
+     * Flush the caller's RSE state before switching to a private physical
+     * backing store.  Each CPU uses 16 KiB for RSE state and 16 KiB for its
+     * memory stack while interrupts and interruption collection are disabled.
      */
     .equ SAL_PSR_I,                         (1 << 14)
     .equ SAL_PSR_IC,                        (1 << 13)
@@ -73,8 +53,8 @@ pal_proc_entry:
     .equ SAL_PSR_RT,                        (1 << 27)
     .equ SAL_PSR_IT,                        (1 << 36)
     .equ SAL_PSR_BN,                        (1 << 44)
-    .equ SAL_PSR_TRANSLATION_MASK,          (SAL_PSR_DT | SAL_PSR_RT | SAL_PSR_IT)
-    .equ SAL_PSR_PHYSICAL_ENTRY_CLEAR,      (SAL_PSR_I | SAL_PSR_IC | SAL_PSR_TRANSLATION_MASK)
+    .equ SAL_PSR_TRANSLATION_MASK, SAL_PSR_DT | SAL_PSR_RT | SAL_PSR_IT
+    .equ SAL_PSR_ENTRY_CLEAR, SAL_PSR_I | SAL_PSR_IC | SAL_PSR_TRANSLATION_MASK
     .equ SAL_RUNTIME_AREA_SHIFT,            15
     .equ SAL_RUNTIME_BACKING_SIZE,          0x4000
     .equ SAL_RUNTIME_STACK_FRAME_SIZE,      0x100
@@ -212,7 +192,7 @@ sal_proc_mode_valid:
     mov ar.bspstore = r30
     ;;
     mov ar.rnat = r0
-    movl r31 = SAL_PSR_PHYSICAL_ENTRY_CLEAR
+    movl r31 = SAL_PSR_ENTRY_CLEAR
     ;;
     andcm r31 = r25, r31
     movl r3 = sal_proc_physical
@@ -415,6 +395,17 @@ fw_debug_exception_entry:
 start_after_pal:
 
     /*
+     * HP profiles enter with descriptor GPA, size, and platform
+     * ID in r8-r10.  Preserve them in static registers before the first C
+     * call reuses the return-value registers.  VPC enters with all three
+     * values zero and continues to use its fixed legacy handoff page.
+     */
+    mov r5 = r8
+    mov r6 = r9
+    mov r7 = r10
+    ;;
+
+    /*
      * QEMU reloads the firmware image on reset, but the raw binary does not
      * contain the trailing NOBITS .bss.  Clear it here so guest-requested and
      * monitor-requested resets start with the same firmware state as a fresh
@@ -442,11 +433,21 @@ start_after_pal:
 
     /*
      * Preserve the reset return pointer across the ABI call, then move the
-     * firmware stack to the top of installed low RAM.
+     * firmware stack to the top of installed low RAM.  HP machine boot-info
+     * already supplied a platform-specific stack in r12, so recover its
+     * region top directly.  Only an all-zero transport selects VPC; malformed
+     * partial transport must not touch the VPC fixed handoff page before the
+     * descriptor validator rejects it.
      */
     mov r4 = b0
+    or r8 = r5, r6
     ;;
-    br.call.sptk.many b0 = fw_boot_stack_top
+    or r8 = r8, r7
+    ;;
+    cmp.ne p6, p7 = r8, r0
+    ;;
+(p6) adds r8 = 16, r12
+(p7) br.call.sptk.many b0 = fw_boot_stack_top
     ;;
     /*
      * The region top may be the exact end of installed RAM, and the psABI
@@ -457,15 +458,36 @@ start_after_pal:
     mov r3 = r4
     ;;
 
-    /* Alloc: 0 ins, 13 locals, 3 outs → output regs r45-r47
-     * After br.call these become callee's input r32-r34. */
-    alloc r2 = ar.pfs, 0, 13, 3, 0
+    /* Alloc: 0 ins, 13 locals, 6 outs → output regs r45-r50
+     * After br.call these become callee's input r32-r37. */
+    alloc r2 = ar.pfs, 0, 13, 6, 0
     ;;
 
-    /* Pass args: gp, stack region top, boot_b0 */
-    mov r45 = r1               /* arg0 → callee r32 = gp      */
-    mov r46 = r8               /* arg1 → callee r33 = stack region top */
-    mov r47 = r3               /* arg2 → callee r34 = boot_b0 */
+    /* Copy the descriptor before clearing its entry registers. */
+    mov r45 = r5               /* arg0 → descriptor GPA */
+    mov r46 = r6               /* arg1 → descriptor size */
+    mov r47 = r7               /* arg2 → platform ID */
+    ;;
+
+    br.call.sptk.many b0 = fw_platform_descriptor_init
+    ;;
+
+    /* The descriptor has been copied; do not leak its transport registers. */
+    mov r5 = r0
+    mov r6 = r0
+    mov r7 = r0
+    mov r8 = r0
+    mov r9 = r0
+    mov r10 = r0
+    ;;
+
+    /* Pass args: gp, stack region top, boot_b0. */
+    mov r45 = r1               /* arg0 → callee r32 = gp */
+    adds r46 = 16, r12         /* arg1 → stack region top */
+    mov r47 = r4               /* arg2 → callee r34 = boot_b0 */
+    mov r48 = r0
+    mov r49 = r0
+    mov r50 = r0
     ;;
 
     br.call.sptk.many b0 = firmware_main

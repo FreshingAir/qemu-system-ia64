@@ -1,14 +1,8 @@
 /*
  * HP Diva GSP controller
  *
- * The Diva PCI boards are Remote Management cards for PA-RISC machines.
- * They come with built-in 16550A multi UARTs for serial consoles
- * and a mailbox-like memory area for hardware auto-reboot functionality.
- * GSP stands for "Guardian Service Processor". Later products were marketed
- * "Management Processor" (MP).
- *
- * Diva cards are multifunctional cards. The first part, the aux port,
- * is on physical machines not useable but we still try to mimic it here.
+ * Models the Diva serial functions and exposes mailbox and auxiliary MMIO
+ * apertures. Mailbox and auxiliary register behavior is not implemented.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
@@ -162,9 +156,10 @@ static const VMStateDescription vmstate_pci_diva = {
     .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, PCIDivaSerialState),
-        VMSTATE_STRUCT_ARRAY(state, PCIDivaSerialState, PCI_SERIAL_MAX_PORTS,
-                             0, vmstate_serial, SerialState),
-        VMSTATE_UINT32_ARRAY(level, PCIDivaSerialState, PCI_SERIAL_MAX_PORTS),
+        VMSTATE_STRUCT_VARRAY_UINT32(state, PCIDivaSerialState, ports, 0,
+                                     vmstate_serial, SerialState),
+        VMSTATE_VARRAY_MULTIPLY(level, PCIDivaSerialState, ports, 1,
+                                vmstate_info_uint32, uint32_t),
         VMSTATE_END_OF_LIST()
     }
 };

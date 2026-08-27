@@ -1,0 +1,50 @@
+/*
+ * IA-64 ISP12160 qtest devices
+ *
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_IA64_ISP12160_TEST_H
+#define HW_IA64_ISP12160_TEST_H
+
+#include "qom/object.h"
+
+#define TYPE_IA64_ISP12160_MAILBOX_QTEST \
+    "ia64-isp12160-mailbox-qtest"
+#define TYPE_IA64_ISP12160_QUEUE_QTEST \
+    "ia64-isp12160-queue-qtest"
+#define TYPE_IA64_ISP12160_SCSI_QTEST \
+    "ia64-isp12160-scsi-qtest"
+#define IA64_ISP12160_MAILBOX_QTEST_ID "isp12160-mailbox-test"
+#define IA64_ISP12160_QUEUE_QTEST_ID "isp12160-queue-test"
+#define IA64_ISP12160_SCSI_QTEST_ID "isp12160-scsi-test"
+#define IA64_ISP12160_MAILBOX_QTEST_QOM_PATH \
+    "/machine/peripheral/" IA64_ISP12160_MAILBOX_QTEST_ID
+#define IA64_ISP12160_QUEUE_QTEST_QOM_PATH \
+    "/machine/peripheral/" IA64_ISP12160_QUEUE_QTEST_ID
+#define IA64_ISP12160_SCSI_QTEST_QOM_PATH \
+    "/machine/peripheral/" IA64_ISP12160_SCSI_QTEST_ID
+#define IA64_ISP12160_TEST_460GX_TEST_CHILD "460gx-test"
+#define IA64_ISP12160_MAILBOX_TEST_460GX_TEST_QOM_PATH \
+    IA64_ISP12160_MAILBOX_QTEST_QOM_PATH "/" \
+    IA64_ISP12160_TEST_460GX_TEST_CHILD
+#define IA64_ISP12160_TEST_GPIO_CANCEL_MAILBOX \
+    "x-cancel-mailbox"
+
+OBJECT_DECLARE_SIMPLE_TYPE(IA64ISP12160TestState,
+                           IA64_ISP12160_MAILBOX_QTEST)
+
+/* Fixed topology and resource values shared by all three devices. */
+#define IA64_ISP12160_TEST_ROOT_INDEX       1U
+#define IA64_ISP12160_TEST_PCI_BUS          0x20U
+#define IA64_ISP12160_TEST_PCI_SLOT         2U
+#define IA64_ISP12160_TEST_PCI_FUNCTION     0U
+#define IA64_ISP12160_TEST_INTERRUPT_PIN    1U
+#define IA64_ISP12160_TEST_PID_PIN          20U
+
+#define IA64_ISP12160_TEST_IO_BASE          UINT16_C(0x5000)
+#define IA64_ISP12160_TEST_MMIO_BASE        UINT64_C(0xa0010000)
+#define IA64_ISP12160_TEST_TOKEN_DMA        UINT64_C(0x00400000)
+#define IA64_ISP12160_TEST_TOKEN_RISC_ADDR  UINT16_C(0x1000)
+
+#endif /* HW_IA64_ISP12160_TEST_H */

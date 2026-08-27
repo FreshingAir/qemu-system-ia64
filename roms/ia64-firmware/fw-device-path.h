@@ -23,4 +23,11 @@ typedef struct {
     UINT8 Device;
 } __attribute__((packed)) FW_PCI_DEVICE_PATH_NODE;
 
+typedef struct {
+    FW_DEVICE_PATH_NODE Header;
+    UINT32 MemoryType;
+    EFI_PHYSICAL_ADDRESS StartingAddress;
+    EFI_PHYSICAL_ADDRESS EndingAddress;
+} __attribute__((packed)) FW_MEMORY_MAPPED_DEVICE_PATH_NODE;
+
 #endif /* IA64_FIRMWARE_FW_DEVICE_PATH_H */

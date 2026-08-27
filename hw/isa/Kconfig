@@ -1,6 +1,26 @@
 config ISA_BUS
     bool
 
+config LPC47B27_CONFIG
+    bool
+
+config LPC47B27_ISA
+    bool
+    depends on ISA_BUS
+    select LPC47B27_CONFIG
+    select PCKBD
+    select SERIAL
+
+config INTEL_82468GX_IFB
+    bool
+    depends on PCI
+    select ACPI
+    select ISA_BUS
+    select I8259
+    select IDE_82468GX
+    select USB_UHCI
+    select ACPI_SMBUS
+
 config APM
     bool
 

@@ -6,6 +6,7 @@
 #define ASTRO_H
 
 #include "hw/pci/pci_host.h"
+#include "hw/pci-host/hp-sba-routing.h"
 
 #define ASTRO_HPA               0xfed00000
 
@@ -65,6 +66,11 @@ struct ElroyState {
 
     MemoryRegion gmmio_alias;
     MemoryRegion lmmio_alias;
+
+    /* Variant-derived, non-migrated callback metadata. */
+    MemoryRegionOps chip_ops;
+    MemoryRegionOps config_addr_ops;
+    MemoryRegionOps config_data_ops;
 };
 
 struct AstroState {
@@ -84,6 +90,10 @@ struct AstroState {
     uint64_t tlb_pdir_base;
 
     uint8_t phys_addr_bits;
+
+    /* Static machine policy and derived callback metadata are not migrated. */
+    const HPSBARoutingVariant *variant;
+    MemoryRegionOps chip_ops;
 
     struct ElroyState *elroy[ELROY_NUM];
 

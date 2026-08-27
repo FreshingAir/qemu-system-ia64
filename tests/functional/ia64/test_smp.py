@@ -33,22 +33,36 @@ SMP_CASES = {
     "uce-unaligned-store-load-sequentiality",
     "big-endian-16-byte-semaphore",
 }
+SMP_16_BYTE_ATOMIC_CASES = {
+    "atomic-16-byte-semaphore", "big-endian-16-byte-semaphore",
+}
+SMP_CASES_NO_AO = SMP_CASES - SMP_16_BYTE_ATOMIC_CASES
 
 
 class Ia64Smp(Ia64FirmwareTest):
-    def test_four_processors_mttcg(self):
+    def run_four_processors_mttcg(self, name, cases, cpu=None):
         timeout = float(os.getenv("IA64_SMP_TIMEOUT", "60.0"))
         if timeout <= 0:
             raise ValueError("IA64_SMP_TIMEOUT must be positive")
-        disk = Path(self.scratch_file("smp.img"))
-        nvram = self.make_nvram()
+        disk = Path(self.scratch_file(f"smp-{name}.img"))
+        nvram = self.make_nvram(f"smp-{name}.nvram")
         make_fat_disk(disk, app_path("smp"))
+        extra_args = ("-accel", "tcg,thread=multi")
+        if cpu is not None:
+            extra_args = ("-cpu", cpu) + extra_args
         vm = self.launch_ia64(
-            media=disk, smp=4, memory="8G",
+            name=name, media=disk, smp=4, memory="8G",
             machine_options=f"firmware-console=serial,nvram={nvram}",
-            extra_args=("-accel", "tcg,thread=multi"))
-        result = self.wait_ia64_suite(vm, "smp", SMP_CASES, timeout=timeout)
-        self.assertSetEqual(set(result.cases), SMP_CASES)
+            extra_args=extra_args)
+        result = self.wait_ia64_suite(vm, "smp", cases, timeout=timeout)
+        self.assertSetEqual(set(result.cases), cases)
+
+    def test_four_processors_mttcg(self):
+        self.run_four_processors_mttcg("default", SMP_CASES)
+
+    def test_four_processors_merced_mttcg(self):
+        self.run_four_processors_mttcg("merced", SMP_CASES_NO_AO,
+                                       cpu="merced")
 
 
 if __name__ == "__main__":

@@ -1914,7 +1914,7 @@ BOOLEAN fw_usb_protocols_install(VOID)
     EFI_HANDLE controller = fw_usb_controller_handle();
     EFI_STATUS status;
 
-    if (!usb_ohci_controller_present()) {
+    if (controller == NULL || !usb_ohci_controller_present()) {
         return 1;
     }
     usb_protocol_initialize_interfaces();

@@ -657,9 +657,17 @@ static int cleanup_add_fd(void *opaque, QemuOpts *opts, Error **errp)
 
 static int drive_init_func(void *opaque, QemuOpts *opts, Error **errp)
 {
-    BlockInterfaceType *block_default_type = opaque;
+    MachineClass *machine_class = opaque;
+    BlockInterfaceType block_default_type =
+        machine_class->block_default_type;
 
-    return drive_new(opts, *block_default_type, errp) == NULL;
+    if (!qemu_opt_get(opts, "if") &&
+        machine_class->block_default_cdrom_type != IF_DEFAULT &&
+        g_strcmp0(qemu_opt_get(opts, "media"), "cdrom") == 0) {
+        block_default_type = machine_class->block_default_cdrom_type;
+    }
+
+    return drive_new(opts, block_default_type, errp) == NULL;
 }
 
 static int drive_enable_snapshot(void *opaque, QemuOpts *opts, Error **errp)
@@ -693,6 +701,11 @@ static void default_drive(int enable, int snapshot, BlockInterfaceType type,
 static void configure_blockdev(BlockdevOptionsQueue *bdo_queue,
                                MachineClass *machine_class, int snapshot)
 {
+    BlockInterfaceType default_cdrom_type =
+        machine_class->block_default_cdrom_type == IF_DEFAULT ?
+        machine_class->block_default_type :
+        machine_class->block_default_cdrom_type;
+
     /*
      * If the currently selected machine wishes to override the
      * units-per-bus property of its default HBA interface type, do so
@@ -719,12 +732,12 @@ static void configure_blockdev(BlockdevOptionsQueue *bdo_queue,
                           NULL, NULL);
     }
     if (qemu_opts_foreach(qemu_find_opts("drive"), drive_init_func,
-                          &machine_class->block_default_type, &error_fatal)) {
+                          machine_class, &error_fatal)) {
         /* We printed help */
         exit(0);
     }
 
-    default_drive(default_cdrom, snapshot, machine_class->block_default_type, 2,
+    default_drive(default_cdrom, snapshot, default_cdrom_type, 2,
                   CDROM_OPTS);
     default_drive(default_floppy, snapshot, IF_FLOPPY, 0, FD_OPTS);
     default_drive(auto_create_sdcard, snapshot, IF_SD, 0, SD_OPTS);

@@ -188,11 +188,15 @@ static size_t mptsas_config_pack_ext(uint8_t **data, const char *fmt, ...)
 static
 size_t mptsas_config_manufacturing_0(MPTSASState *s, uint8_t **data, int address)
 {
+    const char *name = mptsas_is_spi(s) ? "QEMU LSI53C1030" :
+                                          "QEMU MPT Fusion";
+    const char *version = mptsas_is_spi(s) ? "1.0" : "2.5";
+
     return MPTSAS_CONFIG_PACK(0, MPI_CONFIG_PAGETYPE_MANUFACTURING, 0x00,
                               "s16s8s16s16s16",
-                              "QEMU MPT Fusion",
-                              "2.5",
-                              "QEMU MPT Fusion",
+                              name,
+                              version,
+                              name,
                               "QEMU",
                               "0000111122223333");
 }
@@ -236,7 +240,8 @@ static
 size_t mptsas_config_manufacturing_5(MPTSASState *s, uint8_t **data, int address)
 {
     return MPTSAS_CONFIG_PACK(5, MPI_CONFIG_PAGETYPE_MANUFACTURING, 0x02,
-                              "q*b*b*w*l*l", s->sas_addr);
+                              "q*b*b*w*l*l",
+                              mptsas_is_spi(s) ? 0 : s->sas_addr);
 }
 
 static
@@ -250,7 +255,7 @@ static
 size_t mptsas_config_manufacturing_7(MPTSASState *s, uint8_t **data, int address)
 {
     return MPTSAS_CONFIG_PACK(7, MPI_CONFIG_PAGETYPE_MANUFACTURING, 0x00,
-                              "*l*l*l*s16*b*b*w", MPTSAS_NUM_PORTS);
+                              "*l*l*l*s16*b*b*w", mptsas_num_ports(s));
 }
 
 static
@@ -291,7 +296,10 @@ static
 size_t mptsas_config_io_unit_1(MPTSASState *s, uint8_t **data, int address)
 {
     return MPTSAS_CONFIG_PACK(1, MPI_CONFIG_PAGETYPE_IO_UNIT, 0x02, "l",
-                              0x41 /* single function, RAID disabled */ );
+                              MPI_IOUNITPAGE1_DISABLE_IR |
+                              (mptsas_is_spi(s) ?
+                               MPI_IOUNITPAGE1_MULTI_FUNCTION :
+                               MPI_IOUNITPAGE1_SINGLE_FUNCTION));
 }
 
 static
@@ -334,8 +342,17 @@ size_t mptsas_config_ioc_0(MPTSASState *s, uint8_t **data, int address)
 static
 size_t mptsas_config_ioc_1(MPTSASState *s, uint8_t **data, int address)
 {
-    return MPTSAS_CONFIG_PACK(1, MPI_CONFIG_PAGETYPE_IOC, 0x03,
-                              "*l*l*b*b*b*b");
+    if (!mptsas_is_spi(s)) {
+        return MPTSAS_CONFIG_PACK(1, MPI_CONFIG_PAGETYPE_IOC, 0x03,
+                                  "*l*l*b*b*b*b");
+    }
+
+    return MPTSAS_CONFIG_PACK(1,
+                              MPI_CONFIG_PAGEATTR_CHANGEABLE |
+                              MPI_CONFIG_PAGETYPE_IOC,
+                              0x03, "llb*b*w", s->ioc1_flags,
+                              s->ioc1_coalescing_timeout,
+                              s->ioc1_coalescing_depth);
 }
 
 static
@@ -372,6 +389,161 @@ size_t mptsas_config_ioc_6(MPTSASState *s, uint8_t **data, int address)
     return MPTSAS_CONFIG_PACK(6, MPI_CONFIG_PAGETYPE_IOC, 0x01,
                               "*l*b*b*b*b*b*b*b*b*b*b*w*l*l*l*l*b*b*w"
                               "*w*w*w*w*l*l*l");
+}
+
+/* Parallel SCSI port and target pages */
+
+static int mptspi_port_addr_get(int address)
+{
+    uint32_t page_address = address;
+    unsigned int port = page_address & MPI_SCSI_PORT_PGAD_PORT_MASK;
+
+    if ((page_address & ~MPI_SCSI_PORT_PGAD_PORT_MASK) ||
+        port >= MPTSPI_NUM_PORTS) {
+        return -EINVAL;
+    }
+    return port;
+}
+
+static int mptspi_device_addr_get(int address)
+{
+    uint32_t page_address = address;
+    unsigned int bus;
+    unsigned int target;
+
+    if ((page_address & MPI_SCSI_DEVICE_FORM_MASK) !=
+        MPI_SCSI_DEVICE_FORM_BUS_TID ||
+        (page_address & ~(MPI_SCSI_DEVICE_BUS_MASK |
+                          MPI_SCSI_DEVICE_TARGET_ID_MASK))) {
+        return -EINVAL;
+    }
+
+    bus = (page_address & MPI_SCSI_DEVICE_BUS_MASK) >>
+          MPI_SCSI_DEVICE_BUS_SHIFT;
+    target = (page_address & MPI_SCSI_DEVICE_TARGET_ID_MASK) >>
+             MPI_SCSI_DEVICE_TARGET_ID_SHIFT;
+    if (bus != 0 || target >= MPTSPI_MAX_TARGETS) {
+        return -EINVAL;
+    }
+    return target;
+}
+
+static size_t mptspi_config_port_0(MPTSASState *s, uint8_t **data,
+                                    int address)
+{
+    uint32_t capabilities;
+
+    if (mptspi_port_addr_get(address) < 0) {
+        return -EINVAL;
+    }
+
+    capabilities = MPI_SCSIPORTPAGE0_CAP_IU |
+                   MPI_SCSIPORTPAGE0_CAP_DT |
+                   MPI_SCSIPORTPAGE0_CAP_QAS |
+                   (0x08 << MPI_SCSIPORTPAGE0_CAP_MIN_SYNC_PERIOD_SHIFT) |
+                   (0xff << MPI_SCSIPORTPAGE0_CAP_MAX_SYNC_OFFSET_SHIFT) |
+                   MPI_SCSIPORTPAGE0_CAP_WIDE;
+    return MPTSAS_CONFIG_PACK(0, MPI_CONFIG_PAGETYPE_SCSI_PORT, 0x02,
+                              "ll", capabilities,
+                              MPI_SCSIPORTPAGE0_PHY_SIGNAL_LVD);
+}
+
+static size_t mptspi_config_port_1(MPTSASState *s, uint8_t **data,
+                                    int address)
+{
+    if (mptspi_port_addr_get(address) < 0) {
+        return -EINVAL;
+    }
+
+    return MPTSAS_CONFIG_PACK(1,
+                              MPI_CONFIG_PAGEATTR_CHANGEABLE |
+                              MPI_CONFIG_PAGETYPE_SCSI_PORT,
+                              0x03, "llb*bw", s->spi_port_configuration,
+                              s->spi_port_on_bus_timer, 0, 0);
+}
+
+static size_t mptspi_config_port_2(MPTSASState *s, uint8_t **data,
+                                    int address)
+{
+    const uint16_t device_flags =
+        MPI_SCSIPORTPAGE2_DEVICE_DISCONNECT_ENABLE |
+        MPI_SCSIPORTPAGE2_DEVICE_ID_SCAN_ENABLE |
+        MPI_SCSIPORTPAGE2_DEVICE_LUN_SCAN_ENABLE |
+        MPI_SCSIPORTPAGE2_DEVICE_TAG_QUEUE_ENABLE;
+    size_t size;
+    int i;
+
+    if (mptspi_port_addr_get(address) < 0) {
+        return -EINVAL;
+    }
+
+    size = MPTSAS_CONFIG_PACK(2,
+                              MPI_CONFIG_PAGEATTR_RO_PERSISTENT |
+                              MPI_CONFIG_PAGETYPE_SCSI_PORT,
+                              0x02, "ll" repl(8, "*s4") repl(8, "*s4"), 0,
+                              MPI_SCSIPORTPAGE2_PORT_BIOS_OS_INIT_HBA |
+                              MPTSPI_HOST_ID);
+    if (data) {
+        for (i = 0; i < MPTSPI_MAX_TARGETS; i++) {
+            fill(*data + 12 + i * 4, 4, "bbw", 0, 0x08, device_flags);
+        }
+    }
+    return size;
+}
+
+static size_t mptspi_config_device_0(MPTSASState *s, uint8_t **data,
+                                      int address)
+{
+    int target = mptspi_device_addr_get(address);
+
+    if (target < 0) {
+        return -EINVAL;
+    }
+
+    return MPTSAS_CONFIG_PACK(0, MPI_CONFIG_PAGETYPE_SCSI_DEVICE, 0x04,
+                              "ll", s->spi_requested_params[target],
+                              MPI_SCSIDEVPAGE0_INFO_PARAMS_NEGOTIATED);
+}
+
+static size_t mptspi_config_device_1(MPTSASState *s, uint8_t **data,
+                                      int address)
+{
+    int target = mptspi_device_addr_get(address);
+
+    if (target < 0) {
+        return -EINVAL;
+    }
+
+    return MPTSAS_CONFIG_PACK(1,
+                              MPI_CONFIG_PAGEATTR_CHANGEABLE |
+                              MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+                              0x05, "l*ll",
+                              s->spi_requested_params[target],
+                              s->spi_configuration[target]);
+}
+
+static size_t mptspi_config_device_2(MPTSASState *s, uint8_t **data,
+                                      int address)
+{
+    if (mptspi_device_addr_get(address) < 0) {
+        return -EINVAL;
+    }
+
+    return MPTSAS_CONFIG_PACK(2,
+                              MPI_CONFIG_PAGEATTR_CHANGEABLE |
+                              MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+                              0x01, "*l*l*l");
+}
+
+static size_t mptspi_config_device_3(MPTSASState *s, uint8_t **data,
+                                      int address)
+{
+    if (mptspi_device_addr_get(address) < 0) {
+        return -EINVAL;
+    }
+
+    return MPTSAS_CONFIG_PACK(3, MPI_CONFIG_PAGETYPE_SCSI_DEVICE, 0x00,
+                              "*w*w*w*w");
 }
 
 /* SAS I/O unit pages (extended) */
@@ -595,7 +767,14 @@ size_t mptsas_config_sas_device_0(MPTSASState *s, uint8_t **data, int address)
     int phy_handle = -1;
     int dev_handle = -1;
     int i = mptsas_device_addr_get(s, address);
-    SCSIDevice *dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
+    SCSIDevice *dev;
+
+    if (i < 0) {
+        trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle,
+                                       0);
+        return i;
+    }
+    dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
 
     trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle, 0);
     if (!dev) {
@@ -619,7 +798,14 @@ size_t mptsas_config_sas_device_1(MPTSASState *s, uint8_t **data, int address)
     int phy_handle = -1;
     int dev_handle = -1;
     int i = mptsas_device_addr_get(s, address);
-    SCSIDevice *dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
+    SCSIDevice *dev;
+
+    if (i < 0) {
+        trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle,
+                                       1);
+        return i;
+    }
+    dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
 
     trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle, 1);
     if (!dev) {
@@ -637,7 +823,14 @@ size_t mptsas_config_sas_device_2(MPTSASState *s, uint8_t **data, int address)
     int phy_handle = -1;
     int dev_handle = -1;
     int i = mptsas_device_addr_get(s, address);
-    SCSIDevice *dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
+    SCSIDevice *dev;
+
+    if (i < 0) {
+        trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle,
+                                       2);
+        return i;
+    }
+    dev = mptsas_phy_get_device(s, i, &phy_handle, &dev_handle);
 
     trace_mptsas_config_sas_device(s, address, i, phy_handle, dev_handle, 2);
     if (!dev) {
@@ -725,6 +918,27 @@ static const MPTSASConfigPage mptsas_config_pages[] = {
         6, MPI_CONFIG_PAGETYPE_IOC,
         mptsas_config_ioc_6,
     }, {
+        0, MPI_CONFIG_PAGETYPE_SCSI_PORT,
+        mptspi_config_port_0,
+    }, {
+        1, MPI_CONFIG_PAGETYPE_SCSI_PORT,
+        mptspi_config_port_1,
+    }, {
+        2, MPI_CONFIG_PAGETYPE_SCSI_PORT,
+        mptspi_config_port_2,
+    }, {
+        0, MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+        mptspi_config_device_0,
+    }, {
+        1, MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+        mptspi_config_device_1,
+    }, {
+        2, MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+        mptspi_config_device_2,
+    }, {
+        3, MPI_CONFIG_PAGETYPE_SCSI_DEVICE,
+        mptspi_config_device_3,
+    }, {
         0, MPI_CONFIG_EXTPAGETYPE_SAS_IO_UNIT,
         mptsas_config_sas_io_unit_0,
     }, {
@@ -754,10 +968,20 @@ static const MPTSASConfigPage mptsas_config_pages[] = {
     }
 };
 
-static const MPTSASConfigPage *mptsas_find_config_page(int type, int number)
+static const MPTSASConfigPage *mptsas_find_config_page(MPTSASState *s,
+                                                       int type, int number)
 {
     const MPTSASConfigPage *page;
     int i;
+
+    if (mptsas_is_spi(s)) {
+        if (type > MPI_CONFIG_PAGETYPE_MASK) {
+            return NULL;
+        }
+    } else if (type == MPI_CONFIG_PAGETYPE_SCSI_PORT ||
+               type == MPI_CONFIG_PAGETYPE_SCSI_DEVICE) {
+        return NULL;
+    }
 
     for (i = 0; i < ARRAY_SIZE(mptsas_config_pages); i++) {
         page = &mptsas_config_pages[i];
@@ -767,6 +991,167 @@ static const MPTSASConfigPage *mptsas_find_config_page(int type, int number)
     }
 
     return NULL;
+}
+
+static int mptsas_write_ioc_1(MPTSASState *s, int address, uint64_t pa,
+                              uint32_t dmalen)
+{
+    uint8_t page_data[16];
+    uint32_t flags;
+
+    if (address) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+    }
+    if (dmalen < sizeof(page_data)) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    pci_dma_read(PCI_DEVICE(s), pa, page_data, sizeof(page_data));
+    if (page_data[0] != 0x03 || page_data[1] < sizeof(page_data) / 4 ||
+        page_data[2] != 1 ||
+        (page_data[3] & MPI_CONFIG_PAGETYPE_MASK) !=
+        MPI_CONFIG_PAGETYPE_IOC) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    flags = ldl_le_p(page_data + 4);
+    /*
+     * Store the reply-coalescing request so drivers can configure and read
+     * back the standard page.  Interrupt coalescing itself is not modelled,
+     * so QEMU continues to interrupt for each posted reply.  The other IOC
+     * Page 1 modes alter reply formats or require EEDP support and therefore
+     * must not be claimed.
+     */
+    if ((flags & ~(uint32_t)MPI_IOCPAGE1_REPLY_COALESCING) ||
+        lduw_le_p(page_data + 14)) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    s->ioc1_flags = flags;
+    s->ioc1_coalescing_timeout = ldl_le_p(page_data + 8);
+    s->ioc1_coalescing_depth = page_data[12];
+    return MPI_IOCSTATUS_SUCCESS;
+}
+
+static int mptspi_write_port_1(MPTSASState *s, int address, uint64_t pa,
+                               uint32_t dmalen)
+{
+    const uint32_t configuration_mask =
+        MPI_SCSIPORTPAGE1_CFG_PORT_SCSI_ID_MASK |
+        MPI_SCSIPORTPAGE1_CFG_PORT_RESPONSE_ID_MASK;
+    uint8_t page_data[16];
+    uint32_t configuration;
+    unsigned int port_id;
+
+    if (mptspi_port_addr_get(address) < 0) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+    }
+    if (dmalen < sizeof(page_data)) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    pci_dma_read(PCI_DEVICE(s), pa, page_data, sizeof(page_data));
+    if (page_data[0] != 0x03 || page_data[1] < sizeof(page_data) / 4 ||
+        page_data[2] != 1 ||
+        (page_data[3] & MPI_CONFIG_PAGETYPE_MASK) !=
+        MPI_CONFIG_PAGETYPE_SCSI_PORT) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    configuration = ldl_le_p(page_data + 4);
+    port_id = configuration & MPI_SCSIPORTPAGE1_CFG_PORT_SCSI_ID_MASK;
+    if ((configuration & ~configuration_mask) ||
+        port_id >= MPTSPI_MAX_TARGETS || page_data[12] || page_data[13] ||
+        lduw_le_p(page_data + 14)) {
+        /* Target mode is not implemented by this initiator-only adapter. */
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    s->spi_port_configuration = configuration;
+    s->spi_port_on_bus_timer = ldl_le_p(page_data + 8);
+    return MPI_IOCSTATUS_SUCCESS;
+}
+
+static int mptsas_write_current(MPTSASState *s, int type, int number,
+                                int address, uint64_t pa, uint32_t dmalen)
+{
+    uint8_t page_data[16];
+    int target;
+
+    if (mptsas_is_spi(s) && type == MPI_CONFIG_PAGETYPE_IOC && number == 1) {
+        return mptsas_write_ioc_1(s, address, pa, dmalen);
+    }
+    if (mptsas_is_spi(s) && type == MPI_CONFIG_PAGETYPE_SCSI_PORT &&
+        number == 1) {
+        return mptspi_write_port_1(s, address, pa, dmalen);
+    }
+
+    if (!mptsas_is_spi(s) || type != MPI_CONFIG_PAGETYPE_SCSI_DEVICE ||
+        number != 1) {
+        return MPI_IOCSTATUS_CONFIG_CANT_COMMIT;
+    }
+
+    target = mptspi_device_addr_get(address);
+    if (target < 0) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+    }
+    if (dmalen < sizeof(page_data)) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    pci_dma_read(PCI_DEVICE(s), pa, page_data, sizeof(page_data));
+    if (page_data[0] != 0x05 || page_data[1] < sizeof(page_data) / 4 ||
+        page_data[2] != 1 ||
+        (page_data[3] & MPI_CONFIG_PAGETYPE_MASK) !=
+        MPI_CONFIG_PAGETYPE_SCSI_DEVICE || ldl_le_p(page_data + 8)) {
+        return MPI_IOCSTATUS_CONFIG_INVALID_DATA;
+    }
+
+    s->spi_requested_params[target] = ldl_le_p(page_data + 4);
+    s->spi_configuration[target] = ldl_le_p(page_data + 12);
+    return MPI_IOCSTATUS_SUCCESS;
+}
+
+static int mptsas_set_current_to_default(MPTSASState *s, int type,
+                                         int number, int address)
+{
+    int target;
+
+    if (!mptsas_is_spi(s)) {
+        /* Preserve the SAS1068 PAGE_DEFAULT success/no-op guest ABI. */
+        return MPI_IOCSTATUS_SUCCESS;
+    }
+
+    if (type == MPI_CONFIG_PAGETYPE_IOC && number == 1) {
+        if (address) {
+            return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+        }
+        s->ioc1_flags = 0;
+        s->ioc1_coalescing_timeout = 0;
+        s->ioc1_coalescing_depth = 0;
+        return MPI_IOCSTATUS_SUCCESS;
+    }
+
+    if (type == MPI_CONFIG_PAGETYPE_SCSI_PORT && number == 1) {
+        if (mptspi_port_addr_get(address) < 0) {
+            return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+        }
+        s->spi_port_configuration = MPTSPI_DEFAULT_PORT_CONFIGURATION;
+        s->spi_port_on_bus_timer = 0;
+        return MPI_IOCSTATUS_SUCCESS;
+    }
+
+    if (type == MPI_CONFIG_PAGETYPE_SCSI_DEVICE && number == 1) {
+        target = mptspi_device_addr_get(address);
+        if (target < 0) {
+            return MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
+        }
+        s->spi_requested_params[target] = 0;
+        s->spi_configuration[target] = 0;
+        return MPI_IOCSTATUS_SUCCESS;
+    }
+
+    return MPI_IOCSTATUS_CONFIG_CANT_COMMIT;
 }
 
 void mptsas_process_config(MPTSASState *s, MPIMsgConfig *req)
@@ -783,6 +1168,11 @@ void mptsas_process_config(MPTSASState *s, MPIMsgConfig *req)
     uint64_t pa;
 
     mptsas_fix_config_endianness(req);
+
+    trace_mptsas_config_request(s, req->MsgContext, req->Action,
+                                req->PageType, req->PageNumber,
+                                req->PageAddress,
+                                req->PageBufferSGE.FlagsLength);
 
     QEMU_BUILD_BUG_ON(sizeof(s->doorbell_msg) < sizeof(*req));
     QEMU_BUILD_BUG_ON(sizeof(s->doorbell_reply) < sizeof(reply));
@@ -809,7 +1199,7 @@ void mptsas_process_config(MPTSASState *s, MPIMsgConfig *req)
         reply.ExtPageType = req->ExtPageType;
     }
 
-    page = mptsas_find_config_page(type, req->PageNumber);
+    page = mptsas_find_config_page(s, type, req->PageNumber);
 
     switch(req->Action) {
     case MPI_CONFIG_ACTION_PAGE_DEFAULT:
@@ -827,7 +1217,7 @@ void mptsas_process_config(MPTSASState *s, MPIMsgConfig *req)
     }
 
     if (!page) {
-        page = mptsas_find_config_page(type, 1);
+        page = mptsas_find_config_page(s, type, 1);
         if (page) {
             reply.IOCStatus = MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
         } else {
@@ -836,68 +1226,82 @@ void mptsas_process_config(MPTSASState *s, MPIMsgConfig *req)
         goto out;
     }
 
-    if (req->Action == MPI_CONFIG_ACTION_PAGE_DEFAULT ||
-        req->Action == MPI_CONFIG_ACTION_PAGE_HEADER) {
-        length = page->mpt_config_build(s, NULL, req->PageAddress);
-        if ((ssize_t)length < 0) {
-            reply.IOCStatus = MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
-            goto out;
-        } else {
-            goto done;
-        }
-    }
-
-    if (req->Action == MPI_CONFIG_ACTION_PAGE_WRITE_CURRENT ||
-        req->Action == MPI_CONFIG_ACTION_PAGE_WRITE_NVRAM) {
-        length = page->mpt_config_build(s, NULL, req->PageAddress);
-        if ((ssize_t)length < 0) {
-            reply.IOCStatus = MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
-        } else {
-            reply.IOCStatus = MPI_IOCSTATUS_CONFIG_CANT_COMMIT;
-        }
-        goto out;
-    }
-
     flags_and_length = req->PageBufferSGE.FlagsLength;
     dmalen = flags_and_length & MPI_SGE_LENGTH_MASK;
-    if (dmalen == 0) {
-        length = page->mpt_config_build(s, NULL, req->PageAddress);
-        if ((ssize_t)length < 0) {
-            reply.IOCStatus = MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
-            goto out;
-        } else {
-            goto done;
-        }
-    }
-
     if (flags_and_length & MPI_SGE_FLAGS_64_BIT_ADDRESSING) {
         pa = req->PageBufferSGE.u.Address64;
     } else {
         pa = req->PageBufferSGE.u.Address32;
     }
 
-    /* Only read actions left.  */
     length = page->mpt_config_build(s, &data, req->PageAddress);
     if ((ssize_t)length < 0) {
         reply.IOCStatus = MPI_IOCSTATUS_CONFIG_INVALID_PAGE;
         goto out;
-    } else {
-        assert(data[2] == page->number);
-        pci_dma_write(pci, pa, data, MIN(length, dmalen));
-        goto done;
     }
 
-    abort();
+    assert(data[2] == page->number);
+    reply.PageVersion = data[0];
+    reply.PageNumber = data[2];
+    reply.PageType = data[3];
 
-done:
+    switch (req->Action) {
+    case MPI_CONFIG_ACTION_PAGE_DEFAULT:
+        reply.IOCStatus = mptsas_set_current_to_default(s, type, page->number,
+                                                        req->PageAddress);
+        break;
+
+    case MPI_CONFIG_ACTION_PAGE_HEADER:
+        break;
+
+    case MPI_CONFIG_ACTION_PAGE_READ_NVRAM:
+    case MPI_CONFIG_ACTION_PAGE_READ_CURRENT:
+    case MPI_CONFIG_ACTION_PAGE_READ_DEFAULT:
+        if (type == MPI_CONFIG_PAGETYPE_IOC && page->number == 1 &&
+            req->Action != MPI_CONFIG_ACTION_PAGE_READ_CURRENT) {
+            memset(data + 4, 0, length - 4);
+        } else if (mptsas_is_spi(s) &&
+                   type == MPI_CONFIG_PAGETYPE_SCSI_PORT &&
+                   page->number == 1 &&
+                   req->Action != MPI_CONFIG_ACTION_PAGE_READ_CURRENT) {
+            stl_le_p(data + 4, MPTSPI_DEFAULT_PORT_CONFIGURATION);
+            memset(data + 8, 0, length - 8);
+        } else if (mptsas_is_spi(s) &&
+                   type == MPI_CONFIG_PAGETYPE_SCSI_DEVICE &&
+                   page->number == 1 &&
+                   req->Action != MPI_CONFIG_ACTION_PAGE_READ_CURRENT) {
+            memset(data + 4, 0, length - 4);
+        }
+        if (dmalen) {
+            pci_dma_write(pci, pa, data, MIN(length, dmalen));
+        }
+        break;
+
+    case MPI_CONFIG_ACTION_PAGE_WRITE_CURRENT:
+        reply.IOCStatus = mptsas_write_current(s, type, page->number,
+                                               req->PageAddress, pa, dmalen);
+        break;
+
+    case MPI_CONFIG_ACTION_PAGE_WRITE_NVRAM:
+        reply.IOCStatus = MPI_IOCSTATUS_CONFIG_CANT_COMMIT;
+        break;
+
+    default:
+        abort();
+    }
+
     if (type > MPI_CONFIG_PAGETYPE_MASK) {
-        reply.ExtPageLength = length / 4;
-        reply.ExtPageType   = req->ExtPageType;
+        reply.ExtPageLength = lduw_le_p(data + 4);
+        reply.ExtPageType = data[6];
     } else {
-        reply.PageLength    = length / 4;
+        reply.PageLength = data[1];
     }
 
 out:
+    trace_mptsas_config_reply(s, reply.MsgContext, reply.IOCStatus,
+                              reply.PageType, reply.PageNumber,
+                              reply.PageLength, reply.ExtPageLength,
+                              reply.ExtPageType);
     mptsas_fix_config_reply_endianness(&reply);
     mptsas_reply(s, (MPIDefaultReply *)&reply);
     g_free(data);

@@ -103,8 +103,20 @@ def _loader_args(program: MicroProgram) -> list[str]:
 
 def _command(qemu: str, program: MicroProgram, *, load: bool = True) -> list[str]:
     machine = program.machine
-    if program.machine_args:
-        machine += "," + ",".join(program.machine_args)
+    machine_args = program.machine_args
+    ia64_firmware_machines = {
+        "hp-i2000", "hp-zx6000", "ia64-vpc",
+        "itanium-vpc", "itanium2-vpc",
+    }
+    if machine.split(",", 1)[0] in ia64_firmware_machines:
+        if "firmware=" not in machine and not any(
+                arg.startswith("firmware=") for arg in machine_args):
+            machine_args += ("firmware=none",)
+        if "nvram=" not in machine and not any(
+                arg.startswith("nvram=") for arg in machine_args):
+            machine_args += ("nvram=none",)
+    if machine_args:
+        machine += "," + ",".join(machine_args)
     command = [
         os.path.abspath(qemu),
         "-machine", machine,

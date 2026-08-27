@@ -1,0 +1,21 @@
+/*
+ * SPDX-License-Identifier: GPL-2.0-or-later
+ */
+
+#ifndef HW_IA64_INTEL_460GX_PID_H
+#define HW_IA64_INTEL_460GX_PID_H
+
+#include "hw/core/sysbus.h"
+
+#define TYPE_INTEL_460GX_PID "intel-460gx-pid"
+OBJECT_DECLARE_SIMPLE_TYPE(Intel460GXPIDState, INTEL_460GX_PID)
+
+#define INTEL_460GX_PID_NUM_PINS 64
+#define INTEL_460GX_PID_MAX_ID 15U
+#define INTEL_460GX_PID_PROP_INITIAL_ID "initial-id"
+#define INTEL_460GX_PID_PROP_LEGACY_PIN "legacy-pin"
+#define INTEL_460GX_PID_LEGACY_PIN_DISCONNECTED UINT32_MAX
+#define INTEL_460GX_PID_GPIO_IRQ "irq"
+#define INTEL_460GX_PID_GPIO_LEGACY "legacy"
+
+#endif

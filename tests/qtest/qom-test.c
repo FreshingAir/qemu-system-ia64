@@ -20,6 +20,21 @@
 
 static int verbosity_level;
 
+static const char *ia64_nvram_option(const char *machine)
+{
+    if (!g_str_equal(qtest_get_arch(), "ia64")) {
+        return "";
+    }
+    if (g_str_equal(machine, "ia64-vpc") ||
+        g_str_equal(machine, "itanium-vpc") ||
+        g_str_equal(machine, "itanium2-vpc") ||
+        g_str_equal(machine, "hp-i2000") ||
+        g_str_equal(machine, "hp-zx6000")) {
+        return ",nvram=none";
+    }
+    return "";
+}
+
 /*
  * Verify that the /object/RAM_NAME 'size' property is RAM_SIZE.
  */
@@ -195,8 +210,10 @@ static void test_machine(gconstpointer data)
     QTestState *qts;
     g_autoptr(QList) paths = qlist_new();
 
-    qts = qtest_initf("-machine %s -object memory-backend-ram,id=%s,size=%d",
-                      machine, RAM_NAME, RAM_SIZE);
+    qts = qtest_initf("-machine %s%s "
+                      "-object memory-backend-ram,id=%s,size=%d",
+                      machine, ia64_nvram_option(machine),
+                      RAM_NAME, RAM_SIZE);
 
     if (g_test_slow()) {
         /* Make sure we can get the machine class properties: */

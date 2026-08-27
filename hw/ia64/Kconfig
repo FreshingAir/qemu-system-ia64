@@ -6,11 +6,118 @@ config IA64_VPC
     select PCI
     select ISA_BUS
     select ACPI
+    imply TEST_DEVICES
     imply IA64_VPC_GRAPHICS
     imply IA64_VPC_NETWORK
     imply IA64_VPC_PS2
     imply IA64_VPC_STORAGE
     imply IA64_VPC_USB
+
+config IA64_460GX_PID
+    bool
+    depends on IA64
+
+config IA64_460GX_HOST
+    bool
+    depends on IA64
+    select PCI
+
+config IA64_460GX_CHIPSET
+    bool
+    depends on IA64_460GX_HOST
+
+config HP_I2000
+    bool
+    depends on IA64
+    select IA64_460GX_HOST
+    select IA64_460GX_PID
+    select IA64_460GX_CHIPSET
+    select INTEL_82468GX_IFB
+    select LPC47B27_ISA
+    select I8254
+    select MC146818RTC
+    select EEPRO100_PCI
+    select ISP12160
+    select LSI_SCSI_PCI
+    select ATI_VGA
+    select VGA_PCI
+
+config IA64_460GX_DMA_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on IA64_460GX_HOST && IA64_VPC
+    select IOMMU_TESTDEV
+
+config IA64_I2000_460GX_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_460GX_HOST && IA64_460GX_PID
+    select IOMMU_TESTDEV
+
+config IA64_I2000_IO_TEST_LAYOUT
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_I2000_460GX_TEST
+    select LPC47B27_CONFIG
+
+config IA64_I2000_IO_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_I2000_IO_TEST_LAYOUT
+    select ISA_BUS
+    select LPC47B27_ISA
+    select I8259
+    select I8254
+    select MC146818RTC
+    select IDE_ISA
+    select EEPRO100_PCI
+    select ISP12160
+
+config IA64_I2000_EFI_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_I2000_IO_TEST
+
+config IA64_ISP12160_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_I2000_460GX_TEST
+    select ISP12160
+
+config IA64_ZX6000_ZX1_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_VPC
+    select HP_ZX1_MIO
+    select HP_ZX1_IOA
+    select IOMMU_TESTDEV
+
+config IA64_ZX6000_EFI_TEST
+    bool
+    default y if TEST_DEVICES
+    depends on TEST_DEVICES && IA64_ZX6000_ZX1_TEST
+    select SERIAL_MM
+
+config HP_ZX6000_PDH
+    bool
+    depends on IA64
+    select ACPI
+    select SERIAL_MM
+
+config HP_ZX6000
+    bool
+    depends on IA64
+    select PCI
+    select HP_ZX6000_PDH
+    select HP_ZX1_MIO
+    select HP_ZX1_IOA
+    select IDE_CMD649
+    select MPTSPI_SCSI_PCI
+    select EEPRO100_PCI
+    select ATI_VGA
+    select VGA_PCI
+    select USB_NEC_PCI
+    select USB_HID
 
 config IA64_VPC_GRAPHICS
     bool

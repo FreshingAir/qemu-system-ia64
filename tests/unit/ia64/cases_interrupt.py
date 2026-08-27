@@ -1195,6 +1195,10 @@ def test_itc_rate_tracks_madison_pal_ratio(qemu):
     _check_itc_model_rate(qemu, "madison", 1600000)
 
 
+def test_itc_rate_tracks_madison_zx6000_pal_ratio(qemu):
+    _check_itc_model_rate(qemu, "madison-zx6000", 1500000)
+
+
 def test_itc_rate_tracks_montecito_pal_ratio(qemu):
     _check_itc_model_rate(qemu, "montecito", 400000)
 
@@ -5248,9 +5252,8 @@ test_native_dbr_precedes_advanced_non_speculative_failure = \
         }, entry=0x10)
 
 
-# Itanium 2 reports Data Debug for any datum crossing a 16-byte boundary
-# while PSR.db is set, even though no byte matches a programmed DBR.  The
-# fault has priority over the otherwise-applicable unaligned-data fault.
+# A qualified DBR control enables cross-boundary Data Debug even when its
+# address does not match.  Data Debug precedes Unaligned Data Reference.
 test_native_madison_cross16_data_debug_precedes_unaligned = \
     require_registers(
         "native_madison_cross16_data_debug_precedes_unaligned", [
@@ -5404,7 +5407,7 @@ test_native_madison_cross16_higher_fault_precedes_debug = require_registers(
     }, entry=0x10, cpu="madison")
 
 
-# PSR.db remains the global gate for the Itanium 2 cross-boundary rule.
+# PSR.db is required in addition to an enabled DBR control.
 test_native_madison_cross16_requires_psr_db = require_registers(
     "native_madison_cross16_requires_psr_db", [
         (0x10, *movl_mlx(4, 0)),
@@ -5437,6 +5440,54 @@ test_native_madison_cross16_requires_psr_db = require_registers(
         "r10": 0x20f,
         "r11": IA64_ISR_R,
     }, entry=0x10, cpu="madison")
+
+
+def madison_cross16_unqualified_dbr_test(name, control):
+    return require_registers(name, [
+        (0x10, *movl_mlx(4, 0)),
+        (0x20, *movl_mlx(5, 0x300)),
+        (0x30, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x40, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x50, *movl_mlx(5, control)),
+        (0x60, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x70, *movl_mlx(3, 0x20f)),
+        (0x80, *movl_mlx(2, IA64_PSR_IC | IA64_PSR_DB)),
+        (0x90, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xa0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xb0, 0x00, ld2_s(8, 3), nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR, 0x00, mov_m_cr_gr(9, 19),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 20),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x20, 0x00, mov_m_cr_gr(11, 17),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x30, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_UNALIGNED_VECTOR + 0x30,
+                 IA64_UNALIGNED_VECTOR + 0x30)),
+    ], {
+        "ip": IA64_UNALIGNED_VECTOR + 0x30,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_UNALIGNED,
+        "r9": 0xb0,
+        "r10": 0x20f,
+        "r11": IA64_ISR_R | IA64_ISR_SP,
+    }, entry=0x10, cpu="madison")
+
+
+# Cross-boundary Data Debug requires a DBR control matching the access.
+test_native_madison_cross16_disabled_dbr_uses_unaligned = \
+    madison_cross16_unqualified_dbr_test(
+        "native_madison_cross16_disabled_dbr_uses_unaligned", 0)
+
+test_native_madison_cross16_read_with_write_dbr_uses_unaligned = \
+    madison_cross16_unqualified_dbr_test(
+        "native_madison_cross16_read_with_write_dbr_uses_unaligned",
+        0x41ffffffffffffff)
+
+test_native_madison_cross16_plm_mismatch_uses_unaligned = \
+    madison_cross16_unqualified_dbr_test(
+        "native_madison_cross16_plm_mismatch_uses_unaligned",
+        0x88ffffffffffffff)
 
 
 # This extra fault is specific to the selected Madison/Itanium 2 model; the
@@ -5830,6 +5881,7 @@ CASE_NAMES = (
     'ia32_bound_checks_second_element_against_segment_limit',
     'invalid_itv_vector_is_ignored',
     'itc_rate_tracks_madison_pal_ratio',
+    'itc_rate_tracks_madison_zx6000_pal_ratio',
     'itc_rate_tracks_merced_pal_ratio',
     'itc_rate_tracks_montecito_pal_ratio',
     'masked_itv_discards_due_timer',
@@ -5851,7 +5903,10 @@ CASE_NAMES = (
     'native_ibr_matches_predicated_off_instruction',
     'native_madison_cross16_data_debug_precedes_unaligned',
     'native_madison_cross16_data_debug_respects_psr_dd',
+    'native_madison_cross16_disabled_dbr_uses_unaligned',
     'native_madison_cross16_higher_fault_precedes_debug',
+    'native_madison_cross16_plm_mismatch_uses_unaligned',
+    'native_madison_cross16_read_with_write_dbr_uses_unaligned',
     'native_madison_cross16_requires_psr_db',
     'native_madison_speculative_cross16_data_debug',
     'native_merced_cross16_does_not_add_data_debug',
