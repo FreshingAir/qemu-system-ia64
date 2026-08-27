@@ -26,6 +26,10 @@ ia64_firmware_bin = custom_target(
     '@DEPFILE@',
   ],
   depfile: 'ia64-firmware.d',
-  build_by_default: true,
+  # Built on demand (ninja roms/ia64-firmware/ia64-firmware.bin); the Android
+  # cross build lacks an IA-64 ELF toolchain (ia64-linux-gnu-*), while the
+  # firmware ROM is loaded at runtime via -bios and is not linked into the
+  # qemu-system-ia64 binary. Matches upstream CI, which builds it separately.
+  build_by_default: false,
   install: false,
 )

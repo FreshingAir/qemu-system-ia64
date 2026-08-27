@@ -940,7 +940,7 @@ static gboolean gd_touch_handle(VirtualConsole *vc, int type,
     fbx = (x - wx_offset) / vc->gfx.scale_x;
     fby = (y - wy_offset) / vc->gfx.scale_y;
 
-    console_handle_touch_event(vc->gfx.dcl.con, touch_slots,
+    qemu_input_touch_event(vc->gfx.dcl.con, touch_slots,
                                0, surface_width(vc->gfx.ds),
                                surface_height(vc->gfx.ds), fbx,
                                fby, type, &err);

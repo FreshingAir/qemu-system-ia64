@@ -1955,16 +1955,10 @@ if get_option('gtk') \
              .require(pixman.found(),
                       error_message: 'cannot enable GTK if pixman is not available') \
              .allowed()
-  gtk = dependency('gtk+-3.0', version: '>=3.22.0',
+  gtk = dependency('gtk4', version: '>=4.0',
                    method: 'pkg-config',
                    required: get_option('gtk'))
   if gtk.found()
-    gtkx11 = dependency('gtk+-x11-3.0', version: '>=3.22.0',
-                        method: 'pkg-config',
-                        required: false)
-    gtk = declare_dependency(dependencies: [gtk, gtkx11],
-                             version: gtk.version())
-
     if not get_option('vte').auto() or have_system
       vte = dependency('vte-2.91',
                        method: 'pkg-config',
@@ -1973,7 +1967,22 @@ if get_option('gtk') \
   endif
 endif
 
-x11 = dependency('x11', method: 'pkg-config', required: gtkx11.found())
+# The Android NDK host compilers define __ANDROID__. The Limbo Android build
+# uses the GTK4 Android backend, which has no X11; x11 would otherwise be a
+# host-only leak. Forcing x11 to not-found drops ui/gtk-egl.c (X11/EGL session)
+# and ui/x_keymap.c, and clears CONFIG_X11 (which also drops the X11 keyboard
+# path and its <X11/Xlib.h> include in ui/sdl2.c).
+android_host = cc.compiles('''
+#ifdef __ANDROID__
+int android_host_probe;
+#else
+#error not an Android host
+#endif
+''')
+x11 = dependency('x11', method: 'pkg-config', required: false)
+if android_host
+  x11 = not_found
+endif
 
 png = not_found
 if get_option('png').allowed() and have_system

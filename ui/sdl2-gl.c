@@ -26,17 +26,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/main-loop.h"
+#include "qemu/error-report.h"
 #include "ui/console.h"
 #include "ui/input.h"
 #include "ui/sdl2.h"
-
-#ifdef __LIMBO__
-/* Injected by vm-executor-jni.c at VM start via set_qemu_var().
- *   0 = stretch to fill the screen (ignore aspect ratio)
- *   1 = keep the guest aspect ratio (letterbox, default)
- *   2 = 1:1 pixel mapping (native guest resolution, centered) */
-extern int limbo_sdl_scale_mode;
-#endif
 
 static void sdl2_set_scanout_mode(struct sdl2_console *scon, bool scanout)
 {
@@ -59,46 +53,11 @@ static void sdl2_gl_render_surface(struct sdl2_console *scon)
     int ww, wh;
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
-    sdl2_set_scanout_mode(scon, false);
 
     SDL_GetWindowSize(scon->real_window, &ww, &wh);
-
-#ifdef __LIMBO__
-    {
-        int mode = limbo_sdl_scale_mode;
-        if (mode < 0) {
-            mode = 1; /* fallback to aspect */
-        }
-        /* Clear the entire window to black first (letterbox/pillarbox border) */
-        glViewport(0, 0, ww, wh);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        switch (mode) {
-        case 0: /* stretch — fill the entire window */
-            glViewport(0, 0, ww, wh);
-            break;
-        case 2: { /* 1:1 — native guest resolution, centered */
-            int gw = surface_width(scon->surface);
-            int gh = surface_height(scon->surface);
-            int vx = (ww - gw) / 2;
-            int vy = (wh - gh) / 2;
-            glViewport(MAX(vx, 0), MAX(vy, 0),
-                       MIN(gw, ww), MIN(gh, wh));
-            break;
-        }
-        case 1: /* aspect — letterbox, keep aspect ratio */
-        default:
-            surface_gl_setup_viewport(scon->gls, scon->surface, ww, wh);
-            break;
-        }
-
-        surface_gl_render_texture(scon->gls, scon->surface);
-    }
-#else
     surface_gl_setup_viewport(scon->gls, scon->surface, ww, wh);
+
     surface_gl_render_texture(scon->gls, scon->surface);
-#endif
     SDL_GL_SwapWindow(scon->real_window);
 }
 
@@ -182,9 +141,11 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
                                      QEMUGLParams *params)
 {
     struct sdl2_console *scon = container_of(dgc, struct sdl2_console, dgc);
-    SDL_GLContext ctx;
+    SDL_GLContext ctx, current_ctx;
 
     assert(scon->opengl);
+
+    current_ctx = SDL_GL_GetCurrentContext();
 
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
@@ -210,6 +171,9 @@ QEMUGLContext sdl2_gl_create_context(DisplayGLCtx *dgc,
                             SDL_GL_CONTEXT_PROFILE_ES);
         ctx = SDL_GL_CreateContext(scon->real_window);
     }
+
+    SDL_GL_MakeCurrent(scon->real_window, current_ctx);
+
     return (QEMUGLContext)ctx;
 }
 
@@ -283,62 +247,74 @@ void sdl2_gl_scanout_flush(DisplayChangeListener *dcl,
     SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
 
     SDL_GetWindowSize(scon->real_window, &ww, &wh);
-#ifdef __LIMBO__
-    {
-        int mode = limbo_sdl_scale_mode;
-        int dx = 0, dy = 0, dw = ww, dh = wh;
-        int gw = scon->guest_fb.width;
-        int gh = scon->guest_fb.height;
-
-        if (mode < 0) {
-            mode = 1;
-        }
-
-        /* Black out the whole window first (letterbox/pillarbox border). */
-        glViewport(0, 0, ww, wh);
-        glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        switch (mode) {
-        case 0: /* stretch — fill the entire window */
-            dx = 0;
-            dy = 0;
-            dw = ww;
-            dh = wh;
-            break;
-        case 2: { /* 1:1 — native guest resolution, centered */
-            dx = MAX((ww - gw) / 2, 0);
-            dy = MAX((wh - gh) / 2, 0);
-            dw = MIN(gw, ww);
-            dh = MIN(gh, wh);
-            break;
-        }
-        case 1: /* aspect — letterbox, keep aspect ratio */
-        default: {
-            double sw = (double)ww / gw;
-            double sh = (double)wh / gh;
-            if (sw < sh) {
-                dw = ww;
-                dh = (int)(gh * sw);
-                dx = 0;
-                dy = (wh - dh) / 2;
-            } else {
-                dh = wh;
-                dw = (int)(gw * sh);
-                dy = 0;
-                dx = (ww - dw) / 2;
-            }
-            break;
-        }
-        }
-
-        egl_fb_setup_default(&scon->win_fb, dw, dh, dx, dy);
-        egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
-    }
-#else
     egl_fb_setup_default(&scon->win_fb, ww, wh, 0, 0);
     egl_fb_blit(&scon->win_fb, &scon->guest_fb, !scon->y0_top);
-#endif
 
     SDL_GL_SwapWindow(scon->real_window);
+}
+
+#ifdef CONFIG_GBM
+void sdl2_gl_scanout_dmabuf(DisplayChangeListener *dcl,
+                            QemuDmaBuf *dmabuf)
+{
+    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+    const int *fds;
+
+    assert(scon->opengl);
+    SDL_GL_MakeCurrent(scon->real_window, scon->winctx);
+
+    egl_dmabuf_import_texture(dmabuf);
+    if (!qemu_dmabuf_get_texture(dmabuf)) {
+        fds = qemu_dmabuf_get_fds(dmabuf, NULL);
+        error_report("%s: failed fd=%d", __func__, fds ? fds[0] : -1);
+        return;
+    }
+
+    sdl2_gl_scanout_texture(dcl, qemu_dmabuf_get_texture(dmabuf), false,
+                            qemu_dmabuf_get_width(dmabuf),
+                            qemu_dmabuf_get_height(dmabuf),
+                            0, 0,
+                            qemu_dmabuf_get_width(dmabuf),
+                            qemu_dmabuf_get_height(dmabuf),
+                            NULL);
+
+    if (qemu_dmabuf_get_allow_fences(dmabuf)) {
+        scon->guest_fb.dmabuf = dmabuf;
+    }
+}
+
+void sdl2_gl_release_dmabuf(DisplayChangeListener *dcl,
+                            QemuDmaBuf *dmabuf)
+{
+    egl_dmabuf_release_texture(dmabuf);
+}
+
+bool sdl2_gl_has_dmabuf(DisplayChangeListener *dcl)
+{
+    struct sdl2_console *scon = container_of(dcl, struct sdl2_console, dcl);
+
+    return scon->has_dmabuf;
+}
+#endif
+
+void sdl2_gl_console_init(struct sdl2_console *scon)
+{
+    bool hidden = scon->hidden;
+
+    scon->hidden = true;
+    scon->surface = qemu_create_displaysurface(1, 1);
+    sdl2_window_create(scon);
+
+    /*
+     * QEMU checks whether console supports dma-buf before switching
+     * to the console.  To break this chicken-egg problem we pre-check
+     * dma-buf availability beforehand using a dummy SDL window.
+     */
+    scon->has_dmabuf = qemu_egl_has_dmabuf();
+
+    sdl2_window_destroy(scon);
+    qemu_free_displaysurface(scon->surface);
+
+    scon->surface = NULL;
+    scon->hidden = hidden;
 }

@@ -44,6 +44,7 @@ typedef struct VirtualGfxConsole {
     double preferred_scale;
     double scale_x;
     double scale_y;
+    bool touch_active;
 #if defined(CONFIG_OPENGL)
     QemuGLShader *gls;
     EGLContext ectx;
@@ -98,8 +99,6 @@ struct GtkDisplayState {
 
     GtkWidget *menu_bar;
 
-    GtkAccelGroup *accel_group;
-
     GtkWidget *machine_menu_item;
     GtkWidget *machine_menu;
     GtkWidget *pause_item;
@@ -108,7 +107,7 @@ struct GtkDisplayState {
     GtkWidget *quit_item;
 
     GtkWidget *view_menu_item;
-    GtkWidget *view_menu;
+    GMenu *view_menu;
     GtkWidget *full_screen_item;
     GtkWidget *copy_item;
     GtkWidget *zoom_in_item;
@@ -145,9 +144,17 @@ struct GtkDisplayState {
 
     bool external_pause_update;
 
+    int current_vc;
+    bool grab_active;
+    bool grab_on_hover;
+    bool show_menubar;
+    bool show_tabs;
+    bool zoom_fit_active;
+    GActionGroup *actions;
+
     QemuClipboardPeer cbpeer;
     uint32_t cbpending[QEMU_CLIPBOARD_SELECTION__COUNT];
-    GtkClipboard *gtkcb[QEMU_CLIPBOARD_SELECTION__COUNT];
+    GdkClipboard *gtkcb[QEMU_CLIPBOARD_SELECTION__COUNT];
     bool cbowner[QEMU_CLIPBOARD_SELECTION__COUNT];
 
     DisplayOptions *opts;

@@ -178,17 +178,24 @@ out:
     return ret;
 }
 
+void kbd_layout_free(kbd_layout_t *k)
+{
+    if (!k) {
+        return;
+    }
+    g_hash_table_unref(k->hash);
+    g_free(k);
+}
 
-kbd_layout_t *init_keyboard_layout(const name2keysym_t *table,
-                                   const char *language, Error **errp)
+kbd_layout_t *kbd_layout_new(const name2keysym_t *table,
+                             const char *language, Error **errp)
 {
     kbd_layout_t *k;
 
     k = g_new0(kbd_layout_t, 1);
-    k->hash = g_hash_table_new(NULL, NULL);
+    k->hash = g_hash_table_new_full(NULL, NULL, NULL, g_free);
     if (parse_keyboard_layout(k, table, language, errp) < 0) {
-        g_hash_table_unref(k->hash);
-        g_free(k);
+        kbd_layout_free(k);
         return NULL;
     }
     return k;
@@ -208,25 +215,6 @@ int keysym2scancode(kbd_layout_t *k, int keysym,
         keysym = XK_Tab;
     }
 #endif
-
-    if (!k) {
-        /* Fallback: no keymap file loaded (e.g. on Android).
-         * Use x11 keysym -> QKeyCode -> AT set1 scancode mapping. */
-        QKeyCode qcode;
-        int scancode;
-
-        if ((unsigned)keysym >= qemu_input_map_x11_to_qcode_len) {
-            trace_keymap_unmapped(keysym);
-            return 0;
-        }
-        qcode = qemu_input_map_x11_to_qcode[keysym];
-        if (qcode == 0 || qcode >= qemu_input_map_qcode_to_atset1_len) {
-            trace_keymap_unmapped(keysym);
-            return 0;
-        }
-        scancode = qemu_input_map_qcode_to_atset1[qcode];
-        return scancode;
-    }
 
     keysym2code = g_hash_table_lookup(k->hash, GINT_TO_POINTER(keysym));
     if (!keysym2code) {
