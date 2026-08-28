@@ -7,13 +7,9 @@
  */
 
 /*
- * WARNING:
- * This is very incomplete and only enough for Linux console and some
- * unaccelerated X output at the moment.
- * Currently it's little more than a frame buffer with minimal functions,
- * other more advanced features of the hardware are yet to be implemented.
- * We only aim for Rage 128 Pro (and some RV100) and 2D only at first,
- * No 3D at all yet (maybe after 2D works, but feel free to improve it)
+ * Rage 128 Pro, Radeon RV100, and Radeon ES1000 VGA, display, cursor, and 2D
+ * emulation. RV100 also provides a synchronous software command processor and
+ * fixed-function rasterizer.
  */
 
 #include "qemu/osdep.h"
@@ -21,6 +17,8 @@
 #include "ati_regs.h"
 #include "vga-access.h"
 #include "hw/core/qdev-properties.h"
+#include "hw/pci/pci.h"
+#include "hw/pci/pci_regs.h"
 #include "vga_regs.h"
 #include "qemu/bswap.h"
 #include "qemu/log.h"
@@ -29,9 +27,21 @@
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "ui/console.h"
+#include "ui/pixel_ops.h"
 #include "trace.h"
 
 #define ATI_DEBUG_HW_CURSOR 0
+
+#define ATI_RAGE128_GEN_INT_STATUS_RESET       0x00080000U
+#define ATI_R100_GEN_INT_STATUS_RESET          0x00080000U
+#define ATI_CRTC_GEN_CNTL_RESET                0x04000000U
+#define ATI_RAGE128_CRTC_EXT_CNTL_RESET        0x00200000U
+#define ATI_RAGE128_DAC_CNTL_RESET             0xff00000aU
+#define ATI_R100_DAC_CNTL_RESET                0xff00000aU
+#define ATI_RV100_CRTC_OFFSET_CNTL_RESET        0x10000000U
+/* TODO: Derive CRTC cadence from the programmed PLL and timing registers. */
+#define ATI_CRTC_FRAME_NS                       (NANOSECONDS_PER_SECOND / 60)
+#define ATI_CRTC_FRAME_MASK                     0x001fffffU
 
 #ifdef CONFIG_PIXMAN
 #define DEFAULT_X_PIXMAN 3
@@ -45,6 +55,7 @@ static const struct {
 } ati_model_aliases[] = {
     { "rage128p", PCI_DEVICE_ID_ATI_RAGE128_PF },
     { "rv100", PCI_DEVICE_ID_ATI_RADEON_QY },
+    { "es1000", PCI_DEVICE_ID_ATI_ES1000 },
 };
 
 enum { VGA_MODE, EXT_MODE };
@@ -62,8 +73,40 @@ static void ati_vga_set_offset(VGACommonState *vga, uint32_t offs)
     vga->vbe_start_addr = offs / 4;
 }
 
+static bool ati_crtc_enabled(const ATIVGAState *s)
+{
+    return (s->regs.crtc_gen_cntl & (CRTC2_EXT_DISP_EN | CRTC2_EN)) ==
+           (CRTC2_EXT_DISP_EN | CRTC2_EN);
+}
+
+static void ati_vga_switch_mode(ATIVGAState *s);
+
+static void ati_crtc_commit_offset(ATIVGAState *s)
+{
+    bool pitch_changed;
+
+    if (!(s->regs.crtc_offset & CRTC_OFFSET_GUI_TRIG_OFFSET) ||
+        (s->regs.crtc_offset & CRTC_OFFSET_LOCK)) {
+        return;
+    }
+
+    pitch_changed = s->crtc_pitch_active != s->regs.crtc_pitch;
+    s->crtc_offset_active = s->regs.crtc_offset & CRTC_OFFSET_MASK;
+    s->crtc_pitch_active = s->regs.crtc_pitch;
+    s->regs.crtc_offset &= ~CRTC_OFFSET_GUI_TRIG_OFFSET;
+    if (ati_crtc_enabled(s)) {
+        if (pitch_changed) {
+            ati_vga_switch_mode(s);
+        } else {
+            ati_vga_set_offset(&s->vga, s->crtc_offset_active);
+        }
+        graphic_hw_invalidate(s->vga.con);
+    }
+}
+
 static void ati_vga_switch_mode(ATIVGAState *s)
 {
+    /* TODO: Render overlay/scaler planes; only primary scanout is exposed. */
     DPRINTF("%d -> %d\n",
             s->mode, !!(s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN));
     if (s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN) {
@@ -71,9 +114,8 @@ static void ati_vga_switch_mode(ATIVGAState *s)
         s->mode = EXT_MODE;
         if (s->regs.crtc_gen_cntl & CRTC2_EN) {
             /* CRT controller enabled, use CRTC values */
-            /* FIXME Should these be the same as VGA CRTC regs? */
-            uint32_t offs = s->regs.crtc_offset & 0x07ffffff;
-            int stride = (s->regs.crtc_pitch & 0x7ff) * 8;
+            uint32_t offs = s->crtc_offset_active;
+            int stride = (s->crtc_pitch_active & 0x7ff) * 8;
             int bpp = 0;
             int h, v;
 
@@ -138,102 +180,421 @@ static void ati_vga_switch_mode(ATIVGAState *s)
     }
 }
 
-/* Used by host side hardware cursor */
-static void ati_cursor_define(ATIVGAState *s)
-{
-    uint64_t data[128];
-    uint32_t srcoff;
+#define ATI_CURSOR_DIMENSION 64
+#define ATI_MONO_CURSOR_STRIDE 16
+#define ATI_ARGB_CURSOR_STRIDE (ATI_CURSOR_DIMENSION * sizeof(uint32_t))
 
-    if ((s->regs.cur_offset & BIT(31)) || s->cursor_guest_mode) {
-        return; /* Do not update cursor if locked or rendered by guest */
-    }
-    /* FIXME handle cur_hv_offs correctly */
-    srcoff = (s->regs.cur_offset & 0x07fffff0) - (s->regs.cur_hv_offs >> 16) -
-             (s->regs.cur_hv_offs & 0xffff) * 16;
-    if (srcoff > s->vga.vram_size - 64 * 16) {
-        return;
-    }
-    for (int i = 0; i < 64; i++, srcoff += 16) {
-        data[i] = ldq_le_p(&s->vga.vram_ptr[srcoff]);
-        data[i + 64] = ldq_le_p(&s->vga.vram_ptr[srcoff + 8]);
-    }
-    if (!s->cursor) {
-        s->cursor = cursor_alloc(64, 64);
-    }
-    cursor_set_mono(s->cursor, s->regs.cur_color1, s->regs.cur_color0,
-                    (uint8_t *)&data[64], 1, (uint8_t *)&data[0]);
-    dpy_cursor_define(s->vga.con, s->cursor);
+typedef struct ATICursorParams {
+    uint32_t offset;
+    uint16_t stride;
+    uint8_t x_offset;
+    uint8_t width;
+    uint8_t height;
+    uint8_t mode;
+    int x;
+    int y;
+    bool enabled;
+} ATICursorParams;
+
+static void ati_cursor_commit(ATIVGAState *s)
+{
+    s->cursor_active.offset = s->regs.cur_offset & 0x07fffff0;
+    s->cursor_active.hv_pos = s->regs.cur_hv_pos;
+    s->cursor_active.hv_offs = s->regs.cur_hv_offs;
 }
 
-/* Alternatively support guest rendered hardware cursor */
+static bool ati_cursor_get_params(ATIVGAState *s, ATICursorParams *params)
+{
+    const ATICursorState *cursor = &s->cursor_active;
+    uint32_t x_offset = extract32(cursor->hv_offs, 16, 6);
+    uint32_t y_offset = extract32(cursor->hv_offs, 0, 6);
+    uint64_t bytes;
+
+    memset(params, 0, sizeof(*params));
+    params->mode = ati_is_rv100_family(s) ?
+        extract32(s->regs.crtc_gen_cntl, R100_CRTC_CUR_MODE_SHIFT, 3) :
+        R100_CRTC_CUR_MODE_MONO;
+    if (params->mode == R100_CRTC_CUR_MODE_MONO) {
+        params->stride = ATI_MONO_CURSOR_STRIDE;
+    } else if (ati_is_rv100_family(s) &&
+               params->mode == R100_CRTC_CUR_MODE_24BPP) {
+        params->stride = ATI_ARGB_CURSOR_STRIDE;
+    } else {
+        return false;
+    }
+
+    params->offset = cursor->offset;
+    params->x_offset = x_offset;
+    params->width = ATI_CURSOR_DIMENSION - x_offset;
+    params->height = ATI_CURSOR_DIMENSION - y_offset;
+    params->x = extract32(cursor->hv_pos, 16, 14);
+    params->y = extract32(cursor->hv_pos, 0, 12);
+    params->enabled = s->regs.crtc_gen_cntl & CRTC2_CUR_EN;
+
+    bytes = (uint64_t)params->height * params->stride;
+    return params->offset <= s->vga.vram_size &&
+           bytes <= s->vga.vram_size - params->offset;
+}
+
+static uint32_t ati_cursor_argb_to_rgba(uint32_t pixel)
+{
+    uint8_t alpha = pixel >> 24;
+    uint8_t red = pixel >> 16;
+    uint8_t green = pixel >> 8;
+    uint8_t blue = pixel;
+
+    /* R100 stores premultiplied A8R8G8B8; QEMUCursor uses straight RGBA. */
+    if (alpha) {
+        red = MIN(255U, ((unsigned int)red * 255 + alpha / 2) / alpha);
+        green = MIN(255U, ((unsigned int)green * 255 + alpha / 2) / alpha);
+        blue = MIN(255U, ((unsigned int)blue * 255 + alpha / 2) / alpha);
+    }
+    return ((uint32_t)alpha << 24) | ((uint32_t)blue << 16) |
+           ((uint32_t)green << 8) | red;
+}
+
+static bool ati_cursor_define(ATIVGAState *s, const ATICursorParams *params)
+{
+    uint8_t and_mask[ATI_CURSOR_DIMENSION *
+                     DIV_ROUND_UP(ATI_CURSOR_DIMENSION, 8)] = { 0 };
+    uint8_t xor_mask[ATI_CURSOR_DIMENSION *
+                     DIV_ROUND_UP(ATI_CURSOR_DIMENSION, 8)] = { 0 };
+    unsigned int x;
+    unsigned int y;
+
+    if (!ati_3d_consume_command_work(s,
+                                     params->width * params->height)) {
+        return false;
+    }
+    if (!s->cursor || s->cursor->width != params->width ||
+        s->cursor->height != params->height) {
+        cursor_unref(s->cursor);
+        s->cursor = cursor_alloc(params->width, params->height);
+        if (!s->cursor) {
+            return false;
+        }
+    }
+    s->cursor->hot_x = 0;
+    s->cursor->hot_y = 0;
+
+    if (params->mode == R100_CRTC_CUR_MODE_24BPP) {
+        for (y = 0; y < params->height; y++) {
+            const uint8_t *row = s->vga.vram_ptr + params->offset +
+                                 (uint64_t)y * params->stride;
+
+            for (x = 0; x < params->width; x++) {
+                uint32_t pixel = ldl_le_p(row +
+                                         (params->x_offset + x) * 4);
+
+                s->cursor->data[y * params->width + x] =
+                    ati_cursor_argb_to_rgba(pixel);
+            }
+        }
+    } else {
+        unsigned int bpl = DIV_ROUND_UP(params->width, 8);
+
+        for (y = 0; y < params->height; y++) {
+            const uint8_t *row = s->vga.vram_ptr + params->offset +
+                                 (uint64_t)y * params->stride;
+            uint64_t abits = ldq_be_p(row);
+            uint64_t xbits = ldq_be_p(row + 8);
+
+            for (x = 0; x < params->width; x++) {
+                uint64_t bit = BIT_ULL(63 - params->x_offset - x);
+                uint8_t out_bit = 0x80U >> (x & 7);
+                size_t out = y * bpl + x / 8;
+
+                if (abits & bit) {
+                    and_mask[out] |= out_bit;
+                }
+                if (xbits & bit) {
+                    xor_mask[out] |= out_bit;
+                }
+            }
+        }
+        cursor_set_mono(s->cursor,
+                        ati_cursor_argb_to_rgba(0xff000000U |
+                                                s->regs.cur_color1),
+                        ati_cursor_argb_to_rgba(0xff000000U |
+                                                s->regs.cur_color0),
+                        xor_mask, 1, and_mask);
+    }
+    dpy_cursor_define(s->vga.con, s->cursor);
+    return true;
+}
+
+static void ati_cursor_update_host(ATIVGAState *s, bool redefine)
+{
+    ATICursorParams params;
+    const uint8_t *source;
+    uint32_t image_size;
+    bool shape_changed;
+
+    if (s->cursor_guest_mode) {
+        return;
+    }
+    if (!ati_cursor_get_params(s, &params) || !params.enabled) {
+        s->cursor_image_valid = false;
+        if (s->cursor_host_visible) {
+            dpy_mouse_set(s->vga.con, 0, 0, false);
+            s->cursor_host_visible = false;
+        }
+        return;
+    }
+
+    image_size = params.height * params.stride;
+    source = s->vga.vram_ptr + params.offset;
+    shape_changed = redefine || !s->cursor_image_valid ||
+                    s->cursor_image_offset != params.offset ||
+                    s->cursor_image_size != image_size ||
+                    s->cursor_image_stride != params.stride ||
+                    s->cursor_image_x_offset != params.x_offset ||
+                    s->cursor_image_width != params.width ||
+                    s->cursor_image_height != params.height ||
+                    s->cursor_image_mode != params.mode ||
+                    memcmp(s->cursor_image, source, image_size);
+    if (shape_changed) {
+        if (!ati_cursor_define(s, &params)) {
+            s->cursor_image_valid = false;
+            if (s->cursor_host_visible) {
+                dpy_mouse_set(s->vga.con, 0, 0, false);
+                s->cursor_host_visible = false;
+            }
+            return;
+        }
+        memcpy(s->cursor_image, source, image_size);
+        s->cursor_image_offset = params.offset;
+        s->cursor_image_size = image_size;
+        s->cursor_image_stride = params.stride;
+        s->cursor_image_x_offset = params.x_offset;
+        s->cursor_image_width = params.width;
+        s->cursor_image_height = params.height;
+        s->cursor_image_mode = params.mode;
+        s->cursor_image_valid = true;
+    }
+    if (!s->cursor_host_visible || s->cursor_host_x != params.x ||
+        s->cursor_host_y != params.y) {
+        dpy_mouse_set(s->vga.con, params.x, params.y, true);
+        s->cursor_host_visible = true;
+        s->cursor_host_x = params.x;
+        s->cursor_host_y = params.y;
+    }
+}
+
+static void ati_cursor_update_guest_mode(ATIVGAState *s)
+{
+    ATICursorParams params;
+    bool enabled = ati_cursor_get_params(s, &params) && params.enabled;
+
+    if (s->vga.force_shadow != enabled) {
+        s->vga.force_shadow = enabled;
+        s->vga.graphic_mode = -1;
+    }
+    graphic_hw_invalidate(s->vga.con);
+}
+
+static void ati_cursor_changed(ATIVGAState *s, bool redefine)
+{
+    if (s->cursor_guest_mode) {
+        ati_cursor_update_guest_mode(s);
+    } else {
+        ati_cursor_update_host(s, redefine);
+    }
+}
+
+static void ati_cursor_invalidate_range(VGACommonState *vga, int y,
+                                        unsigned int height)
+{
+    int first = MAX(y, 0);
+    int last = MIN(y + (int)height, VGA_MAX_HEIGHT);
+
+    if (first < last) {
+        vga_invalidate_scanlines(vga, first, last);
+    }
+}
+
 static void ati_cursor_invalidate(VGACommonState *vga)
 {
     ATIVGAState *s = container_of(vga, ATIVGAState, vga);
-    int size = (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) ? 64 : 0;
+    ATICursorParams params;
+    const uint8_t *source = NULL;
+    uint32_t image_size = 0;
+    bool changed;
+    bool valid;
+    uint8_t width;
+    uint8_t height;
 
-    if (s->regs.cur_offset & BIT(31)) {
-        return; /* Do not update cursor if locked */
+    valid = ati_cursor_get_params(s, &params) && params.enabled;
+    width = valid ? params.width : 0;
+    height = valid ? params.height : 0;
+    changed = s->cursor_width != width || s->cursor_height != height ||
+              s->cursor_mode != (valid ? params.mode : 0) ||
+              s->cursor_x_offset != (valid ? params.x_offset : 0) ||
+              vga->hw_cursor_x != (valid ? params.x : 0) ||
+              vga->hw_cursor_y != (valid ? params.y : 0) ||
+              s->cursor_offset != (valid ? params.offset : 0);
+    if (valid) {
+        image_size = params.height * params.stride;
+        source = vga->vram_ptr + params.offset;
+        changed |= !s->cursor_image_valid ||
+                   s->cursor_image_offset != params.offset ||
+                   s->cursor_image_size != image_size ||
+                   s->cursor_image_stride != params.stride ||
+                   s->cursor_image_x_offset != params.x_offset ||
+                   s->cursor_image_width != params.width ||
+                   s->cursor_image_height != params.height ||
+                   s->cursor_image_mode != params.mode ||
+                   memcmp(s->cursor_image, source, image_size);
+    } else {
+        changed |= s->cursor_image_valid;
     }
-    if (s->cursor_size != size ||
-        vga->hw_cursor_x != s->regs.cur_hv_pos >> 16 ||
-        vga->hw_cursor_y != (s->regs.cur_hv_pos & 0xffff) ||
-        s->cursor_offset != (s->regs.cur_offset & 0x07fffff0) -
-        (s->regs.cur_hv_offs >> 16) -
-        (s->regs.cur_hv_offs & 0xffff) * 16) {
-        /* Remove old cursor then update and show new one if needed */
-        vga_invalidate_scanlines(vga, vga->hw_cursor_y, vga->hw_cursor_y + 63);
-        vga->hw_cursor_x = s->regs.cur_hv_pos >> 16;
-        vga->hw_cursor_y = s->regs.cur_hv_pos & 0xffff;
-        s->cursor_offset = (s->regs.cur_offset & 0x07fffff0) -
-                           (s->regs.cur_hv_offs >> 16) -
-                           (s->regs.cur_hv_offs & 0xffff) * 16;
-        s->cursor_size = size;
-        if (size) {
-            vga_invalidate_scanlines(vga,
-                                     vga->hw_cursor_y, vga->hw_cursor_y + 63);
-        }
+    if (!changed) {
+        return;
     }
+
+    ati_cursor_invalidate_range(vga, vga->hw_cursor_y,
+                                s->cursor_height);
+    vga->hw_cursor_x = valid ? params.x : 0;
+    vga->hw_cursor_y = valid ? params.y : 0;
+    s->cursor_offset = valid ? params.offset : 0;
+    s->cursor_width = width;
+    s->cursor_height = height;
+    s->cursor_mode = valid ? params.mode : 0;
+    s->cursor_x_offset = valid ? params.x_offset : 0;
+    if (valid) {
+        memcpy(s->cursor_image, source, image_size);
+        s->cursor_image_offset = params.offset;
+        s->cursor_image_size = image_size;
+        s->cursor_image_stride = params.stride;
+        s->cursor_image_x_offset = params.x_offset;
+        s->cursor_image_width = params.width;
+        s->cursor_image_height = params.height;
+        s->cursor_image_mode = params.mode;
+        s->cursor_image_valid = true;
+        ati_cursor_invalidate_range(vga, vga->hw_cursor_y,
+                                    s->cursor_height);
+    } else {
+        s->cursor_image_valid = false;
+    }
+}
+
+static uint8_t ati_cursor_blend_channel(uint8_t source, uint8_t destination,
+                                        uint8_t alpha)
+{
+    unsigned int value = (unsigned int)source * 255 +
+                         (unsigned int)destination * (255 - alpha);
+
+    return MIN(255U, (value + 127) / 255);
 }
 
 static void ati_cursor_draw_line(VGACommonState *vga, uint8_t *d, int scr_y)
 {
     ATIVGAState *s = container_of(vga, ATIVGAState, vga);
-    uint32_t h, srcoff, color;
-    uint64_t abits, xbits, mask;
     uint32_t *dp = (uint32_t *)d;
+    uint32_t stride;
+    uint32_t srcoff;
+    int first_x;
+    int last_x;
+    int screen_x;
 
-    if (!(s->regs.crtc_gen_cntl & CRTC2_CUR_EN) ||
-        scr_y < vga->hw_cursor_y || scr_y >= vga->hw_cursor_y + 64 ||
+    if (!s->cursor_width || !s->cursor_height ||
+        scr_y < vga->hw_cursor_y ||
+        scr_y >= vga->hw_cursor_y + s->cursor_height ||
         scr_y > s->regs.crtc_v_total_disp >> 16) {
         return;
     }
-    /* FIXME handle cur_hv_offs correctly */
-    srcoff = s->cursor_offset + (scr_y - vga->hw_cursor_y) * 16;
-    if (srcoff > s->vga.vram_size - 16) {
+    stride = s->cursor_mode == R100_CRTC_CUR_MODE_24BPP ?
+             ATI_ARGB_CURSOR_STRIDE : ATI_MONO_CURSOR_STRIDE;
+    srcoff = s->cursor_offset +
+             (scr_y - vga->hw_cursor_y) * stride;
+    first_x = MAX(vga->hw_cursor_x, 0);
+    last_x = MIN(vga->hw_cursor_x + s->cursor_width,
+                 vga->last_scr_width);
+    if (first_x >= last_x || srcoff > s->vga.vram_size - stride) {
         return;
     }
-    dp = &dp[vga->hw_cursor_x];
-    h = ((s->regs.crtc_h_total_disp >> 16) + 1) * 8;
-    abits = ldq_be_p(&vga->vram_ptr[srcoff]);
-    xbits = ldq_be_p(&vga->vram_ptr[srcoff + 8]);
-    mask = BIT_ULL(63);
-    for (int i = 0; i < 64; i++, mask >>= 1) {
-        if (vga->hw_cursor_x + i >= h) {
-            return; /* end of screen, don't span to next line */
-        }
-        if (abits & mask) {
-            if (xbits & mask) {
-                color = dp[i] ^ 0xffffffff; /* complement */
-            } else {
-                continue; /* transparent, no change */
+
+    if (s->cursor_mode == R100_CRTC_CUR_MODE_24BPP) {
+        for (screen_x = first_x; screen_x < last_x; screen_x++) {
+            unsigned int source_x = s->cursor_x_offset +
+                                    screen_x - vga->hw_cursor_x;
+            uint32_t source = ldl_le_p(vga->vram_ptr + srcoff + source_x * 4);
+            uint8_t alpha = source >> 24;
+            uint8_t red;
+            uint8_t green;
+            uint8_t blue;
+
+            if (!alpha) {
+                continue;
             }
-        } else {
-            color = (xbits & mask ? s->regs.cur_color1 :
-                                    s->regs.cur_color0) | 0xff000000;
+            red = source >> 16;
+            green = source >> 8;
+            blue = source;
+            if (alpha != 0xff) {
+                uint32_t destination = dp[screen_x];
+
+                red = ati_cursor_blend_channel(red, destination >> 16,
+                                               alpha);
+                green = ati_cursor_blend_channel(green, destination >> 8,
+                                                 alpha);
+                blue = ati_cursor_blend_channel(blue, destination, alpha);
+            }
+            dp[screen_x] = rgb_to_pixel32(red, green, blue);
         }
-        dp[i] = color;
+    } else {
+        uint64_t abits = ldq_be_p(vga->vram_ptr + srcoff);
+        uint64_t xbits = ldq_be_p(vga->vram_ptr + srcoff + 8);
+
+        for (screen_x = first_x; screen_x < last_x; screen_x++) {
+            unsigned int source_x = s->cursor_x_offset +
+                                    screen_x - vga->hw_cursor_x;
+            uint64_t mask = BIT_ULL(63 - source_x);
+            uint32_t color;
+
+            if (abits & mask) {
+                if (xbits & mask) {
+                    color = dp[screen_x] ^ 0xffffffff;
+                } else {
+                    continue;
+                }
+            } else {
+                color = (xbits & mask ? s->regs.cur_color1 :
+                                        s->regs.cur_color0) |
+                        0xff000000;
+            }
+            dp[screen_x] = color;
+        }
     }
 }
+
+static void ati_graphic_invalidate(void *opaque)
+{
+    ATIVGAState *s = opaque;
+
+    s->vga.hw_ops->invalidate(&s->vga);
+}
+
+static bool ati_graphic_update(void *opaque)
+{
+    ATIVGAState *s = opaque;
+    bool complete = s->vga.hw_ops->gfx_update(&s->vga);
+
+    ati_cursor_update_host(s, false);
+    return complete;
+}
+
+static void ati_graphic_text_update(void *opaque, uint32_t *text)
+{
+    ATIVGAState *s = opaque;
+
+    s->vga.hw_ops->text_update(&s->vga, text);
+}
+
+static const GraphicHwOps ati_graphic_ops = {
+    .invalidate = ati_graphic_invalidate,
+    .gfx_update = ati_graphic_update,
+    .text_update = ati_graphic_text_update,
+};
 
 static uint64_t ati_i2c(bitbang_i2c_interface *i2c, uint64_t data, int base)
 {
@@ -258,13 +619,179 @@ static void ati_vga_update_irq(ATIVGAState *s)
     pci_set_irq(&s->dev, !!(s->regs.gen_int_status & s->regs.gen_int_cntl));
 }
 
-static void ati_vga_vblank_irq(void *opaque)
+static uint32_t ati_crtc_line_mask(const ATIVGAState *s)
+{
+    return ati_is_rv100_family(s) ? 0xfff : 0x7ff;
+}
+
+static uint32_t ati_crtc_h_total_disp_mask(const ATIVGAState *s)
+{
+    return ati_is_rv100_family(s) ? 0x01ff03ff : 0x00ff01ff;
+}
+
+static uint32_t ati_crtc_h_sync_mask(const ATIVGAState *s)
+{
+    return ati_is_rv100_family(s) ? 0x17bf1fff : 0x00bf0fff;
+}
+
+static uint32_t ati_crtc_vtotal(const ATIVGAState *s)
+{
+    return (s->regs.crtc_v_total_disp & ati_crtc_line_mask(s)) + 1;
+}
+
+static bool ati_crtc_vblank_line(const ATIVGAState *s, uint32_t *line)
+{
+    uint32_t value = ((s->regs.crtc_v_total_disp >> 16) &
+                      ati_crtc_line_mask(s)) + 1;
+
+    if (value >= ati_crtc_vtotal(s)) {
+        return false;
+    }
+    *line = value;
+    return true;
+}
+
+static bool ati_crtc_vsync_line(const ATIVGAState *s, uint32_t *line)
+{
+    uint32_t value = (s->regs.crtc_v_sync_strt_wid &
+                      ati_crtc_line_mask(s)) + 1;
+
+    if (value >= ati_crtc_vtotal(s)) {
+        return false;
+    }
+    *line = value;
+    return true;
+}
+
+static uint32_t ati_crtc_current_line(const ATIVGAState *s)
+{
+    int64_t now, elapsed;
+
+    if (!ati_crtc_enabled(s)) {
+        return 0;
+    }
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    elapsed = now - s->crtc_frame_start_ns;
+    if (elapsed <= 0) {
+        return 0;
+    }
+    return muldiv64(elapsed % ATI_CRTC_FRAME_NS,
+                    ati_crtc_vtotal(s), ATI_CRTC_FRAME_NS);
+}
+
+static uint32_t ati_crtc_next_event_line(const ATIVGAState *s,
+                                         uint32_t current)
+{
+    uint32_t next = ati_crtc_vtotal(s);
+    uint32_t line;
+
+    if (ati_crtc_vblank_line(s, &line) && line > current) {
+        next = MIN(next, line);
+    }
+    if (ati_crtc_vsync_line(s, &line) && line > current) {
+        next = MIN(next, line);
+    }
+    line = s->crtc_vline & ati_crtc_line_mask(s);
+    if (line < ati_crtc_vtotal(s) && line > current) {
+        next = MIN(next, line);
+    }
+    return next;
+}
+
+static void ati_crtc_schedule_from_line(ATIVGAState *s, uint32_t current)
+{
+    uint32_t total = ati_crtc_vtotal(s);
+
+    s->crtc_event_line = ati_crtc_next_event_line(s, current);
+    timer_mod(&s->vblank_timer,
+              s->crtc_frame_start_ns +
+              DIV_ROUND_UP((uint64_t)ATI_CRTC_FRAME_NS *
+                           s->crtc_event_line, total));
+}
+
+static void ati_crtc_start(ATIVGAState *s)
+{
+    timer_del(&s->vblank_timer);
+    if (!ati_crtc_enabled(s)) {
+        return;
+    }
+    s->crtc_frame_start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (!(s->crtc_vline & ati_crtc_line_mask(s))) {
+        s->regs.gen_int_status |= CRTC_VLINE_INT;
+    }
+    ati_crtc_schedule_from_line(s, 0);
+    ati_vga_update_irq(s);
+}
+
+static void ati_crtc_reschedule(ATIVGAState *s)
+{
+    uint32_t line;
+
+    if (!ati_crtc_enabled(s)) {
+        timer_del(&s->vblank_timer);
+        return;
+    }
+    line = ati_crtc_current_line(s);
+    timer_del(&s->vblank_timer);
+    ati_crtc_schedule_from_line(s, line);
+}
+
+static uint32_t ati_crtc_status(const ATIVGAState *s)
+{
+    uint32_t status = s->crtc_vblank_save ? CRTC_VBLANK_SAVE : 0;
+    uint32_t line = ati_crtc_current_line(s);
+    uint32_t vblank;
+
+    if (ati_crtc_enabled(s)) {
+        if (ati_crtc_vblank_line(s, &vblank) && line >= vblank) {
+            status |= CRTC_VBLANK_CUR;
+        }
+        if (line & 1) {
+            status |= CRTC_VLINE_SYNC;
+        }
+    }
+    if (s->crtc_frame & 1) {
+        status |= CRTC_FRAME;
+    }
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF &&
+        s->crtc_fix_vsync_timing) {
+        status |= CRTC_FIX_VSYNC_TIMING;
+    }
+    return status;
+}
+
+static void ati_crtc_event(void *opaque)
 {
     ATIVGAState *s = opaque;
+    uint32_t line = s->crtc_event_line;
+    uint32_t event_line;
 
-    timer_mod(&s->vblank_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-              NANOSECONDS_PER_SECOND / 60);
-    s->regs.gen_int_status |= CRTC_VBLANK_INT;
+    if (!ati_crtc_enabled(s)) {
+        return;
+    }
+    if (line == ati_crtc_vtotal(s)) {
+        s->crtc_frame_start_ns += ATI_CRTC_FRAME_NS;
+        if (!(s->crtc_vline & ati_crtc_line_mask(s))) {
+            s->regs.gen_int_status |= CRTC_VLINE_INT;
+        }
+        ati_crtc_schedule_from_line(s, 0);
+        ati_vga_update_irq(s);
+        return;
+    }
+
+    if (ati_crtc_vblank_line(s, &event_line) && line == event_line) {
+        ati_crtc_commit_offset(s);
+        s->crtc_vblank_save = true;
+        s->regs.gen_int_status |= CRTC_VBLANK_INT;
+    }
+    if ((s->crtc_vline & ati_crtc_line_mask(s)) == line) {
+        s->regs.gen_int_status |= CRTC_VLINE_INT;
+    }
+    if (ati_crtc_vsync_line(s, &event_line) && line == event_line) {
+        s->crtc_frame = (s->crtc_frame + 1) & ATI_CRTC_FRAME_MASK;
+        s->regs.gen_int_status |= CRTC_VSYNC_INT;
+    }
+    ati_crtc_schedule_from_line(s, line);
     ati_vga_update_irq(s);
 }
 
@@ -278,10 +805,52 @@ static inline uint32_t ati_reg_read_offs(uint32_t reg, int offs,
     }
 }
 
+static inline void ati_reg_write_offs(uint32_t *reg, int offs,
+                                      uint64_t data, unsigned int size)
+{
+    if (offs == 0 && size == 4) {
+        *reg = data;
+    } else {
+        *reg = deposit32(*reg, offs * BITS_PER_BYTE, size * BITS_PER_BYTE,
+                         data);
+    }
+}
+
+static uint32_t ati_pll_read(ATIVGAState *s, hwaddr addr,
+                             unsigned int size)
+{
+    unsigned int index = s->regs.clock_cntl_index & PLL_INDEX_MASK;
+
+    return ati_reg_read_offs(s->regs.pll[index], addr - CLOCK_CNTL_DATA,
+                             size);
+}
+
+static void ati_pll_write(ATIVGAState *s, hwaddr addr, uint64_t data,
+                          unsigned int size)
+{
+    unsigned int index = s->regs.clock_cntl_index & PLL_INDEX_MASK;
+
+    if (!(s->regs.clock_cntl_index & PLL_WR_EN)) {
+        return;
+    }
+    ati_reg_write_offs(&s->regs.pll[index], addr - CLOCK_CNTL_DATA,
+                       data, size);
+    if (index == PPLL_REF_DIV) {
+        /* TODO: Stage PPLL divisors and commit them on ATOMIC_UPDATE_W. */
+        s->regs.pll[index] &= ~PPLL_ATOMIC_UPDATE_R;
+    }
+}
+
 static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
 {
     ATIVGAState *s = opaque;
     uint32_t val = 0;
+    uint64_t r100_val;
+
+    if (ati_3d_read(s, addr, &r100_val, size)) {
+        trace_ati_mm_read(size, addr, ati_reg_name(addr & ~3ULL), r100_val);
+        return r100_val;
+    }
 
     switch (addr) {
     case MM_INDEX:
@@ -300,6 +869,13 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
             qemu_log_mask(LOG_GUEST_ERROR,
                 "ati_mm_read: mm_index too small: %u\n", s->regs.mm_index);
         }
+        break;
+    case CLOCK_CNTL_INDEX ... CLOCK_CNTL_INDEX + 3:
+        val = ati_reg_read_offs(s->regs.clock_cntl_index,
+                                addr - CLOCK_CNTL_INDEX, size);
+        break;
+    case CLOCK_CNTL_DATA ... CLOCK_CNTL_DATA + 3:
+        val = ati_pll_read(s, addr, size);
         break;
     case BIOS_0_SCRATCH ... BUS_CNTL - 1:
     {
@@ -328,6 +904,10 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     case DAC_CNTL:
         val = s->regs.dac_cntl;
         break;
+    case CRTC_STATUS ... CRTC_STATUS + 3:
+        val = ati_reg_read_offs(ati_crtc_status(s), addr - CRTC_STATUS,
+                                size);
+        break;
     case GPIO_VGA_DDC ... GPIO_VGA_DDC + 3:
         val = ati_reg_read_offs(s->regs.gpio_vga_ddc,
                                 addr - GPIO_VGA_DDC, size);
@@ -341,7 +921,7 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
                                 addr - GPIO_MONID, size);
         break;
     case PALETTE_INDEX:
-        /* FIXME unaligned access */
+        /* TODO: Implement the sub-word PALETTE_INDEX register layout. */
         val = vga_ioport_read(&s->vga, VGA_PEL_IR) << 16;
         val |= vga_ioport_read(&s->vga, VGA_PEL_IW) & 0xff;
         break;
@@ -387,17 +967,30 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     case GUI_STAT:
         val = 64; /* free CMDFIFO entries */
         break;
-    case CRTC_H_TOTAL_DISP:
-        val = s->regs.crtc_h_total_disp;
+    case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
+        val = ati_reg_read_offs(s->regs.crtc_h_total_disp,
+                                addr - CRTC_H_TOTAL_DISP, size);
         break;
-    case CRTC_H_SYNC_STRT_WID:
-        val = s->regs.crtc_h_sync_strt_wid;
+    case CRTC_H_SYNC_STRT_WID ... CRTC_H_SYNC_STRT_WID + 3:
+        val = ati_reg_read_offs(s->regs.crtc_h_sync_strt_wid,
+                                addr - CRTC_H_SYNC_STRT_WID, size);
         break;
-    case CRTC_V_TOTAL_DISP:
-        val = s->regs.crtc_v_total_disp;
+    case CRTC_V_TOTAL_DISP ... CRTC_V_TOTAL_DISP + 3:
+        val = ati_reg_read_offs(s->regs.crtc_v_total_disp,
+                                addr - CRTC_V_TOTAL_DISP, size);
         break;
-    case CRTC_V_SYNC_STRT_WID:
-        val = s->regs.crtc_v_sync_strt_wid;
+    case CRTC_V_SYNC_STRT_WID ... CRTC_V_SYNC_STRT_WID + 3:
+        val = ati_reg_read_offs(s->regs.crtc_v_sync_strt_wid,
+                                addr - CRTC_V_SYNC_STRT_WID, size);
+        break;
+    case CRTC_VLINE_CRNT_VLINE ... CRTC_VLINE_CRNT_VLINE + 3:
+        val = ati_reg_read_offs(s->crtc_vline |
+                                (ati_crtc_current_line(s) << 16),
+                                addr - CRTC_VLINE_CRNT_VLINE, size);
+        break;
+    case CRTC_CRNT_FRAME ... CRTC_CRNT_FRAME + 3:
+        val = ati_reg_read_offs(s->crtc_frame, addr - CRTC_CRNT_FRAME,
+                                size);
         break;
     case CRTC_OFFSET:
         val = s->regs.crtc_offset;
@@ -415,18 +1008,14 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
         val = ati_reg_read_offs(s->regs.cur_offset, addr - CUR_OFFSET, size);
         break;
     case CUR_HORZ_VERT_POSN ... CUR_HORZ_VERT_POSN + 3:
-        val = ati_reg_read_offs(s->regs.cur_hv_pos,
+        val = ati_reg_read_offs(s->regs.cur_hv_pos |
+                                (s->regs.cur_offset & BIT(31)),
                                 addr - CUR_HORZ_VERT_POSN, size);
-        if (addr + size > CUR_HORZ_VERT_POSN + 3) {
-            val |= (s->regs.cur_offset & BIT(31)) >> (4 - size);
-        }
         break;
     case CUR_HORZ_VERT_OFF ... CUR_HORZ_VERT_OFF + 3:
-        val = ati_reg_read_offs(s->regs.cur_hv_offs,
+        val = ati_reg_read_offs(s->regs.cur_hv_offs |
+                                (s->regs.cur_offset & BIT(31)),
                                 addr - CUR_HORZ_VERT_OFF, size);
-        if (addr + size > CUR_HORZ_VERT_OFF + 3) {
-            val |= (s->regs.cur_offset & BIT(31)) >> (4 - size);
-        }
         break;
     case CUR_CLR0 ... CUR_CLR0 + 3:
         val = ati_reg_read_offs(s->regs.cur_color0, addr - CUR_CLR0, size);
@@ -470,6 +1059,12 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
               (s->regs.dp_mix & DP_ROP3) |
               ((s->regs.dp_mix & DP_SRC_SOURCE) << 16);
         break;
+    case BRUSH_Y_X ... BRUSH_Y_X + 3:
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            val = ati_reg_read_offs(s->regs.brush_y_x,
+                                    addr - BRUSH_Y_X, size);
+        }
+        break;
     case SRC_OFFSET:
         val = s->regs.src_offset;
         break;
@@ -485,6 +1080,17 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     case DP_BRUSH_FRGD_CLR:
         val = s->regs.dp_brush_frgd_clr;
         break;
+    case BRUSH_DATA0 ... BRUSH_DATA63 + 3:
+    {
+        unsigned int i = (addr - BRUSH_DATA0) / sizeof(uint32_t);
+
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            val = ati_reg_read_offs(s->regs.brush_data[i],
+                                    (addr - BRUSH_DATA0) % sizeof(uint32_t),
+                                    size);
+        }
+        break;
+    }
     case DP_SRC_FRGD_CLR:
         val = s->regs.dp_src_frgd_clr;
         break;
@@ -502,6 +1108,24 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
         break;
     case DP_WRITE_MASK:
         val = s->regs.dp_write_mask;
+        break;
+    case CLR_CMP_CNTL:
+        val = s->regs.clr_cmp_cntl;
+        break;
+    case CLR_CMP_CLR_SRC:
+        val = s->regs.clr_cmp_clr_src;
+        break;
+    case CLR_CMP_CLR_DST:
+        val = s->regs.clr_cmp_clr_dst;
+        break;
+    case CLR_CMP_MASK:
+        val = s->regs.clr_cmp_mask;
+        break;
+    case RBBM_GUICNTL ... RBBM_GUICNTL + 3:
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            val = ati_reg_read_offs(s->regs.rbbm_guicntl,
+                                    addr - RBBM_GUICNTL, size);
+        }
         break;
     case DEFAULT_OFFSET:
         val = s->regs.default_offset;
@@ -552,24 +1176,30 @@ static uint64_t ati_mm_read(void *opaque, hwaddr addr, unsigned int size)
     return val;
 }
 
-static inline void ati_reg_write_offs(uint32_t *reg, int offs,
-                                      uint64_t data, unsigned int size)
+static uint16_t ati_scissor_value(const ATIVGAState *s, uint32_t value)
 {
-    if (offs == 0 && size == 4) {
-        *reg = data;
-    } else {
-        *reg = deposit32(*reg, offs * BITS_PER_BYTE, size * BITS_PER_BYTE,
-                         data);
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+        return value & 0x3fff;
     }
+
+    /* Radeon scissors use bit 15 as the sign for a 14-bit magnitude. */
+    return value & (BIT(15) | 0x3fff);
 }
 
-static void ati_mm_write(void *opaque, hwaddr addr,
-                           uint64_t data, unsigned int size)
+static uint32_t ati_brush_y_x_mask(const ATIVGAState *s)
 {
-    ATIVGAState *s = opaque;
+    return s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ? 0 :
+           R100_BRUSH_Y_X_MASK;
+}
 
+void ati_mmio_write(ATIVGAState *s, hwaddr addr, uint64_t data,
+                    unsigned int size)
+{
     if (addr < CUR_OFFSET || addr > CUR_CLR1 || ATI_DEBUG_HW_CURSOR) {
         trace_ati_mm_write(size, addr, ati_reg_name(addr & ~3ULL), data);
+    }
+    if (ati_3d_write(s, addr, data, size)) {
+        return;
     }
     switch (addr) {
     case MM_INDEX:
@@ -583,11 +1213,19 @@ static void ati_mm_write(void *opaque, hwaddr addr,
                 stn_le_p(s->vga.vram_ptr + idx, size, data);
             }
         } else if (s->regs.mm_index > MM_DATA + 3) {
-            ati_mm_write(s, s->regs.mm_index + addr - MM_DATA, data, size);
+            ati_mmio_write(s, s->regs.mm_index + addr - MM_DATA, data, size);
         } else {
             qemu_log_mask(LOG_GUEST_ERROR,
                 "ati_mm_write: mm_index too small: %u\n", s->regs.mm_index);
         }
+        break;
+    case CLOCK_CNTL_INDEX ... CLOCK_CNTL_INDEX + 3:
+        ati_reg_write_offs(&s->regs.clock_cntl_index,
+                           addr - CLOCK_CNTL_INDEX, data, size);
+        s->regs.clock_cntl_index &= PLL_INDEX_CNTL_MASK;
+        break;
+    case CLOCK_CNTL_DATA ... CLOCK_CNTL_DATA + 3:
+        ati_pll_write(s, addr, data, size);
         break;
     case BIOS_0_SCRATCH ... BUS_CNTL - 1:
     {
@@ -601,40 +1239,67 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     }
     case GEN_INT_CNTL:
         s->regs.gen_int_cntl = data;
-        if (data & CRTC_VBLANK_INT) {
-            ati_vga_vblank_irq(s);
-        } else {
-            timer_del(&s->vblank_timer);
-            ati_vga_update_irq(s);
-        }
-        break;
-    case GEN_INT_STATUS:
-        data &= (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
-                 0x000f040fUL : 0xfc080effUL);
-        s->regs.gen_int_status &= ~data;
         ati_vga_update_irq(s);
         break;
+    case GEN_INT_STATUS:
+    {
+        bool fire = ati_is_rv100_family(s) && (data & SW_INT_FIRE);
+
+        data &= (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
+                 0x000f040fUL : 0xfe080effUL);
+        s->regs.gen_int_status &= ~data;
+        if (fire) {
+            s->regs.gen_int_status |= SW_INT_TEST;
+        }
+        ati_vga_update_irq(s);
+        break;
+    }
+    case CRTC_STATUS ... CRTC_STATUS + 3:
+    {
+        uint32_t value = s->crtc_fix_vsync_timing ?
+                         CRTC_FIX_VSYNC_TIMING : 0;
+
+        ati_reg_write_offs(&value, addr - CRTC_STATUS, data, size);
+        if (value & CRTC_VBLANK_SAVE) {
+            s->crtc_vblank_save = false;
+        }
+        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            s->crtc_fix_vsync_timing = value & CRTC_FIX_VSYNC_TIMING;
+        }
+        break;
+    }
     case CRTC_GEN_CNTL ... CRTC_GEN_CNTL + 3:
     {
         uint32_t val = s->regs.crtc_gen_cntl;
+        uint32_t cursor_mask = CRTC2_CUR_EN;
+        bool was_enabled = ati_crtc_enabled(s);
+
+        if (ati_is_rv100_family(s)) {
+            cursor_mask |= R100_CRTC_CUR_MODE_MASK;
+        }
         ati_reg_write_offs(&s->regs.crtc_gen_cntl,
                            addr - CRTC_GEN_CNTL, data, size);
         if ((val & CRTC2_CUR_EN) != (s->regs.crtc_gen_cntl & CRTC2_CUR_EN)) {
             ati_vga_switch_mode(s);
+        }
+        if ((val & cursor_mask) !=
+            (s->regs.crtc_gen_cntl & cursor_mask)) {
             if (s->cursor_guest_mode) {
-                s->vga.force_shadow = !!(s->regs.crtc_gen_cntl & CRTC2_CUR_EN);
+                ati_cursor_update_guest_mode(s);
             } else {
-                if (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) {
-                    ati_cursor_define(s);
-                }
-                dpy_mouse_set(s->vga.con, s->regs.cur_hv_pos >> 16,
-                              s->regs.cur_hv_pos & 0xffff,
-                              (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) != 0);
+                ati_cursor_update_host(s, true);
             }
         }
         if ((val & (CRTC2_EXT_DISP_EN | CRTC2_EN)) !=
             (s->regs.crtc_gen_cntl & (CRTC2_EXT_DISP_EN | CRTC2_EN))) {
             ati_vga_switch_mode(s);
+        }
+        if (was_enabled != ati_crtc_enabled(s)) {
+            if (ati_crtc_enabled(s)) {
+                ati_crtc_start(s);
+            } else {
+                timer_del(&s->vblank_timer);
+            }
         }
         break;
     }
@@ -669,7 +1334,15 @@ static void ati_mm_write(void *opaque, hwaddr addr,
      */
     case GPIO_VGA_DDC ... GPIO_VGA_DDC + 3:
         if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
-            /* FIXME: Maybe add a property to select VGA or DVI port? */
+            ati_reg_write_offs(&s->regs.gpio_vga_ddc,
+                               addr - GPIO_VGA_DDC, data, size);
+            if ((addr <= GPIO_VGA_DDC + 2 &&
+                 addr + size > GPIO_VGA_DDC + 2) ||
+                (addr == GPIO_VGA_DDC &&
+                 (s->regs.gpio_vga_ddc & 0x30000))) {
+                s->regs.gpio_vga_ddc = ati_i2c(&s->bbi2c,
+                                               s->regs.gpio_vga_ddc, 0);
+            }
         }
         break;
     case GPIO_DVI_DDC ... GPIO_DVI_DDC + 3:
@@ -684,7 +1357,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         }
         break;
     case GPIO_MONID ... GPIO_MONID + 3:
-        /* FIXME What does Radeon have here? */
+        /* TODO: Implement Radeon MONID GPIO behavior. */
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
             /* Rage128p accesses DDC via MONID(1-2) with additional mask bit */
             ati_reg_write_offs(&s->regs.gpio_monid,
@@ -726,30 +1399,93 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     case CNFG_CNTL:
         s->regs.config_cntl = data;
         break;
-    case CRTC_H_TOTAL_DISP:
-        s->regs.crtc_h_total_disp = data & 0x07ff07ff;
+    case CRTC_H_TOTAL_DISP ... CRTC_H_TOTAL_DISP + 3:
+    {
+        uint32_t value = s->regs.crtc_h_total_disp;
+
+        ati_reg_write_offs(&value, addr - CRTC_H_TOTAL_DISP, data, size);
+        s->regs.crtc_h_total_disp = value &
+                                    ati_crtc_h_total_disp_mask(s);
         break;
-    case CRTC_H_SYNC_STRT_WID:
-        s->regs.crtc_h_sync_strt_wid = data & 0x17bf1fff;
+    }
+    case CRTC_H_SYNC_STRT_WID ... CRTC_H_SYNC_STRT_WID + 3:
+    {
+        uint32_t value = s->regs.crtc_h_sync_strt_wid;
+
+        ati_reg_write_offs(&value, addr - CRTC_H_SYNC_STRT_WID, data,
+                           size);
+        s->regs.crtc_h_sync_strt_wid = value & ati_crtc_h_sync_mask(s);
         break;
-    case CRTC_V_TOTAL_DISP:
-        s->regs.crtc_v_total_disp = data & 0x0fff0fff;
+    }
+    case CRTC_V_TOTAL_DISP ... CRTC_V_TOTAL_DISP + 3:
+    {
+        uint32_t value = s->regs.crtc_v_total_disp;
+
+        ati_reg_write_offs(&value, addr - CRTC_V_TOTAL_DISP, data, size);
+        s->regs.crtc_v_total_disp = value &
+            (ati_is_rv100_family(s) ? 0x0fff0fff : 0x07ff07ff);
+        ati_crtc_reschedule(s);
         break;
-    case CRTC_V_SYNC_STRT_WID:
-        s->regs.crtc_v_sync_strt_wid = data & 0x9f0fff;
+    }
+    case CRTC_V_SYNC_STRT_WID ... CRTC_V_SYNC_STRT_WID + 3:
+    {
+        uint32_t value = s->regs.crtc_v_sync_strt_wid;
+
+        ati_reg_write_offs(&value, addr - CRTC_V_SYNC_STRT_WID, data,
+                           size);
+        s->regs.crtc_v_sync_strt_wid = value &
+            (ati_is_rv100_family(s) ? 0x009f0fff : 0x009f07ff);
+        ati_crtc_reschedule(s);
         break;
+    }
+    case CRTC_VLINE_CRNT_VLINE ... CRTC_VLINE_CRNT_VLINE + 3:
+    {
+        uint32_t value = s->crtc_vline;
+
+        ati_reg_write_offs(&value, addr - CRTC_VLINE_CRNT_VLINE,
+                           data, size);
+        s->crtc_vline = value & ati_crtc_line_mask(s);
+        ati_crtc_reschedule(s);
+        break;
+    }
     case CRTC_OFFSET:
-        s->regs.crtc_offset = data & 0x87fffff8;
-        ati_vga_set_offset(&s->vga, s->regs.crtc_offset & 0x07ffffff);
+    {
+        uint32_t old = s->regs.crtc_offset;
+        uint32_t value = data & (CRTC_OFFSET_MASK | CRTC_OFFSET_LOCK);
+
+        if (!ati_crtc_enabled(s)) {
+            s->regs.crtc_offset = value;
+            s->crtc_offset_active = value & CRTC_OFFSET_MASK;
+            s->crtc_pitch_active = s->regs.crtc_pitch;
+            ati_vga_set_offset(&s->vga, s->crtc_offset_active);
+        } else if (value & CRTC_OFFSET_LOCK) {
+            s->regs.crtc_offset = value | CRTC_OFFSET_GUI_TRIG_OFFSET;
+        } else if (old & (CRTC_OFFSET_LOCK |
+                          CRTC_OFFSET_GUI_TRIG_OFFSET)) {
+            s->regs.crtc_offset = value | CRTC_OFFSET_GUI_TRIG_OFFSET;
+            if (!timer_pending(&s->vblank_timer)) {
+                ati_crtc_reschedule(s);
+            }
+        } else {
+            s->regs.crtc_offset = value;
+            s->crtc_offset_active = value & CRTC_OFFSET_MASK;
+            ati_vga_set_offset(&s->vga, s->crtc_offset_active);
+            graphic_hw_invalidate(s->vga.con);
+        }
         break;
+    }
     case CRTC_OFFSET_CNTL:
-        s->regs.crtc_offset_cntl = data; /* FIXME */
+        /* TODO: Implement CRTC scanout tiling selected by this register. */
+        s->regs.crtc_offset_cntl = data;
         break;
     case CRTC_PITCH:
         data &= 0x07ff07ff;
         if (s->regs.crtc_pitch != data) {
             s->regs.crtc_pitch = data;
-            ati_vga_switch_mode(s);
+            if (!(s->regs.crtc_offset & CRTC_OFFSET_GUI_TRIG_OFFSET)) {
+                s->crtc_pitch_active = data;
+                ati_vga_switch_mode(s);
+            }
         }
         break;
     case 0xf00 ... 0xfff:
@@ -763,12 +1499,16 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         t &= 0x87fffff0;
         if (s->regs.cur_offset != t) {
             s->regs.cur_offset = t;
-            ati_cursor_define(s);
+            if (!(t & BIT(31))) {
+                ati_cursor_commit(s);
+                ati_cursor_changed(s, true);
+            }
         }
         break;
     }
     case CUR_HORZ_VERT_POSN ... CUR_HORZ_VERT_POSN + 3:
     {
+        bool was_locked = s->regs.cur_offset & BIT(31);
         uint32_t t = s->regs.cur_hv_pos | (s->regs.cur_offset & BIT(31));
 
         ati_reg_write_offs(&t, addr - CUR_HORZ_VERT_POSN, data, size);
@@ -777,16 +1517,14 @@ static void ati_mm_write(void *opaque, hwaddr addr,
             s->regs.cur_offset |= t & BIT(31);
         } else if (s->regs.cur_offset & BIT(31)) {
             s->regs.cur_offset &= ~BIT(31);
-            ati_cursor_define(s);
         }
-        if (!s->cursor_guest_mode &&
-            (s->regs.crtc_gen_cntl & CRTC2_CUR_EN) && !(t & BIT(31))) {
-            dpy_mouse_set(s->vga.con, s->regs.cur_hv_pos >> 16,
-                          s->regs.cur_hv_pos & 0xffff, true);
+        if (!(t & BIT(31))) {
+            ati_cursor_commit(s);
+            ati_cursor_changed(s, was_locked);
         }
         break;
     }
-    case CUR_HORZ_VERT_OFF:
+    case CUR_HORZ_VERT_OFF ... CUR_HORZ_VERT_OFF + 3:
     {
         uint32_t t = s->regs.cur_hv_offs | (s->regs.cur_offset & BIT(31));
 
@@ -796,7 +1534,10 @@ static void ati_mm_write(void *opaque, hwaddr addr,
             s->regs.cur_offset |= t & BIT(31);
         } else if (s->regs.cur_offset & BIT(31)) {
             s->regs.cur_offset &= ~BIT(31);
-            ati_cursor_define(s);
+        }
+        if (!(t & BIT(31))) {
+            ati_cursor_commit(s);
+            ati_cursor_changed(s, true);
         }
         break;
     }
@@ -808,7 +1549,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         t &= 0xffffff;
         if (s->regs.cur_color0 != t) {
             s->regs.cur_color0 = t;
-            ati_cursor_define(s);
+            ati_cursor_changed(s, true);
         }
         break;
     }
@@ -820,7 +1561,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
          */
         ati_reg_write_offs(&s->regs.cur_color1, addr - CUR_CLR1, data, size);
         s->regs.cur_color1 &= 0xffffff;
-        ati_cursor_define(s);
+        ati_cursor_changed(s, true);
         break;
     case DST_OFFSET:
             s->regs.dst_offset = data & 0xfffffff0;
@@ -832,7 +1573,7 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         }
         break;
     case DST_TILE:
-        if (s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY) {
+        if (ati_is_rv100_family(s)) {
             s->regs.dst_tile = data & 3;
         }
         break;
@@ -895,6 +1636,18 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         s->regs.dp_datatype = (data & 0x0f00) >> 8 | (data & 0x30f0) << 4 |
                               (data & 0x4000) << 16;
         s->regs.dp_mix = (data & GMC_ROP3_MASK) | (data & 0x7000000) >> 16;
+        s->regs.dp_cntl |= DST_Y_TOP_TO_BOTTOM;
+        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            s->regs.dp_cntl |= DST_X_LEFT_TO_RIGHT;
+        }
+        if (data & GMC_WRITE_MASK_SET) {
+            s->regs.dp_write_mask = UINT32_MAX;
+            s->regs.clr_cmp_mask = UINT32_MAX;
+        }
+        if (data & GMC_DST_CLR_CMP_FCN_CLEAR) {
+            s->regs.clr_cmp_cntl &=
+                ~(CLR_CMP_FN_SRC_MASK | CLR_CMP_FN_DST_MASK);
+        }
 
         if (!(data & GMC_SRC_PITCH_OFFSET_CNTL)) {
             s->regs.src_offset = s->regs.default_offset;
@@ -913,6 +1666,13 @@ static void ati_mm_write(void *opaque, hwaddr addr,
             s->regs.sc_left = 0;
             s->regs.sc_right = s->regs.default_sc_right;
             s->regs.sc_bottom = s->regs.default_sc_bottom;
+        }
+        break;
+    case BRUSH_Y_X ... BRUSH_Y_X + 3:
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            ati_reg_write_offs(&s->regs.brush_y_x, addr - BRUSH_Y_X,
+                               data, size);
+            s->regs.brush_y_x &= ati_brush_y_x_mask(s);
         }
         break;
     case DST_WIDTH_X:
@@ -952,6 +1712,17 @@ static void ati_mm_write(void *opaque, hwaddr addr,
     case DP_BRUSH_FRGD_CLR:
         s->regs.dp_brush_frgd_clr = data;
         break;
+    case BRUSH_DATA0 ... BRUSH_DATA63 + 3:
+    {
+        unsigned int i = (addr - BRUSH_DATA0) / sizeof(uint32_t);
+
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            ati_reg_write_offs(&s->regs.brush_data[i],
+                               (addr - BRUSH_DATA0) % sizeof(uint32_t),
+                               data, size);
+        }
+        break;
+    }
     case DP_CNTL:
         s->regs.dp_cntl = data;
         break;
@@ -962,13 +1733,36 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         s->regs.dp_src_bkgd_clr = data;
         break;
     case DP_DATATYPE:
-        s->regs.dp_datatype = data & 0xe0070f0f;
+        s->regs.dp_datatype = data &
+            (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF ?
+             0xe0070f0f : 0xc0070f0f);
         break;
     case DP_MIX:
         s->regs.dp_mix = data & 0x00ff0700;
         break;
     case DP_WRITE_MASK:
         s->regs.dp_write_mask = data;
+        break;
+    case CLR_CMP_CNTL:
+        s->regs.clr_cmp_cntl = data &
+            (CLR_CMP_FN_SRC_MASK | CLR_CMP_FN_DST_MASK |
+             CLR_CMP_ENABLE_MASK);
+        break;
+    case CLR_CMP_CLR_SRC:
+        s->regs.clr_cmp_clr_src = data;
+        break;
+    case CLR_CMP_CLR_DST:
+        s->regs.clr_cmp_clr_dst = data;
+        break;
+    case CLR_CMP_MASK:
+        s->regs.clr_cmp_mask = data;
+        break;
+    case RBBM_GUICNTL ... RBBM_GUICNTL + 3:
+        if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            ati_reg_write_offs(&s->regs.rbbm_guicntl,
+                               addr - RBBM_GUICNTL, data, size);
+            s->regs.rbbm_guicntl &= HOST_DATA_SWAP_MASK;
+        }
         break;
     case DEFAULT_OFFSET:
         if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
@@ -991,34 +1785,34 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         s->regs.default_sc_bottom = (data >> 16) & 0x3fff;
         break;
     case SC_TOP_LEFT:
-        s->regs.sc_left = data & 0x3fff;
-        s->regs.sc_top = (data >> 16) & 0x3fff;
+        s->regs.sc_left = ati_scissor_value(s, data);
+        s->regs.sc_top = ati_scissor_value(s, data >> 16);
         break;
     case SC_LEFT:
-        s->regs.sc_left = data & 0x3fff;
+        s->regs.sc_left = ati_scissor_value(s, data);
         break;
     case SC_TOP:
-        s->regs.sc_top = data & 0x3fff;
+        s->regs.sc_top = ati_scissor_value(s, data);
         break;
     case SC_BOTTOM_RIGHT:
-        s->regs.sc_right = data & 0x3fff;
-        s->regs.sc_bottom = (data >> 16) & 0x3fff;
+        s->regs.sc_right = ati_scissor_value(s, data);
+        s->regs.sc_bottom = ati_scissor_value(s, data >> 16);
         break;
     case SC_RIGHT:
-        s->regs.sc_right = data & 0x3fff;
+        s->regs.sc_right = ati_scissor_value(s, data);
         break;
     case SC_BOTTOM:
-        s->regs.sc_bottom = data & 0x3fff;
+        s->regs.sc_bottom = ati_scissor_value(s, data);
         break;
     case SRC_SC_BOTTOM_RIGHT:
-        s->regs.src_sc_right = data & 0x3fff;
-        s->regs.src_sc_bottom = (data >> 16) & 0x3fff;
+        s->regs.src_sc_right = ati_scissor_value(s, data);
+        s->regs.src_sc_bottom = ati_scissor_value(s, data >> 16);
         break;
     case SRC_SC_RIGHT:
-        s->regs.src_sc_right = data & 0x3fff;
+        s->regs.src_sc_right = ati_scissor_value(s, data);
         break;
     case SRC_SC_BOTTOM:
-        s->regs.src_sc_bottom = data & 0x3fff;
+        s->regs.src_sc_bottom = ati_scissor_value(s, data);
         break;
     case HOST_DATA0:
     case HOST_DATA1:
@@ -1032,18 +1826,17 @@ static void ati_mm_write(void *opaque, hwaddr addr,
         if (!s->host_data.active) {
             break;
         }
-        s->host_data.acc[s->host_data.next++] = data;
-        if (addr == HOST_DATA_LAST) {
-            ati_host_data_finish(s);
-            s->host_data.next = 0;
-        } else if (s->host_data.next >= 4) {
-            ati_host_data_flush(s);
-            s->host_data.next = 0;
-        }
+        ati_host_data_write(s, data, addr == HOST_DATA_LAST);
         break;
     default:
         break;
     }
+}
+
+static void ati_mm_write(void *opaque, hwaddr addr, uint64_t data,
+                         unsigned int size)
+{
+    ati_mmio_write(opaque, addr, data, size);
 }
 
 static const MemoryRegionOps ati_mm_ops = {
@@ -1126,7 +1919,20 @@ static const VMStateDescription vmstate_ati_host_data = {
         VMSTATE_UINT32(row, ATIHostDataState),
         VMSTATE_UINT32(col, ATIHostDataState),
         VMSTATE_UINT32(next, ATIHostDataState),
-        VMSTATE_UINT32_ARRAY(acc, ATIHostDataState, 4),
+        VMSTATE_UINT32_ARRAY(acc, ATIHostDataState,
+                             ATI_HOST_DATA_BANK_DWORDS),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_ati_cursor = {
+    .name = "ati-vga/cursor",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(offset, ATICursorState),
+        VMSTATE_UINT32(hv_pos, ATICursorState),
+        VMSTATE_UINT32(hv_offs, ATICursorState),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1147,29 +1953,124 @@ static const VMStateDescription vmstate_ati_bitbang_i2c = {
     },
 };
 
+static int ati_vga_pre_save(void *opaque)
+{
+    ATIVGAState *s = opaque;
+    int64_t elapsed;
+
+    if (!ati_crtc_enabled(s)) {
+        s->crtc_frame_elapsed_ns = 0;
+        return 0;
+    }
+    elapsed = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+              s->crtc_frame_start_ns;
+    s->crtc_frame_elapsed_ns = elapsed > 0 ?
+                               elapsed % ATI_CRTC_FRAME_NS : 0;
+    return 0;
+}
+
 static int ati_vga_post_load(void *opaque, int version_id)
 {
     ATIVGAState *s = opaque;
-    bool cursor_enabled = s->regs.crtc_gen_cntl & CRTC2_CUR_EN;
 
-    if (s->host_data.next >= ARRAY_SIZE(s->host_data.acc) ||
-        s->bbi2c.state < STOPPED || s->bbi2c.state > SENT_NACK) {
+    if (s->host_data.next >= ATI_HOST_DATA_BANK_DWORDS ||
+        (version_id >= 3 &&
+         s->regs.brush_y_x & ~ati_brush_y_x_mask(s)) ||
+        (version_id >= 3 && s->host_data.pending_count > 3) ||
+        (version_id >= 3 &&
+         s->regs.rbbm_guicntl & ~HOST_DATA_SWAP_MASK) ||
+        (version_id >= 3 &&
+         s->regs.clr_cmp_cntl &
+         ~(CLR_CMP_FN_SRC_MASK | CLR_CMP_FN_DST_MASK |
+           CLR_CMP_ENABLE_MASK)) ||
+        (version_id >= 4 && (s->regs.cur_offset & BIT(31)) &&
+         (s->cursor_active.offset & ~0x07fffff0U ||
+          s->cursor_active.hv_pos & ~0x3fff0fffU ||
+          s->cursor_active.hv_offs & ~0x003f003fU)) ||
+        (version_id >= 4 &&
+         (s->crtc_frame & ~ATI_CRTC_FRAME_MASK ||
+          s->crtc_frame_elapsed_ns < 0 ||
+          s->crtc_frame_elapsed_ns >= ATI_CRTC_FRAME_NS ||
+          s->crtc_vline & ~ati_crtc_line_mask(s) ||
+          (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
+           s->crtc_fix_vsync_timing))) ||
+        (version_id >= 5 &&
+         (s->regs.clock_cntl_index & ~PLL_INDEX_CNTL_MASK)) ||
+        s->bbi2c.state < STOPPED || s->bbi2c.state > SENT_NACK ||
+        s->bbi2c.last_data < 0 || s->bbi2c.last_data > 1 ||
+        s->bbi2c.last_clock < 0 || s->bbi2c.last_clock > 1 ||
+        s->bbi2c.device_out < 0 || s->bbi2c.device_out > 1 ||
+        s->bbi2c.current_addr < -1 ||
+        s->bbi2c.current_addr > UINT8_MAX) {
         return -EINVAL;
     }
-
+    if (version_id >= 2 && ati_3d_post_load(s) < 0) {
+        return -EINVAL;
+    }
+    if (version_id < 3) {
+        memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
+        s->host_data.pending_count = 0;
+        s->regs.rbbm_guicntl = 0;
+        s->regs.clr_cmp_cntl = 0;
+        s->regs.clr_cmp_clr_src = 0;
+        s->regs.clr_cmp_clr_dst = 0;
+        s->regs.clr_cmp_mask = 0;
+        s->regs.brush_y_x = 0;
+        memset(s->regs.brush_data, 0, sizeof(s->regs.brush_data));
+        memset(s->r100_3d.fog_table, 0,
+               sizeof(s->r100_3d.fog_table));
+        s->r100_3d.fog_table_index = 0;
+        /* Older versions did not apply DP_WRITE_MASK to 2D blits. */
+        s->regs.dp_write_mask = UINT32_MAX;
+        s->crtc_offset_active = s->regs.crtc_offset & CRTC_OFFSET_MASK;
+        s->crtc_pitch_active = s->regs.crtc_pitch;
+    }
+    if (version_id < 4 || !(s->regs.cur_offset & BIT(31))) {
+        ati_cursor_commit(s);
+    }
+    if (version_id < 5) {
+        s->regs.clock_cntl_index = 0;
+        memset(s->regs.pll, 0, sizeof(s->regs.pll));
+    }
+    if (version_id < 4) {
+        s->crtc_frame_start_ns = 0;
+        s->crtc_frame_elapsed_ns = 0;
+        s->crtc_frame = 0;
+        s->crtc_event_line = 0;
+        s->crtc_vline = 0;
+        s->crtc_vblank_save = false;
+        s->crtc_fix_vsync_timing =
+            s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF;
+        timer_del(&s->vblank_timer);
+        ati_crtc_start(s);
+    } else if (!ati_crtc_enabled(s)) {
+        s->crtc_frame_start_ns = 0;
+        timer_del(&s->vblank_timer);
+    } else {
+        s->crtc_frame_start_ns =
+            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+            s->crtc_frame_elapsed_ns;
+        timer_del(&s->vblank_timer);
+        ati_crtc_reschedule(s);
+    }
     s->mode = s->regs.crtc_gen_cntl & CRTC2_EXT_DISP_EN ?
               EXT_MODE : VGA_MODE;
     s->vga.graphic_mode = -1;
+    s->cursor_width = 0;
+    s->cursor_height = 0;
+    s->cursor_mode = 0;
+    s->cursor_x_offset = 0;
+    s->cursor_offset = 0;
+    s->cursor_image_valid = false;
+    s->cursor_host_visible = false;
+    s->cursor_host_x = 0;
+    s->cursor_host_y = 0;
     if (s->cursor_guest_mode) {
-        s->vga.force_shadow = cursor_enabled;
-        s->cursor_size = UINT16_MAX;
+        s->vga.force_shadow = false;
+        ati_cursor_update_guest_mode(s);
     } else {
         s->vga.force_shadow = false;
-        if (cursor_enabled) {
-            ati_cursor_define(s);
-        }
-        dpy_mouse_set(s->vga.con, s->regs.cur_hv_pos >> 16,
-                      s->regs.cur_hv_pos & 0xffff, cursor_enabled);
+        ati_cursor_update_host(s, true);
     }
     ati_vga_update_irq(s);
     graphic_hw_invalidate(s->vga.con);
@@ -1178,8 +2079,9 @@ static int ati_vga_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_ati_vga = {
     .name = "ati-vga",
-    .version_id = 1,
+    .version_id = 5,
     .minimum_version_id = 1,
+    .pre_save = ati_vga_pre_save,
     .post_load = ati_vga_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, ATIVGAState),
@@ -1187,8 +2089,34 @@ static const VMStateDescription vmstate_ati_vga = {
                        vmstate_vga_common, VGACommonState),
         VMSTATE_STRUCT(regs, ATIVGAState, 0,
                        vmstate_ati_vga_regs, ATIVGARegs),
+        VMSTATE_STRUCT(cursor_active, ATIVGAState, 4,
+                       vmstate_ati_cursor, ATICursorState),
         VMSTATE_STRUCT(host_data, ATIVGAState, 0,
                        vmstate_ati_host_data, ATIHostDataState),
+        VMSTATE_UINT8_ARRAY_V(host_data.pending, ATIVGAState, 3, 3),
+        VMSTATE_UINT8_V(host_data.pending_count, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.rbbm_guicntl, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.clr_cmp_cntl, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.clr_cmp_clr_src, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.clr_cmp_clr_dst, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.clr_cmp_mask, ATIVGAState, 3),
+        VMSTATE_UINT32_V(regs.brush_y_x, ATIVGAState, 3),
+        VMSTATE_UINT32_ARRAY_V(regs.brush_data, ATIVGAState, 64, 3),
+        VMSTATE_STRUCT(r100_3d, ATIVGAState, 2,
+                       vmstate_ati_3d, ATI3DState),
+        VMSTATE_UINT8_ARRAY_V(r100_3d.fog_table, ATIVGAState,
+                              ATI_3D_FOG_TABLE_ENTRIES, 3),
+        VMSTATE_UINT8_V(r100_3d.fog_table_index, ATIVGAState, 3),
+        VMSTATE_UINT32_V(crtc_offset_active, ATIVGAState, 3),
+        VMSTATE_UINT32_V(crtc_pitch_active, ATIVGAState, 3),
+        VMSTATE_INT64_V(crtc_frame_elapsed_ns, ATIVGAState, 4),
+        VMSTATE_UINT32_V(crtc_frame, ATIVGAState, 4),
+        VMSTATE_UINT16_V(crtc_vline, ATIVGAState, 4),
+        VMSTATE_BOOL_V(crtc_vblank_save, ATIVGAState, 4),
+        VMSTATE_BOOL_V(crtc_fix_vsync_timing, ATIVGAState, 4),
+        VMSTATE_UINT32_V(regs.clock_cntl_index, ATIVGAState, 5),
+        VMSTATE_UINT32_ARRAY_V(regs.pll, ATIVGAState,
+                               ATI_PLL_REG_COUNT, 5),
         VMSTATE_STRUCT(bbi2c, ATIVGAState, 0,
                        vmstate_ati_bitbang_i2c, bitbang_i2c_interface),
         VMSTATE_TIMER(vblank_timer, ATIVGAState),
@@ -1222,15 +2150,41 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
         }
     }
     if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF &&
-        s->dev_id != PCI_DEVICE_ID_ATI_RADEON_QY) {
+        !ati_is_rv100_family(s)) {
         error_setg(errp, "Unknown ATI VGA device id, "
-                   "only 0x5046 and 0x5159 are supported");
+                   "only 0x5046, 0x5159 and 0x515e are supported");
         return;
     }
     pci_set_word(dev->config + PCI_DEVICE_ID, s->dev_id);
 
-    if (s->dev_id == PCI_DEVICE_ID_ATI_RADEON_QY &&
-        s->vga.vram_size_mb < 16) {
+    if (s->dev_id == PCI_DEVICE_ID_ATI_ES1000) {
+        int pm_cap = pci_pm_init(dev, 0x50, errp);
+
+        if (pm_cap < 0) {
+            return;
+        }
+        /* ES1000 advertises PCI PM 1.1 (reported as version 2). */
+        pci_set_word(dev->config + pm_cap + PCI_PM_PMC,
+                     PCI_PM_CAP_VER_1_1 | PCI_PM_CAP_D1 | PCI_PM_CAP_D2);
+        pci_set_word(dev->wmask + pm_cap + PCI_PM_CTRL,
+                     PCI_PM_CTRL_STATE_MASK);
+        if (dev->romsize == UINT32_MAX) {
+            dev->romsize = 128 * KiB;
+        }
+    }
+
+    if (s->dev_id == PCI_DEVICE_ID_ATI_ES1000) {
+        pci_set_byte(dev->config + PCI_REVISION_ID, 0x02);
+        pci_set_word(dev->config + PCI_SUBSYSTEM_VENDOR_ID,
+                     PCI_VENDOR_ID_HP);
+        pci_set_word(dev->config + PCI_SUBSYSTEM_ID,
+                     0x31fb);
+        pci_set_byte(dev->config + PCI_CACHE_LINE_SIZE, 0x10);
+        pci_set_byte(dev->config + PCI_LATENCY_TIMER, 0x40);
+        pci_set_byte(dev->config + PCI_MIN_GNT, 0x08);
+    }
+
+    if (ati_is_rv100_family(s) && s->vga.vram_size_mb < 16) {
         warn_report("Too small video memory for device id");
         s->vga.vram_size_mb = 16;
     }
@@ -1242,7 +2196,7 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     vga->vbe_legacy_mode_switch = true;
     vga_init(vga, OBJECT(s), pci_address_space(dev),
              pci_address_space_io(dev), true);
-    vga->con = graphic_console_init(DEVICE(s), 0, s->vga.hw_ops, vga);
+    vga->con = graphic_console_init(DEVICE(s), 0, &ati_graphic_ops, s);
     if (s->cursor_guest_mode) {
         vga->cursor_invalidate = ati_cursor_invalidate;
         vga->cursor_draw_line = ati_cursor_draw_line;
@@ -1256,7 +2210,8 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
 
     /* mmio register space */
     memory_region_init_io(&s->mm, OBJECT(s), &ati_mm_ops, s,
-                          "ati.mmregs", 0x4000);
+                          "ati.mmregs", ati_is_rv100_family(s) ?
+                          ATI_R100_MMIO_SIZE : ATI_RAGE128_MMIO_SIZE);
     /* io space is alias to beginning of mmregs */
     memory_region_init_alias(&s->io, OBJECT(s), "ati.io", &s->mm, 0, 0x100);
 
@@ -1280,6 +2235,10 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
         error_setg(errp, "x-linear-aper-size is too small (minimum 16 MiB)");
         return;
     }
+    if (!is_power_of_2(s->linear_aper_sz)) {
+        error_setg(errp, "x-linear-aper-size must be a power of two");
+        return;
+    }
     memory_region_init(&s->linear_aper, OBJECT(dev), "ati-linear-aperture0",
                        s->linear_aper_sz);
     memory_region_add_subregion(&s->linear_aper, 0, &vga->vram);
@@ -1288,9 +2247,9 @@ static void ati_vga_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_IO, &s->io);
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY, &s->mm);
 
-    /* most interrupts are not yet emulated but MacOS needs at least VBlank */
+    /* TODO: Implement the remaining ATI interrupt sources. */
     dev->config[PCI_INTERRUPT_PIN] = 1;
-    timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, ati_vga_vblank_irq, s);
+    timer_init_ns(&s->vblank_timer, QEMU_CLOCK_VIRTUAL, ati_crtc_event, s);
 }
 
 static void ati_vga_reset(DeviceState *dev)
@@ -1298,16 +2257,62 @@ static void ati_vga_reset(DeviceState *dev)
     ATIVGAState *s = ATI_VGA(dev);
 
     timer_del(&s->vblank_timer);
+    i2c_end_transfer(s->bbi2c.bus);
+    bitbang_i2c_init(&s->bbi2c, s->bbi2c.bus);
+    s->bbi2c.state = STOPPED;
+    s->bbi2c.buffer = 0;
+    s->bbi2c.current_addr = -1;
+
+    /* Reset mutable MMIO state, then apply the modeled device defaults. */
+    memset(&s->regs, 0, sizeof(s->regs));
+    s->crtc_frame_start_ns = 0;
+    s->crtc_frame_elapsed_ns = 0;
+    s->crtc_frame = 0;
+    s->crtc_event_line = 0;
+    s->crtc_vline = 0;
+    s->crtc_vblank_save = false;
+    s->crtc_fix_vsync_timing =
+        s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF;
+    s->crtc_offset_active = 0;
+    s->crtc_pitch_active = 0;
+    s->regs.crtc_gen_cntl = ATI_CRTC_GEN_CNTL_RESET;
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+        /* Rage128's documented reset fields differ from Radeon R100. */
+        s->regs.gen_int_status = ATI_RAGE128_GEN_INT_STATUS_RESET;
+        s->regs.crtc_ext_cntl = ATI_RAGE128_CRTC_EXT_CNTL_RESET;
+        s->regs.dac_cntl = ATI_RAGE128_DAC_CNTL_RESET;
+    } else if (ati_is_rv100_family(s)) {
+        s->regs.gen_int_status = ATI_R100_GEN_INT_STATUS_RESET;
+        s->regs.dac_cntl = ATI_R100_DAC_CNTL_RESET;
+        s->regs.crtc_offset_cntl = ATI_RV100_CRTC_OFFSET_CNTL_RESET;
+    }
+    s->regs.gpio_vga_ddc = BIT(8) | BIT(9);
+    s->regs.gpio_dvi_ddc = BIT(8) | BIT(9);
+    s->regs.gpio_monid = BIT(9) | BIT(10);
+    ati_cursor_commit(s);
     ati_vga_update_irq(s);
 
     /* reset vga */
     vga_common_reset(&s->vga);
     s->mode = VGA_MODE;
+    s->vga.big_endian_fb = s->vga.default_endian_fb;
+    s->vga.force_shadow = false;
+    s->cursor_width = 0;
+    s->cursor_height = 0;
+    s->cursor_mode = 0;
+    s->cursor_x_offset = 0;
+    s->cursor_offset = 0;
+    s->cursor_image_valid = false;
+    s->cursor_host_visible = false;
+    s->cursor_host_x = 0;
+    s->cursor_host_y = 0;
+    if (!s->cursor_guest_mode) {
+        dpy_mouse_set(s->vga.con, 0, 0, false);
+    }
 
-    s->host_data.active = false;
-    s->host_data.next = 0;
-    s->host_data.row = 0;
-    s->host_data.col = 0;
+    memset(&s->host_data, 0, sizeof(s->host_data));
+    ati_3d_reset(s);
+    graphic_hw_invalidate(s->vga.con);
 }
 
 static void ati_vga_exit(PCIDevice *dev)
@@ -1316,6 +2321,8 @@ static void ati_vga_exit(PCIDevice *dev)
 
     timer_del(&s->vblank_timer);
     graphic_console_close(s->vga.con);
+    cursor_unref(s->cursor);
+    s->cursor = NULL;
 }
 
 static const Property ati_vga_properties[] = {

@@ -95,6 +95,8 @@
 #define IA64_E1000_IO_SIZE      0x00000040U
 #define IA64_VGA_FB_PCI_BASE    0x00000000c4000000ULL
 #define IA64_VGA_MMIO_PCI_BASE  0x00000000c8000000ULL
+#define IA64_VGA_LARGE_FB_PCI_BASE   0x00000000c8000000ULL
+#define IA64_VGA_LARGE_MMIO_PCI_BASE 0x00000000d0000000ULL
 #define IA64_VGA_LEGACY_BASE   0x000a0000U
 #define IA64_VGA_LEGACY_SIZE   0x00020000U
 #ifdef CONFIG_IA64_VPC_GRAPHICS
@@ -123,8 +125,7 @@
 #define IA64_VBE_NATIVE_MODE_16 0x1f0U
 #define IA64_VBE_NATIVE_MODE_24 0x1f1U
 #define IA64_VBE_NATIVE_MODE_32 0x1f2U
-#define IA64_VGA_FIXED_FB_SIZE  (IA64_VGA_MMIO_PCI_BASE - \
-                                 IA64_VGA_FB_PCI_BASE)
+#define IA64_VGA_FIXED_FB_SIZE  (128 * MiB)
 #define IA64_VGA_PLANAR_MEMORY_SIZE (256 * KiB)
 #define IA64_BDA_VIDEO_MODE      0x00000449U
 #define IA64_BDA_VIDEO_COLUMNS   0x0000044aU
@@ -139,7 +140,7 @@
 #define IA64_BDA_VIDEO_CONTROL   0x00000487U
 #define IA64_BDA_VIDEO_SWITCHES  0x00000488U
 #define IA64_ATI_VENDOR_ID        0x1002U
-#define IA64_ATI_RAGE128_PF_ID    0x5046U
+#define IA64_ATI_ES1000_DEVICE_ID 0x515eU
 #define IA64_ATI_PLL_XCLK         23000U
 #define IA64_ATI_PLL_REFERENCE_FREQ 2700U
 #define IA64_ATI_PLL_REFERENCE_DIV  4U
@@ -466,6 +467,25 @@ struct IA64VpcMachineState {
     IA64MachineFirmwareNotifier firmware_notifier;
     bool vmstate_registered;
 };
+
+static bool ia64_vpc_vga_uses_large_aperture(PCIDevice *pci_dev)
+{
+    return pci_dev != NULL &&
+           pci_dev->io_regions[0].size >
+           IA64_VGA_MMIO_PCI_BASE - IA64_VGA_FB_PCI_BASE;
+}
+
+static hwaddr ia64_vpc_vga_fb_pci_base(PCIDevice *pci_dev)
+{
+    return ia64_vpc_vga_uses_large_aperture(pci_dev) ?
+           IA64_VGA_LARGE_FB_PCI_BASE : IA64_VGA_FB_PCI_BASE;
+}
+
+static hwaddr ia64_vpc_vga_mmio_pci_base(PCIDevice *pci_dev)
+{
+    return ia64_vpc_vga_uses_large_aperture(pci_dev) ?
+           IA64_VGA_LARGE_MMIO_PCI_BASE : IA64_VGA_MMIO_PCI_BASE;
+}
 
 #ifdef CONFIG_IA64_VPC_GRAPHICS
 static const IA64VbeMode *ia64_vbe_find_mode(IA64VpcMachineState *s,
@@ -927,7 +947,8 @@ static void ia64_int10_program_legacy_mode(IA64VpcMachineState *s,
     ia64_vga_load_ega_palette();
 
     if (!no_clear) {
-        address_space_set(&address_space_memory, IA64_VGA_FB_PCI_BASE,
+        address_space_set(&address_space_memory,
+                          ia64_vpc_vga_fb_pci_base(s->vga_dev),
                           0, IA64_VGA_PLANAR_MEMORY_SIZE,
                           MEMTXATTRS_UNSPECIFIED);
     }
@@ -1097,7 +1118,7 @@ static void ia64_int10_mode_info(IA64VpcMachineState *s)
     info[37] = alpha_size;
     info[38] = alpha_pos;
     info[39] = mode->bpp == 32 ? 2 : 0;
-    stl_le_p(info + 40, IA64_VGA_FB_PCI_BASE);
+    stl_le_p(info + 40, ia64_vpc_vga_fb_pci_base(s->vga_dev));
     stw_le_p(info + 50, pitch);
     info[52] = pages;
     info[53] = pages;
@@ -1504,23 +1525,21 @@ static const MemoryRegionOps ia64_int10_io_ops = {
     },
 };
 
-static void ia64_int10_install_ati_bios_info(uint8_t *rom,
-                                             uint16_t vendor,
-                                             uint16_t device)
+static void ia64_int10_install_ati_bios_info(uint8_t *rom, uint16_t vendor)
 {
     static const char ati_bios_signature[] = "761295520";
 
-    if (vendor != IA64_ATI_VENDOR_ID || device != IA64_ATI_RAGE128_PF_ID) {
+    if (vendor != IA64_ATI_VENDOR_ID) {
         return;
     }
 
     /*
-     * Native Rage128 drivers follow the legacy ATI BIOS pointer chain at
-     * 48h to obtain PLL limits.  A generic VBE ROM which only has a valid
-     * 55AAh header is otherwise mistaken for an ATI BIOS, and the driver
-     * interprets executable bytes as clock values.  Publish the small,
-     * device-specific data block expected by those drivers while keeping
-     * all video services in the generic INT 10h implementation.
+     * Native Rage128 and pre-ATOM RV100 drivers follow the legacy ATI BIOS
+     * pointer chain at 48h to obtain PLL limits.  A generic VBE ROM which
+     * only has a valid 55AAh header is otherwise mistaken for an ATI BIOS,
+     * and the driver interprets executable bytes as clock values.  Publish
+     * the small compatibility block while keeping all video services in the
+     * generic INT 10h implementation.
      *
      * Values use the units defined by the Rage128 BIOS interface: clocks
      * are in 10 kHz units.  They match the range supported by QEMU's
@@ -1596,7 +1615,7 @@ static void ia64_vpc_install_int10(IA64VpcMachineState *s)
     rom[IA64_INT10_ROM_PCIR_OFFSET + 0x14] = 0;
     rom[IA64_INT10_ROM_PCIR_OFFSET + 0x15] = 0x80;
     memcpy(rom + 0x60, "QEMU IA64 VBE INT10", 20);
-    ia64_int10_install_ati_bios_info(rom, vendor, device);
+    ia64_int10_install_ati_bios_info(rom, vendor);
     memcpy(rom + IA64_INT10_ROM_HANDLER_OFFSET, ia64_int10_handler,
            sizeof(ia64_int10_handler));
     memcpy(rom + IA64_INT10_ROM_OEM_OFFSET,
@@ -2511,13 +2530,20 @@ static void ia64_vpc_configure_vga(PCIDevice *pci_dev)
     }
 
     pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0,
-                             IA64_VGA_FB_PCI_BASE, 4);
+                             ia64_vpc_vga_fb_pci_base(pci_dev), 4);
     if (pci_dev->io_regions[1].memory != NULL) {
         pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0 + 4,
                                  IA64_VGA_IO_BASE, 4);
     }
     pci_default_write_config(pci_dev, PCI_BASE_ADDRESS_0 + 8,
-                             IA64_VGA_MMIO_PCI_BASE, 4);
+                             ia64_vpc_vga_mmio_pci_base(pci_dev), 4);
+    if (pci_get_word(pci_dev->config + PCI_VENDOR_ID) ==
+            IA64_ATI_VENDOR_ID &&
+        pci_get_word(pci_dev->config + PCI_DEVICE_ID) ==
+            IA64_ATI_ES1000_DEVICE_ID) {
+        pci_default_write_config(pci_dev, PCI_CACHE_LINE_SIZE, 0x10, 1);
+        pci_default_write_config(pci_dev, PCI_LATENCY_TIMER, 0x40, 1);
+    }
     pci_default_write_config(pci_dev, PCI_COMMAND,
                              PCI_COMMAND_IO | PCI_COMMAND_MEMORY, 2);
 
@@ -2696,7 +2722,7 @@ static void ia64_vpc_map_vga_fixed_windows(IA64VpcMachineState *s,
         memory_region_init_alias(s->vga_fb_alias, OBJECT(s),
                                  "ia64-vga-fb-fixed", fb->memory, 0, fb->size);
         memory_region_add_subregion_overlap(fb->address_space,
-                                            IA64_VGA_FB_PCI_BASE,
+                                            ia64_vpc_vga_fb_pci_base(pci_dev),
                                             s->vga_fb_alias, 1);
     }
 
@@ -2706,7 +2732,7 @@ static void ia64_vpc_map_vga_fixed_windows(IA64VpcMachineState *s,
                                  "ia64-vga-mmio-fixed", mmio->memory, 0,
                                  mmio->size);
         memory_region_add_subregion_overlap(fb->address_space,
-                                            IA64_VGA_MMIO_PCI_BASE,
+                                            ia64_vpc_vga_mmio_pci_base(pci_dev),
                                             s->vga_mmio_alias, 1);
     }
 

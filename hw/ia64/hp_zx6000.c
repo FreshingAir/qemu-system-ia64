@@ -776,6 +776,8 @@ static bool hp_zx6000_init_int10(HPZX6000MachineState *s, Error **errp)
             s->ioa[HP_ZX6000_CORE_PCI_ROOT]),
         .vga_io = &s->root_io[HP_ZX6000_AGP_ROOT],
         .framebuffer_base = HP_ZX6000_RV100_FB_BAR,
+        .framebuffer_bar = 0,
+        .mmio_bar = 2,
         .region_name = "hp-zx6000.int10-pci-io",
     };
     return hp_ia64_int10_init(&s->int10, &config, errp);

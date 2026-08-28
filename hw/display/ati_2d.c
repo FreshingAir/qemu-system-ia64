@@ -11,18 +11,12 @@
 #include "ati_int.h"
 #include "ati_regs.h"
 #include "qemu/log.h"
-#include "ui/pixel_ops.h"
 #include "ui/console.h"
 #include "ui/rect.h"
 
 /*
- * NOTE:
- * This is 2D _acceleration_ and supposed to be fast. Therefore, don't try to
- * reinvent the wheel (unlikely to get better with a naive implementation than
- * existing libraries) and avoid (poorly) reimplementing gfx primitives.
- * That is unnecessary and would become a performance problem. Instead, try to
- * map to and reuse existing optimised facilities (e.g. pixman) wherever
- * possible.
+ * TODO: Implement tiled surfaces, stretch blits, and Bresenham
+ * line/trapezoid commands.
  */
 
 static int ati_bpp_from_datatype(const ATIVGAState *s)
@@ -34,17 +28,62 @@ static int ati_bpp_from_datatype(const ATIVGAState *s)
     case 4:
         return 16;
     case 5:
-        return 24;
+        if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+            return 24;
+        }
+        break;
     case 6:
         return 32;
     default:
-        qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %d\n",
-                      s->regs.dp_datatype & 0xf);
-        return 0;
+        break;
     }
+    qemu_log_mask(LOG_UNIMP, "Unknown dst datatype %d\n",
+                  s->regs.dp_datatype & 0xf);
+    return 0;
+}
+
+static uint32_t ati_pixel_mask(unsigned int bpp)
+{
+    return bpp == 32 ? UINT32_MAX : bpp ? (1U << bpp) - 1 : 0;
+}
+
+static int ati_coord_14(uint32_t value)
+{
+    return sextract32(value, 0, 14);
+}
+
+static int ati_scissor_coord(const ATIVGAState *s, uint16_t value)
+{
+    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
+        return ati_coord_14(value);
+    }
+
+    return value & BIT(15) ? -(value & 0x3fff) : value & 0x3fff;
+}
+
+static int ati_div_floor(int value, int divisor)
+{
+    int quotient = value / divisor;
+
+    return quotient - (value % divisor < 0);
+}
+
+static int ati_div_ceil(int value, int divisor)
+{
+    int quotient = value / divisor;
+
+    return quotient + (value % divisor > 0);
+}
+
+static uint16_t ati_scissor_extent(int first, int last, bool inclusive)
+{
+    int extent = last - first + inclusive;
+
+    return extent > 0 ? extent : 0;
 }
 
 typedef struct {
+    ATIVGAState *s;
     VGACommonState *vga;
     int bpp;
     uint32_t rop3;
@@ -52,56 +91,111 @@ typedef struct {
     bool left_to_right;
     bool top_to_bottom;
     bool need_swap;
+    bool solid_brush;
+    bool register_brush;
+    bool mono_lsb_first;
+    bool write_mask_active;
+    bool color_compare_active;
+    bool rage128;
+    uint8_t brush_type;
+    uint8_t brush_x;
+    uint8_t brush_y;
     uint32_t frgd_clr;
+    uint32_t bkgd_clr;
+    const uint32_t *brush_data;
+    uint32_t src_frgd_clr;
+    uint32_t write_mask;
+    uint32_t src_source;
+    uint32_t clr_cmp_cntl;
+    uint32_t clr_cmp_clr_src;
+    uint32_t clr_cmp_clr_dst;
+    uint32_t clr_cmp_mask;
     QemuRect scissor;
+    bool source_clip_active;
+    int source_clip_right;
+    int source_clip_bottom;
 
     QemuRect dst;
     int dst_stride;
     uint8_t *dst_bits;
     uint32_t dst_offset;
+    uint64_t dst_vram_offset;
 
     QemuRect src;
     int src_stride;
     const uint8_t *src_bits;
+    uint32_t src_offset;
+    uint64_t src_vram_offset;
 } ATI2DCtx;
 
-static void ati_set_dirty(const ATI2DCtx *ctx)
+static bool ati_2d_clip_rects(const ATI2DCtx *ctx, QemuRect *vis_src,
+                              QemuRect *vis_dst)
+{
+    int right;
+    int bottom;
+
+    if (!qemu_rect_intersect(&ctx->dst, &ctx->scissor, vis_dst)) {
+        return false;
+    }
+
+    /* Keep source and destination coordinates aligned after dst clipping. */
+    vis_src->x = ctx->src.x + (vis_dst->x - ctx->dst.x);
+    vis_src->y = ctx->src.y + (vis_dst->y - ctx->dst.y);
+    vis_src->width = vis_dst->width;
+    vis_src->height = vis_dst->height;
+
+    if (!ctx->source_clip_active) {
+        return true;
+    }
+
+    /* The source coordinate is top-left; SRC_SC_* is exclusive bottom-right. */
+    right = MIN(vis_src->x + vis_src->width, ctx->source_clip_right);
+    bottom = MIN(vis_src->y + vis_src->height, ctx->source_clip_bottom);
+    if (right <= vis_src->x || bottom <= vis_src->y) {
+        qemu_rect_init(vis_src, 0, 0, 0, 0);
+        qemu_rect_init(vis_dst, 0, 0, 0, 0);
+        return false;
+    }
+    vis_src->width = right - vis_src->x;
+    vis_src->height = bottom - vis_src->y;
+    vis_dst->width = vis_src->width;
+    vis_dst->height = vis_src->height;
+    return true;
+}
+
+static void ati_2d_mark_direct_dirty(const ATI2DCtx *ctx,
+                                     const QemuRect *dirty)
 {
     VGACommonState *vga = ctx->vga;
-    DisplaySurface *ds = qemu_console_surface(vga->con);
     unsigned int bypp = ctx->bpp / 8;
-    QemuRect dirty;
-    hwaddr dirty_start;
-    hwaddr dirty_end;
-    hwaddr visible_start = vga->vbe_start_addr * 4;
-    hwaddr visible_end = visible_start +
-                         vga->vbe_regs[VBE_DISPI_INDEX_YRES] *
-                         vga->vbe_line_offset;
-    hwaddr start;
-    hwaddr end;
+    uint64_t row_bytes;
+    unsigned int y;
 
-    qemu_rect_intersect(&ctx->dst, &ctx->scissor, &dirty);
-    if (!dirty.width || !dirty.height) {
-        return;
-    }
-    dirty_start = ctx->dst_offset + dirty.x * bypp +
-                  dirty.y * ctx->dst_stride;
-    dirty_end = dirty_start + dirty.width * bypp +
-                (dirty.height - 1) * ctx->dst_stride;
-    start = MAX(visible_start, dirty_start);
-    end = MIN(visible_end, dirty_end);
+    g_assert(ctx->dst_bits);
+    row_bytes = (uint64_t)dirty->width * bypp;
+    for (y = 0; y < dirty->height; y++) {
+        uint64_t offset = ctx->dst_vram_offset +
+                          (uint64_t)(dirty->y + y) * ctx->dst_stride +
+                          (uint64_t)dirty->x * bypp;
 
-    (void)ds;
-    DPRINTF("%p %u ds: %p %d %d rop: %x\n", vga->vram_ptr, vga->vbe_start_addr,
-            surface_data(ds), surface_stride(ds), surface_bits_per_pixel(ds),
-            ctx->rop3 >> 16);
-    if (start < end) {
-        memory_region_set_dirty(&vga->vram, start, end - start);
+        memory_region_set_dirty(&vga->vram, offset, row_bytes);
     }
 }
 
 static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
 {
+    bool rage128 = s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF;
+    int sc_left = ati_scissor_coord(s, s->regs.sc_left);
+    int sc_right = ati_scissor_coord(s, s->regs.sc_right);
+    int sc_top = ati_scissor_coord(s, s->regs.sc_top);
+    int sc_bottom = ati_scissor_coord(s, s->regs.sc_bottom);
+    int dst_x = ati_coord_14(s->regs.dst_x);
+    int dst_y = ati_coord_14(s->regs.dst_y);
+    int src_x = ati_coord_14(s->regs.src_x);
+    int src_y = ati_coord_14(s->regs.src_y);
+    uint64_t stride;
+
+    ctx->s = s;
     ctx->vga = &s->vga;
     ctx->bpp = ati_bpp_from_datatype(s);
     ctx->rop3 = s->regs.dp_mix & GMC_ROP3_MASK;
@@ -109,35 +203,92 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
     ctx->left_to_right = s->regs.dp_cntl & DST_X_LEFT_TO_RIGHT;
     ctx->top_to_bottom = s->regs.dp_cntl & DST_Y_TOP_TO_BOTTOM;
     ctx->need_swap = (HOST_BIG_ENDIAN != s->vga.big_endian_fb);
+    ctx->brush_type = (s->regs.dp_datatype & DP_BRUSH_DATATYPE) >> 8;
+    ctx->solid_brush =
+        ctx->brush_type == (BRUSH_SOLIDCOLOR >> 8) ||
+        ctx->brush_type == (BRUSH_SOLIDCOLOR_LINE >> 8);
+    ctx->register_brush = !rage128;
+    ctx->mono_lsb_first = s->regs.dp_datatype & DP_BYTE_PIX_ORDER;
+    ctx->write_mask_active =
+        (s->regs.dp_write_mask & ati_pixel_mask(ctx->bpp)) !=
+        ati_pixel_mask(ctx->bpp);
     ctx->frgd_clr = s->regs.dp_brush_frgd_clr;
+    ctx->bkgd_clr = s->regs.dp_brush_bkgd_clr;
+    ctx->brush_x = s->regs.brush_y_x & R100_BRUSH_X_MASK;
+    ctx->brush_y = (s->regs.brush_y_x & R100_BRUSH_Y_MASK) >> 8;
+    ctx->brush_data = s->regs.brush_data;
+    ctx->src_frgd_clr = s->regs.dp_src_frgd_clr;
+    ctx->write_mask = s->regs.dp_write_mask;
+    ctx->src_source = s->regs.dp_mix & DP_SRC_SOURCE;
+    ctx->source_clip_active = ctx->src_source == DP_SRC_RECT;
+    ctx->source_clip_right =
+        ati_scissor_coord(s, s->regs.src_sc_right) + rage128;
+    ctx->source_clip_bottom =
+        ati_scissor_coord(s, s->regs.src_sc_bottom) + rage128;
+    ctx->clr_cmp_cntl = s->regs.clr_cmp_cntl;
+    ctx->clr_cmp_clr_src = s->regs.clr_cmp_clr_src;
+    ctx->clr_cmp_clr_dst = s->regs.clr_cmp_clr_dst;
+    ctx->clr_cmp_mask = s->regs.clr_cmp_mask;
+    ctx->rage128 = rage128;
+    switch ((ctx->clr_cmp_cntl & CLR_CMP_ENABLE_MASK) >>
+            CLR_CMP_ENABLE_SHIFT) {
+    case CLR_CMP_ENABLE_DST:
+        ctx->color_compare_active =
+            ctx->clr_cmp_cntl & CLR_CMP_FN_DST_MASK;
+        break;
+    case CLR_CMP_ENABLE_SRC:
+        ctx->color_compare_active =
+            ctx->clr_cmp_cntl & CLR_CMP_FN_SRC_MASK;
+        break;
+    case CLR_CMP_ENABLE_BOTH:
+        ctx->color_compare_active =
+            ctx->clr_cmp_cntl &
+            (CLR_CMP_FN_SRC_MASK | CLR_CMP_FN_DST_MASK);
+        break;
+    default:
+        ctx->color_compare_active = true;
+        break;
+    }
     ctx->dst_offset = s->regs.dst_offset;
 
-    ctx->scissor.width = s->regs.sc_right - s->regs.sc_left + 1;
-    ctx->scissor.height = s->regs.sc_bottom - s->regs.sc_top + 1;
-    ctx->scissor.x = s->regs.sc_left;
-    ctx->scissor.y = s->regs.sc_top;
+    if (rage128 && ctx->bpp == 24) {
+        /* Rage128 packed-24 scissor X is expressed in byte coordinates. */
+        sc_left = ati_div_ceil(sc_left, 3);
+        sc_right = ati_div_floor(sc_right, 3);
+    }
+    /* Rage128 right/bottom edges are inclusive; Radeon edges are exclusive. */
+    qemu_rect_init(&ctx->scissor, sc_left, sc_top,
+                   ati_scissor_extent(sc_left, sc_right, rage128),
+                   ati_scissor_extent(sc_top, sc_bottom, rage128));
 
     ctx->dst.width = s->regs.dst_width;
     ctx->dst.height = s->regs.dst_height;
     ctx->dst.x = (ctx->left_to_right ?
-                 s->regs.dst_x : s->regs.dst_x + 1 - ctx->dst.width);
+                 dst_x : dst_x + 1 - ctx->dst.width);
     ctx->dst.y = (ctx->top_to_bottom ?
-                 s->regs.dst_y : s->regs.dst_y + 1 - ctx->dst.height);
-    ctx->dst_stride = s->regs.dst_pitch;
-    ctx->dst_bits = s->vga.vram_ptr + s->regs.dst_offset;
-    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
-        ctx->dst_stride *= ctx->bpp;
+                 dst_y : dst_y + 1 - ctx->dst.height);
+    stride = s->regs.dst_pitch;
+    if (rage128) {
+        stride *= ctx->bpp == 24 ? 8 : ctx->bpp;
     }
+    ctx->dst_stride = stride <= INT_MAX ? stride : 0;
+    ctx->dst_bits = rage128 && s->regs.dst_offset <= s->vga.vram_size ?
+                    s->vga.vram_ptr + s->regs.dst_offset : NULL;
+    ctx->dst_vram_offset = rage128 ? s->regs.dst_offset : 0;
 
     ctx->src.x = (ctx->left_to_right ?
-                 s->regs.src_x : s->regs.src_x + 1 - ctx->dst.width);
+                 src_x : src_x + 1 - ctx->dst.width);
     ctx->src.y = (ctx->top_to_bottom ?
-                 s->regs.src_y : s->regs.src_y + 1 - ctx->dst.height);
-    ctx->src_stride = s->regs.src_pitch;
-    ctx->src_bits = s->vga.vram_ptr + s->regs.src_offset;
-    if (s->dev_id == PCI_DEVICE_ID_ATI_RAGE128_PF) {
-        ctx->src_stride *= ctx->bpp;
+                 src_y : src_y + 1 - ctx->dst.height);
+    ctx->src_offset = s->regs.src_offset;
+    stride = s->regs.src_pitch;
+    if (rage128) {
+        stride *= ctx->bpp == 24 ? 8 : ctx->bpp;
     }
+    ctx->src_stride = stride <= INT_MAX ? stride : 0;
+    ctx->src_bits = rage128 && s->regs.src_offset <= s->vga.vram_size ?
+                    s->vga.vram_ptr + s->regs.src_offset : NULL;
+    ctx->src_vram_offset = rage128 ? s->regs.src_offset : 0;
     DPRINTF("%d %d %d, %d %d %d, (%d,%d) -> (%d,%d) %dx%d %c %c\n",
             s->regs.src_offset, s->regs.dst_offset, s->regs.default_offset,
             ctx->src_stride, ctx->dst_stride, s->regs.default_pitch,
@@ -145,6 +296,112 @@ static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
             ctx->dst.width, ctx->dst.height,
             (ctx->left_to_right ? '>' : '<'),
             (ctx->top_to_bottom ? 'v' : '^'));
+}
+
+static bool ati_2d_rect_layout(const ATI2DCtx *ctx, int stride,
+                               const QemuRect *rect, const char *name,
+                               uint64_t *end)
+{
+    uint64_t bypp = ctx->bpp / 8;
+    uint64_t right;
+    uint64_t bottom;
+    uint64_t row;
+
+    if (!bypp || stride <= 0 || rect->x < 0 || rect->y < 0 ||
+        rect->width <= 0 || rect->height <= 0 ||
+        rect->x > 0x3fff || rect->y > 0x3fff) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Invalid ATI 2D %s rectangle\n",
+                      name);
+        return false;
+    }
+
+    right = (uint64_t)rect->x + rect->width;
+    bottom = (uint64_t)rect->y + rect->height;
+    if (right > UINT64_MAX / bypp || right * bypp > (uint64_t)stride ||
+        bottom - 1 > UINT64_MAX / (uint64_t)stride) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ATI 2D %s rectangle exceeds its pitch\n", name);
+        return false;
+    }
+
+    row = (bottom - 1) * stride;
+    *end = row + right * bypp;
+    return true;
+}
+
+static bool ati_2d_prepare_surface(ATIVGAState *s, const ATI2DCtx *ctx,
+                                   uint32_t address, int stride,
+                                   const QemuRect *rect, const char *name,
+                                   bool is_write, uint8_t **bits,
+                                   uint64_t *vram_offset)
+{
+    uint64_t bypp = ctx->bpp / 8;
+    uint64_t end;
+    unsigned int y;
+
+    *bits = NULL;
+    *vram_offset = 0;
+    if (!ati_2d_rect_layout(ctx, stride, rect, name, &end)) {
+        return false;
+    }
+    if (!ctx->rage128 && end > UINT64_C(1) + UINT32_MAX - address) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "ATI 2D %s rectangle exceeds GPU address space\n",
+                      name);
+        return false;
+    }
+    if (ctx->rage128) {
+        if (address > ctx->vga->vram_size ||
+            end > ctx->vga->vram_size - address) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ATI 2D %s rectangle is outside VRAM\n", name);
+            return false;
+        }
+        *vram_offset = address;
+        *bits = ctx->vga->vram_ptr + address;
+        return true;
+    }
+    if (ati_r100_gpu_vram_offset(s, address, end, vram_offset)) {
+        *bits = ctx->vga->vram_ptr + *vram_offset;
+        return true;
+    }
+
+    for (y = 0; y < rect->height; y++) {
+        uint64_t row = address + (uint64_t)(rect->y + y) * stride +
+                       (uint64_t)rect->x * bypp;
+        uint64_t row_bytes = (uint64_t)rect->width * bypp;
+
+        if (!ati_r100_gpu_access_valid(s, row, row_bytes, is_write)) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "ATI 2D %s rectangle is outside GPU memory\n",
+                          name);
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ati_2d_rects_overlap_in_vram(const ATI2DCtx *ctx,
+                                         const QemuRect *src,
+                                         const QemuRect *dst)
+{
+    uint64_t bypp = ctx->bpp / 8;
+    uint64_t src_start = ctx->src_vram_offset +
+                         (uint64_t)src->y * ctx->src_stride +
+                         (uint64_t)src->x * bypp;
+    uint64_t src_end = ctx->src_vram_offset +
+                       (uint64_t)(src->y + src->height - 1) *
+                       ctx->src_stride +
+                       (uint64_t)(src->x + src->width) * bypp;
+    uint64_t dst_start = ctx->dst_vram_offset +
+                         (uint64_t)dst->y * ctx->dst_stride +
+                         (uint64_t)dst->x * bypp;
+    uint64_t dst_end = ctx->dst_vram_offset +
+                       (uint64_t)(dst->y + dst->height - 1) *
+                       ctx->dst_stride +
+                       (uint64_t)(dst->x + dst->width) * bypp;
+
+    return src_start < dst_end && dst_start < src_end;
 }
 
 static uint32_t make_filler(int bpp, uint32_t color)
@@ -158,68 +415,384 @@ static uint32_t make_filler(int bpp, uint32_t color)
     return color;
 }
 
-static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
+static void ati_store_pixel(const ATI2DCtx *ctx, uint8_t *dst,
+                            uint32_t value)
 {
-    QemuRect vis_src, vis_dst;
+    unsigned int bypp = ctx->bpp / 8;
+
+    if (bypp == 3) {
+        if (ctx->vga->big_endian_fb) {
+            st24_be_p(dst, value);
+        } else {
+            st24_le_p(dst, value);
+        }
+    } else {
+        if (ctx->need_swap) {
+            bswap32s(&value);
+        }
+        stn_he_p(dst, bypp, value);
+    }
+}
+
+static uint32_t ati_load_pixel(const ATI2DCtx *ctx, const uint8_t *src)
+{
+    switch (ctx->bpp / 8) {
+    case 1:
+        return *src;
+    case 2:
+        return ctx->vga->big_endian_fb ? lduw_be_p(src) : lduw_le_p(src);
+    case 3:
+        return ctx->vga->big_endian_fb ?
+               (uint32_t)src[0] << 16 | (uint32_t)src[1] << 8 | src[2] :
+               (uint32_t)src[2] << 16 | (uint32_t)src[1] << 8 | src[0];
+    case 4:
+        return ctx->vga->big_endian_fb ? ldl_be_p(src) : ldl_le_p(src);
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static bool ati_2d_brush_supported(const ATI2DCtx *ctx)
+{
+    switch (ctx->brush_type) {
+    case BRUSH_8X8_MONO_FRGD_BKGD >> 8:
+    case BRUSH_8X8_MONO_FRGD_LEAVE >> 8:
+    case BRUSH_8X8_COLOR >> 8:
+        return ctx->register_brush;
+    case BRUSH_SOLIDCOLOR >> 8:
+    case BRUSH_SOLIDCOLOR_LINE >> 8:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/*
+ * The register brush is destination aligned.  BRUSH_Y_X names the origin
+ * to which pattern element (0, 0) is aligned; the pattern repeats every
+ * eight pixels in each direction.  Monochrome rows occupy consecutive
+ * bytes in BRUSH_DATA0/1, with DP_BYTE_PIX_ORDER selecting bit polarity.
+ */
+static bool ati_2d_brush_pixel(const ATI2DCtx *ctx, unsigned int x,
+                               unsigned int y, uint32_t *pattern)
+{
+    unsigned int pattern_x = (x - ctx->brush_x) & 7;
+    unsigned int pattern_y = (y - ctx->brush_y) & 7;
+    unsigned int pixel = pattern_y * 8 + pattern_x;
+    uint32_t pixel_mask = ati_pixel_mask(ctx->bpp);
+
+    switch (ctx->brush_type) {
+    case BRUSH_8X8_MONO_FRGD_BKGD >> 8:
+    case BRUSH_8X8_MONO_FRGD_LEAVE >> 8:
+    {
+        unsigned int bit = pattern_y * 8 +
+                           (ctx->mono_lsb_first ? pattern_x : 7 - pattern_x);
+        bool foreground = ctx->brush_data[bit / 32] & BIT(bit % 32);
+
+        if (!foreground &&
+            ctx->brush_type == (BRUSH_8X8_MONO_FRGD_LEAVE >> 8)) {
+            return false;
+        }
+        *pattern = (foreground ? ctx->frgd_clr : ctx->bkgd_clr) & pixel_mask;
+        return true;
+    }
+    case BRUSH_8X8_COLOR >> 8:
+        switch (ctx->bpp) {
+        case 8:
+            *pattern = extract32(ctx->brush_data[pixel / 4],
+                                 pixel % 4 * 8, 8);
+            return true;
+        case 16:
+            *pattern = extract32(ctx->brush_data[pixel / 2],
+                                 pixel % 2 * 16, 16);
+            return true;
+        case 24:
+        case 32:
+            *pattern = ctx->brush_data[pixel] & pixel_mask;
+            return true;
+        default:
+            g_assert_not_reached();
+        }
+    case BRUSH_SOLIDCOLOR >> 8:
+    case BRUSH_SOLIDCOLOR_LINE >> 8:
+        *pattern = ctx->frgd_clr & pixel_mask;
+        return true;
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static uint32_t ati_apply_rop3(uint8_t rop, uint32_t pattern,
+                               uint32_t source, uint32_t destination)
+{
+    uint32_t result = 0;
+    unsigned int i;
+
+    switch (rop) {
+    case 0x00:
+        return 0;
+    case 0xff:
+        return UINT32_MAX;
+    case 0xaa:
+        return destination;
+    case 0x55:
+        return ~destination;
+    case 0xcc:
+        return source;
+    case 0x33:
+        return ~source;
+    case 0xf0:
+        return pattern;
+    case 0x0f:
+        return ~pattern;
+    case 0x66:
+        return source ^ destination;
+    case 0x88:
+        return source & destination;
+    case 0xee:
+        return source | destination;
+    case 0x5a:
+        return pattern ^ destination;
+    case 0xa0:
+        return pattern & destination;
+    case 0xfa:
+        return pattern | destination;
+    case 0x3c:
+        return pattern ^ source;
+    case 0xc0:
+        return pattern & source;
+    case 0xfc:
+        return pattern | source;
+    case 0x96:
+        return pattern ^ source ^ destination;
+    default:
+        break;
+    }
+
+    for (i = 0; i < 8; i++) {
+        uint32_t term;
+
+        if (!(rop & BIT(i))) {
+            continue;
+        }
+        term = i & 4 ? pattern : ~pattern;
+        term &= i & 2 ? source : ~source;
+        term &= i & 1 ? destination : ~destination;
+        result |= term;
+    }
+    return result;
+}
+
+static bool ati_color_compare_source(const ATI2DCtx *ctx, uint32_t *source)
+{
+    uint32_t mask = ctx->clr_cmp_mask & ati_pixel_mask(ctx->bpp);
+    unsigned int function = ctx->clr_cmp_cntl & CLR_CMP_FN_SRC_MASK;
+    bool equal = ((*source ^ ctx->clr_cmp_clr_src) & mask) == 0;
+
+    /* Radeon reverses the source comparator output relative to Rage128. */
+    switch (function) {
+    case CLR_CMP_FALSE:
+        return true;
+    case CLR_CMP_TRUE:
+        return false;
+    case CLR_CMP_EQUAL:
+        return ctx->rage128 ? equal : !equal;
+    case CLR_CMP_NOT_EQUAL:
+        return ctx->rage128 ? !equal : equal;
+    case CLR_CMP_EQUAL_FLIP:
+        if (equal) {
+            *source ^= ctx->src_frgd_clr;
+            return true;
+        }
+        return false;
+    default:
+        return false;
+    }
+}
+
+static bool ati_color_compare_destination(const ATI2DCtx *ctx,
+                                          uint32_t destination)
+{
+    uint32_t mask = ctx->clr_cmp_mask & ati_pixel_mask(ctx->bpp);
+    unsigned int function = (ctx->clr_cmp_cntl & CLR_CMP_FN_DST_MASK) >>
+                            CLR_CMP_FN_DST_SHIFT;
+    bool equal = ((destination ^ ctx->clr_cmp_clr_dst) & mask) == 0;
+
+    switch (function) {
+    case CLR_CMP_FALSE:
+        return true;
+    case CLR_CMP_TRUE:
+        return false;
+    case CLR_CMP_EQUAL:
+        return !equal;
+    case CLR_CMP_NOT_EQUAL:
+        return equal;
+    default:
+        return false;
+    }
+}
+
+static bool ati_color_compare(const ATI2DCtx *ctx, uint32_t *source,
+                              uint32_t destination)
+{
+    unsigned int enable = (ctx->clr_cmp_cntl & CLR_CMP_ENABLE_MASK) >>
+                          CLR_CMP_ENABLE_SHIFT;
+
+    switch (enable) {
+    case CLR_CMP_ENABLE_DST:
+        return ati_color_compare_destination(ctx, destination);
+    case CLR_CMP_ENABLE_SRC:
+        return ati_color_compare_source(ctx, source);
+    case CLR_CMP_ENABLE_BOTH:
+        return ati_color_compare_source(ctx, source) &&
+               ati_color_compare_destination(ctx, destination);
+    default:
+        return false;
+    }
+}
+
+static bool ati_color_compare_needs_source(const ATI2DCtx *ctx)
+{
+    unsigned int enable = (ctx->clr_cmp_cntl & CLR_CMP_ENABLE_MASK) >>
+                          CLR_CMP_ENABLE_SHIFT;
+
+    return (enable == CLR_CMP_ENABLE_SRC ||
+            enable == CLR_CMP_ENABLE_BOTH) &&
+           (ctx->clr_cmp_cntl & CLR_CMP_FN_SRC_MASK);
+}
+
+static bool ati_color_compare_needs_destination(const ATI2DCtx *ctx)
+{
+    unsigned int enable = (ctx->clr_cmp_cntl & CLR_CMP_ENABLE_MASK) >>
+                          CLR_CMP_ENABLE_SHIFT;
+
+    return ctx->color_compare_active &&
+           (enable == CLR_CMP_ENABLE_DST || enable == CLR_CMP_ENABLE_BOTH);
+}
+
+static bool ati_2d_uses_generic_rop(const ATI2DCtx *ctx)
+{
+    return ctx->write_mask_active || ctx->color_compare_active ||
+           (ctx->rop3 == ROP3_PATCOPY && !ctx->solid_brush) ||
+           (ctx->rop3 != ROP3_SRCCOPY && ctx->rop3 != ROP3_PATCOPY &&
+            ctx->rop3 != ROP3_BLACKNESS && ctx->rop3 != ROP3_WHITENESS);
+}
+
+static bool ati_2d_source_needed(const ATI2DCtx *ctx)
+{
+    uint8_t rop = ctx->rop3 >> 16;
+
+    if (!ati_2d_uses_generic_rop(ctx)) {
+        return ctx->rop3 == ROP3_SRCCOPY;
+    }
+    return ((rop ^ (rop >> 2)) & 0x33) != 0 ||
+           ati_color_compare_needs_source(ctx);
+}
+
+static bool ati_2d_destination_needed(const ATI2DCtx *ctx)
+{
+    uint8_t rop = ctx->rop3 >> 16;
+
+    return ((rop ^ (rop >> 1)) & 0x55) != 0 ||
+           ctx->write_mask_active ||
+           ati_color_compare_needs_destination(ctx);
+}
+
+static bool ati_2d_preserve_destination(const ATI2DCtx *ctx)
+{
+    uint8_t rop = ctx->rop3 >> 16;
+    bool pattern_needed = ((rop ^ (rop >> 4)) & 0x0f) != 0;
+
+    return ati_2d_destination_needed(ctx) || ctx->color_compare_active ||
+           (pattern_needed &&
+            ctx->brush_type == (BRUSH_8X8_MONO_FRGD_LEAVE >> 8));
+}
+
+static bool ati_2d_generic_rop(const ATI2DCtx *ctx, const QemuRect *vis_src,
+                               const QemuRect *vis_dst)
+{
+    unsigned int bypp = ctx->bpp / 8;
+    uint8_t rop = ctx->rop3 >> 16;
+    bool source_needed = ((rop ^ (rop >> 2)) & 0x33) != 0;
+    bool pattern_needed = ((rop ^ (rop >> 4)) & 0x0f) != 0;
+    bool destination_needed = ati_2d_destination_needed(ctx);
+    uint32_t pixel_mask = ati_pixel_mask(ctx->bpp);
+    unsigned int yi, xi;
+
+    if (pattern_needed && !ati_2d_brush_supported(ctx)) {
+        qemu_log_mask(LOG_UNIMP, "Unsupported ATI 2D brush type %u\n",
+                      ctx->brush_type);
+        return false;
+    }
+    source_needed |= ati_color_compare_needs_source(ctx);
+
+    for (yi = 0; yi < vis_dst->height; yi++) {
+        unsigned int y = ctx->top_to_bottom ? yi :
+                         vis_dst->height - 1 - yi;
+
+        for (xi = 0; xi < vis_dst->width; xi++) {
+            unsigned int x = ctx->left_to_right ? xi :
+                             vis_dst->width - 1 - xi;
+            uint8_t *dst = ctx->dst_bits +
+                           (vis_dst->y + y) * ctx->dst_stride +
+                           (vis_dst->x + x) * bypp;
+            uint32_t destination = 0;
+            uint32_t pattern = 0;
+            uint32_t source = 0;
+            uint32_t result;
+
+            if (pattern_needed &&
+                !ati_2d_brush_pixel(ctx, vis_dst->x + x,
+                                    vis_dst->y + y, &pattern)) {
+                continue;
+            }
+            if (destination_needed) {
+                destination = ati_load_pixel(ctx, dst);
+            }
+            if (source_needed) {
+                const uint8_t *src = ctx->src_bits +
+                    (vis_src->y + y) * ctx->src_stride +
+                    (vis_src->x + x) * bypp;
+
+                source = ati_load_pixel(ctx, src);
+            }
+            if (ctx->color_compare_active &&
+                !ati_color_compare(ctx, &source, destination)) {
+                continue;
+            }
+            result = ati_apply_rop3(rop, pattern, source,
+                                    destination) & pixel_mask;
+            if (ctx->write_mask_active) {
+                uint32_t mask = ctx->write_mask & pixel_mask;
+
+                result = (result & mask) | (destination & ~mask);
+            }
+            ati_store_pixel(ctx, dst, make_filler(ctx->bpp, result));
+        }
+    }
+    return true;
+}
+
+static bool ati_2d_do_blt_direct(const ATI2DCtx *ctx, QemuRect vis_src,
+                                 QemuRect vis_dst, uint8_t use_pixman)
+{
     unsigned int x, y, i, j, bypp = ctx->bpp / 8;
-    const uint8_t *vram_end = ctx->vga->vram_ptr + ctx->vga->vram_size;
 
-    if (!ctx->bpp) {
-        qemu_log_mask(LOG_GUEST_ERROR, "Invalid bpp\n");
-        return false;
+    if (ati_2d_uses_generic_rop(ctx)) {
+        return ati_2d_generic_rop(ctx, &vis_src, &vis_dst);
     }
-    if (!ctx->dst_stride) {
-        qemu_log_mask(LOG_GUEST_ERROR, "Zero dest pitch\n");
-        return false;
-    }
-    if (ctx->dst.x > 0x3fff || ctx->dst.y > 0x3fff ||
-        ctx->dst_bits >= vram_end - bypp ||
-        ctx->dst_bits + ctx->dst.x * bypp + (ctx->dst.y + ctx->dst.height) *
-        ctx->dst_stride >= vram_end - bypp) {
-        qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented\n");
-        return false;
-    }
-    qemu_rect_intersect(&ctx->dst, &ctx->scissor, &vis_dst);
-    if (!vis_dst.height || !vis_dst.width) {
-        /* Nothing is visible, completely clipped */
-        return false;
-    }
-    /*
-     * The src must be offset if clipping is applied to the dst.
-     * This is so that when the source is blit to a dst clipped
-     * on the top or left the src image is not shifted into the
-     * clipped region but actually clipped.
-     */
-    vis_src.x = ctx->src.x + (vis_dst.x - ctx->dst.x);
-    vis_src.y = ctx->src.y + (vis_dst.y - ctx->dst.y);
-    vis_src.width = vis_dst.width;
-    vis_src.height = vis_dst.height;
-
-    DPRINTF("dst: (%d,%d) %dx%d -> vis_dst: (%d,%d) %dx%d\n",
-            ctx->dst.x, ctx->dst.y, ctx->dst.width, ctx->dst.height,
-            vis_dst.x, vis_dst.y, vis_dst.width, vis_dst.height);
-    DPRINTF("src: (%d,%d) %dx%d -> vis_src: (%d,%d) %dx%d\n",
-            ctx->src.x, ctx->src.y, ctx->dst.width, ctx->dst.height,
-            vis_src.x, vis_src.y, vis_src.width, vis_src.height);
 
     switch (ctx->rop3) {
     case ROP3_SRCCOPY:
     {
         bool fallback = false;
-        if (!ctx->src_stride) {
-            qemu_log_mask(LOG_GUEST_ERROR, "Zero source pitch\n");
-            return false;
-        }
-        if (!ctx->host_data_active &&
-            (vis_src.x > 0x3fff || vis_src.y > 0x3fff ||
-            ctx->src_bits >= vram_end - bypp ||
-            ctx->src_bits + vis_src.x * bypp + (vis_src.y + vis_dst.height) *
-            ctx->src_stride >= vram_end - bypp)) {
-            qemu_log_mask(LOG_UNIMP, "blt outside vram not implemented\n");
-            return false;
-        }
+        bool overlap;
 
-        DPRINTF("pixman_blt(%p, %p, %ld, %ld, %d, %d, %d, %d, %d, %d, %d, %d)\n",
+        overlap = !ctx->host_data_active &&
+                  ati_2d_rects_overlap_in_vram(ctx, &vis_src, &vis_dst);
+
+        DPRINTF("pixman_blt(%p, %p, %ld, %ld, %d, %d, "
+                "%d, %d, %d, %d, %d, %d)\n",
                 ctx->src_bits, ctx->dst_bits,
                 ctx->src_stride / sizeof(uint32_t),
                 ctx->dst_stride / sizeof(uint32_t),
@@ -229,7 +802,7 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
         int src_stride_words = ctx->src_stride / sizeof(uint32_t);
         int dst_stride_words = ctx->dst_stride / sizeof(uint32_t);
         if ((use_pixman & BIT(1)) &&
-            ctx->left_to_right && ctx->top_to_bottom) {
+            ctx->left_to_right && ctx->top_to_bottom && !overlap) {
             fallback = !pixman_blt((uint32_t *)ctx->src_bits,
                                    (uint32_t *)ctx->dst_bits, src_stride_words,
                                    dst_stride_words, ctx->bpp, ctx->bpp,
@@ -253,8 +826,26 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
                     j += (vis_src.y + vis_dst.height - 1 - y)
                          * ctx->src_stride;
                 }
-                memmove(&ctx->dst_bits[i], &ctx->src_bits[j],
-                        vis_dst.width * bypp);
+                if (overlap &&
+                    ctx->src_vram_offset + j <
+                    ctx->dst_vram_offset + i + vis_dst.width * bypp &&
+                    ctx->dst_vram_offset + i <
+                    ctx->src_vram_offset + j + vis_dst.width * bypp) {
+                    if (ctx->left_to_right) {
+                        for (x = 0; x < vis_dst.width; x++) {
+                            memmove(&ctx->dst_bits[i + x * bypp],
+                                    &ctx->src_bits[j + x * bypp], bypp);
+                        }
+                    } else {
+                        for (x = vis_dst.width; x-- > 0;) {
+                            memmove(&ctx->dst_bits[i + x * bypp],
+                                    &ctx->src_bits[j + x * bypp], bypp);
+                        }
+                    }
+                } else {
+                    memmove(&ctx->dst_bits[i], &ctx->src_bits[j],
+                            vis_dst.width * bypp);
+                }
             }
         }
         break;
@@ -263,45 +854,38 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
     case ROP3_BLACKNESS:
     case ROP3_WHITENESS:
     {
-        const uint8_t *palette = ctx->vga->palette;
         uint32_t filler = 0;
-
-        if (ctx->bpp == 24) {
-            qemu_log_mask(LOG_UNIMP, "Fill blt unsupported in 24 bits\n");
-            return false;
-        }
         switch (ctx->rop3) {
         case ROP3_PATCOPY:
             filler = make_filler(ctx->bpp, ctx->frgd_clr);
             break;
         case ROP3_BLACKNESS:
-            filler = 0xffUL << 24 | rgb_to_pixel32(palette[0], palette[1],
-                                                   palette[2]);
+            filler = 0;
             break;
         case ROP3_WHITENESS:
-            filler = 0xffUL << 24 | rgb_to_pixel32(palette[3], palette[4],
-                                                   palette[5]);
+            filler = make_filler(ctx->bpp, UINT32_MAX);
             break;
         }
         DPRINTF("pixman_fill(%p, %ld, %d, %d, %d, %d, %d, %x)\n",
                 ctx->dst_bits, ctx->dst_stride / sizeof(uint32_t), ctx->bpp,
                 vis_dst.x, vis_dst.y, vis_dst.width, vis_dst.height, filler);
-        if (ctx->need_swap) {
-            bswap32s(&filler);
-        }
 #ifdef CONFIG_PIXMAN
-        if (!(use_pixman & BIT(0)) ||
+        uint32_t pixman_filler = filler;
+
+        if (ctx->need_swap) {
+            bswap32s(&pixman_filler);
+        }
+        if (ctx->bpp == 24 || !(use_pixman & BIT(0)) ||
             !pixman_fill((uint32_t *)ctx->dst_bits,
                          ctx->dst_stride / sizeof(uint32_t), ctx->bpp,
                          vis_dst.x, vis_dst.y, vis_dst.width, vis_dst.height,
-                         filler))
+                         pixman_filler))
 #endif
         {
-            /* fallback when pixman failed or we don't want to call it */
             for (y = 0; y < vis_dst.height; y++) {
                 i = vis_dst.x * bypp + (vis_dst.y + y) * ctx->dst_stride;
                 for (x = 0; x < vis_dst.width; x++, i += bypp) {
-                    stn_he_p(&ctx->dst_bits[i], bypp, filler);
+                    ati_store_pixel(ctx, &ctx->dst_bits[i], filler);
                 }
             }
         }
@@ -314,6 +898,259 @@ static bool ati_2d_do_blt(const ATI2DCtx *ctx, uint8_t use_pixman)
     }
 
     return true;
+}
+
+static bool ati_2d_surface_read(ATIVGAState *s, const ATI2DCtx *ctx,
+                                bool source, int x, int y,
+                                uint8_t *buf, uint64_t length)
+{
+    const uint8_t *bits = source ? ctx->src_bits : ctx->dst_bits;
+    uint32_t address = source ? ctx->src_offset : ctx->dst_offset;
+    int stride = source ? ctx->src_stride : ctx->dst_stride;
+    uint64_t offset = (uint64_t)y * stride +
+                      (uint64_t)x * (ctx->bpp / 8);
+
+    if (bits) {
+        memcpy(buf, bits + offset, length);
+        return true;
+    }
+    return ati_r100_gpu_read(s, (uint64_t)address + offset, buf, length);
+}
+
+static bool ati_2d_surface_write(ATIVGAState *s, const ATI2DCtx *ctx,
+                                 int x, int y, const uint8_t *buf,
+                                 uint64_t length)
+{
+    uint64_t offset = (uint64_t)y * ctx->dst_stride +
+                      (uint64_t)x * (ctx->bpp / 8);
+
+    if (ctx->dst_bits) {
+        memcpy(ctx->dst_bits + offset, buf, length);
+        memory_region_set_dirty(&ctx->vga->vram,
+                                ctx->dst_vram_offset + offset, length);
+        return true;
+    }
+    return ati_r100_gpu_write(s, (uint64_t)ctx->dst_offset + offset,
+                              buf, length, true);
+}
+
+static bool ati_2d_staged_row_overlap(ATIVGAState *s, const ATI2DCtx *ctx,
+                                      const QemuRect *vis_src,
+                                      const QemuRect *vis_dst,
+                                      unsigned int y, uint64_t row_bytes,
+                                      bool *overlap)
+{
+    uint64_t bypp = ctx->bpp / 8;
+    uint64_t src = ctx->src_offset +
+                   (uint64_t)(vis_src->y + y) * ctx->src_stride +
+                   (uint64_t)vis_src->x * bypp;
+    uint64_t dst = ctx->dst_offset +
+                   (uint64_t)(vis_dst->y + y) * ctx->dst_stride +
+                   (uint64_t)vis_dst->x * bypp;
+
+    return ati_r100_gpu_ranges_overlap(s, src, row_bytes, dst, row_bytes,
+                                        overlap);
+}
+
+static bool ati_2d_do_blt_staged_overlap(ATIVGAState *s,
+                                         const ATI2DCtx *ctx,
+                                         const QemuRect *vis_src,
+                                         const QemuRect *vis_dst,
+                                         unsigned int y,
+                                         bool preserve_destination)
+{
+    unsigned int bypp = ctx->bpp / 8;
+    unsigned int xi;
+
+    for (xi = 0; xi < vis_dst->width; xi++) {
+        ATI2DCtx pixel = *ctx;
+        uint8_t src_pixel[4] = { 0 };
+        uint8_t dst_pixel[4] = { 0 };
+        unsigned int x = ctx->left_to_right ? xi :
+                         vis_dst->width - 1 - xi;
+        int src_x = vis_src->x + x;
+        int src_y = vis_src->y + y;
+        int dst_x = vis_dst->x + x;
+        int dst_y = vis_dst->y + y;
+        QemuRect local_src;
+        QemuRect local_dst;
+
+        if (!ati_2d_surface_read(s, ctx, true, src_x, src_y,
+                                 src_pixel, bypp) ||
+            (preserve_destination &&
+             !ati_2d_surface_read(s, ctx, false, dst_x, dst_y,
+                                  dst_pixel, bypp))) {
+            return false;
+        }
+        qemu_rect_init(&local_src, 0, 0, 1, 1);
+        qemu_rect_init(&local_dst, 0, 0, 1, 1);
+        pixel.src = local_src;
+        pixel.dst = local_dst;
+        pixel.scissor = local_dst;
+        pixel.source_clip_active = false;
+        pixel.src_bits = src_pixel;
+        pixel.dst_bits = dst_pixel;
+        pixel.src_stride = bypp;
+        pixel.dst_stride = bypp;
+        pixel.src_vram_offset = 0;
+        pixel.dst_vram_offset = bypp;
+        pixel.host_data_active = true;
+        pixel.brush_x = (ctx->brush_x - dst_x) & 7;
+        pixel.brush_y = (ctx->brush_y - dst_y) & 7;
+        if (!ati_2d_do_blt_direct(&pixel, local_src, local_dst, 0) ||
+            !ati_2d_surface_write(s, ctx, dst_x, dst_y, dst_pixel, bypp)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ati_2d_do_blt_staged(ATIVGAState *s, const ATI2DCtx *ctx,
+                                 QemuRect vis_src, QemuRect vis_dst,
+                                 bool source_needed)
+{
+    unsigned int row_bytes = vis_dst.width * (ctx->bpp / 8);
+    g_autofree uint8_t *src_row = source_needed ? g_malloc(row_bytes) : NULL;
+    g_autofree uint8_t *dst_row = g_malloc(row_bytes);
+    bool preserve_destination = ati_2d_preserve_destination(ctx);
+    unsigned int yi;
+
+    for (yi = 0; yi < vis_dst.height; yi++) {
+        ATI2DCtx row = *ctx;
+        unsigned int y = ctx->top_to_bottom ? yi :
+                         vis_dst.height - 1 - yi;
+        int src_y = vis_src.y + y;
+        int dst_y = vis_dst.y + y;
+        QemuRect local_src;
+        QemuRect local_dst;
+        bool overlap = false;
+
+        if (source_needed && !ctx->host_data_active &&
+            (!ati_2d_staged_row_overlap(s, ctx, &vis_src, &vis_dst, y,
+                                        row_bytes, &overlap) ||
+             (overlap &&
+              !ati_2d_do_blt_staged_overlap(s, ctx, &vis_src, &vis_dst, y,
+                                             preserve_destination)))) {
+            return false;
+        }
+        if (overlap) {
+            continue;
+        }
+
+        if (source_needed &&
+            !ati_2d_surface_read(s, ctx, true, vis_src.x, src_y,
+                                 src_row, row_bytes)) {
+            return false;
+        }
+        if (preserve_destination) {
+            if (!ati_2d_surface_read(s, ctx, false, vis_dst.x, dst_y,
+                                     dst_row, row_bytes)) {
+                return false;
+            }
+        } else {
+            memset(dst_row, 0, row_bytes);
+        }
+
+        qemu_rect_init(&local_src, 0, 0, vis_src.width, 1);
+        qemu_rect_init(&local_dst, 0, 0, vis_dst.width, 1);
+        row.src = local_src;
+        row.dst = local_dst;
+        row.scissor = local_dst;
+        row.source_clip_active = false;
+        row.src_bits = src_row;
+        row.dst_bits = dst_row;
+        row.src_stride = row_bytes;
+        row.dst_stride = row_bytes;
+        row.src_vram_offset = 0;
+        row.dst_vram_offset = row_bytes;
+        row.host_data_active = true;
+        row.brush_x = (ctx->brush_x - vis_dst.x) & 7;
+        row.brush_y = (ctx->brush_y - dst_y) & 7;
+        if (!ati_2d_do_blt_direct(&row, local_src, local_dst, 0) ||
+            !ati_2d_surface_write(s, ctx, vis_dst.x, dst_y,
+                                  dst_row, row_bytes)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool ati_2d_do_blt(ATIVGAState *s, const ATI2DCtx *ctx,
+                          uint8_t use_pixman, bool account_work)
+{
+    ATI2DCtx direct = *ctx;
+    QemuRect vis_src;
+    QemuRect vis_dst;
+    uint8_t *src_bits;
+    uint8_t *read_bits;
+    uint64_t pixels;
+    uint64_t end;
+    uint64_t read_vram_offset;
+    bool source_needed;
+
+    if (!ctx->bpp) {
+        qemu_log_mask(LOG_GUEST_ERROR, "Invalid bpp\n");
+        return false;
+    }
+    if (!ati_2d_clip_rects(ctx, &vis_src, &vis_dst)) {
+        return false;
+    }
+    if (!ati_2d_prepare_surface(s, ctx, ctx->dst_offset, ctx->dst_stride,
+                                &vis_dst, "destination", true,
+                                &direct.dst_bits,
+                                &direct.dst_vram_offset)) {
+        return false;
+    }
+    if (ati_2d_preserve_destination(ctx) && !direct.dst_bits &&
+        !ati_2d_prepare_surface(s, ctx, ctx->dst_offset, ctx->dst_stride,
+                                &vis_dst, "destination", false, &read_bits,
+                                &read_vram_offset)) {
+        return false;
+    }
+    source_needed = ati_2d_source_needed(ctx);
+    if (source_needed) {
+        if (ctx->host_data_active) {
+            if (!ctx->src_bits ||
+                !ati_2d_rect_layout(ctx, ctx->src_stride, &vis_src,
+                                    "source", &end)) {
+                return false;
+            }
+        } else if (!ati_2d_prepare_surface(s, ctx, ctx->src_offset,
+                                           ctx->src_stride, &vis_src,
+                                           "source", false, &src_bits,
+                                           &direct.src_vram_offset)) {
+            return false;
+        } else {
+            direct.src_bits = src_bits;
+        }
+    }
+    pixels = (uint64_t)vis_dst.width * vis_dst.height;
+    if (pixels > ATI_2D_MAX_PIXELS ||
+        (account_work && !ati_3d_consume_2d_work(s, pixels))) {
+        return false;
+    }
+    DPRINTF("dst: (%d,%d) %dx%d -> vis_dst: (%d,%d) %dx%d\n",
+            ctx->dst.x, ctx->dst.y, ctx->dst.width, ctx->dst.height,
+            vis_dst.x, vis_dst.y, vis_dst.width, vis_dst.height);
+    DPRINTF("src: (%d,%d) %dx%d -> vis_src: (%d,%d) %dx%d\n",
+            ctx->src.x, ctx->src.y, ctx->dst.width, ctx->dst.height,
+            vis_src.x, vis_src.y, vis_src.width, vis_src.height);
+
+    if (direct.dst_bits && (!source_needed || direct.src_bits)) {
+        bool success = ati_2d_do_blt_direct(&direct, vis_src, vis_dst,
+                                            use_pixman);
+
+        /*
+         * Direct rendering either rejects the operation before writing or
+         * completes it, so successful output can be dirtied once here.
+         */
+        if (success) {
+            ati_2d_mark_direct_dirty(&direct, &vis_dst);
+        }
+        return success;
+    }
+    return ati_2d_do_blt_staged(s, &direct, vis_src, vis_dst,
+                                source_needed);
 }
 
 void ati_2d_blt(ATIVGAState *s)
@@ -330,28 +1167,396 @@ void ati_2d_blt(ATIVGAState *s)
         s->host_data.next = 0;
         s->host_data.col = 0;
         s->host_data.row = 0;
+        memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
+        s->host_data.pending_count = 0;
         return;
     }
     setup_2d_blt_ctx(s, &ctx);
-    if (ati_2d_do_blt(&ctx, s->use_pixman)) {
-        ati_set_dirty(&ctx);
+    ati_2d_do_blt(s, &ctx, s->use_pixman, true);
+}
+
+static bool ati_host_data_blit_pixels(ATIVGAState *s, const ATI2DCtx *ctx,
+                                      const uint32_t *pixels,
+                                      unsigned int count,
+                                      unsigned int logical_col,
+                                      bool account_work)
+{
+    ATI2DCtx chunk = *ctx;
+    QemuRect visible;
+    uint8_t stack_buf[128 * sizeof(uint32_t)] = { 0 };
+    g_autofree uint8_t *heap_buf = NULL;
+    uint8_t *pix_buf = stack_buf;
+    unsigned int bypp = ctx->bpp / 8;
+    unsigned int dst_col;
+    unsigned int dst_row;
+    unsigned int stride;
+
+    if (!count) {
+        return true;
+    }
+
+    dst_col = ctx->left_to_right ? logical_col :
+              ctx->dst.width - logical_col - count;
+    dst_row = ctx->top_to_bottom ? s->host_data.row :
+              ctx->dst.height - 1 - s->host_data.row;
+    stride = QEMU_ALIGN_UP(count * bypp, sizeof(uint32_t));
+    if (stride > sizeof(stack_buf)) {
+        heap_buf = g_malloc0(stride);
+        pix_buf = heap_buf;
+    }
+    for (unsigned int i = 0; i < count; i++) {
+        unsigned int buf_col = ctx->left_to_right ? i : count - 1 - i;
+
+        ati_store_pixel(ctx, &pix_buf[buf_col * bypp], pixels[i]);
+    }
+
+    chunk.src_bits = pix_buf;
+    chunk.src.x = 0;
+    chunk.src.y = 0;
+    chunk.src_stride = stride;
+    chunk.dst.x = ctx->dst.x + dst_col;
+    chunk.dst.y = ctx->dst.y + dst_row;
+    chunk.dst.width = count;
+    chunk.dst.height = 1;
+    if (!qemu_rect_intersect(&chunk.dst, &chunk.scissor, &visible)) {
+        return true;
+    }
+    return ati_2d_do_blt(s, &chunk, s->use_pixman, account_work);
+}
+
+static void ati_host_data_advance(ATIVGAState *s, const ATI2DCtx *ctx,
+                                  unsigned int count)
+{
+    s->host_data.col += count;
+    if (s->host_data.col >= ctx->dst.width) {
+        s->host_data.col = 0;
+        s->host_data.row++;
+    }
+    if (s->host_data.row >= ctx->dst.height) {
+        s->host_data.active = false;
     }
 }
 
-bool ati_host_data_flush(ATIVGAState *s)
+static uint32_t ati_radeon_host_data_swap_word(const ATIVGAState *s,
+                                               uint32_t data)
 {
-    ATI2DCtx ctx, chunk;
-    unsigned bypp, pix_count, row, col, idx;
-    uint8_t pix_buf[ATI_HOST_DATA_ACC_BITS * sizeof(uint32_t)];
-    uint32_t src_source = s->regs.dp_mix & DP_SRC_SOURCE;
-    uint32_t src_datatype = s->regs.dp_datatype & DP_SRC_DATATYPE;
+    switch (s->regs.rbbm_guicntl & HOST_DATA_SWAP_MASK) {
+    case HOST_DATA_SWAP_16BIT:
+        return ((data & 0x00ff00ff) << 8) |
+               ((data & 0xff00ff00) >> 8);
+    case HOST_DATA_SWAP_32BIT:
+        return bswap32(data);
+    case HOST_DATA_SWAP_HDW:
+        return (data << 16) | (data >> 16);
+    default:
+        return data;
+    }
+}
 
-    if (!s->host_data.active) {
+static uint32_t ati_rage128_host_data_swap_word(const ATIVGAState *s,
+                                                uint32_t data,
+                                                unsigned int bpp)
+{
+    if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF ||
+        !(s->regs.dp_datatype & HOST_BIG_ENDIAN_EN)) {
+        return data;
+    }
+    if (bpp == 16) {
+        return ((data & 0x00ff00ff) << 8) |
+               ((data & 0xff00ff00) >> 8);
+    }
+    return bpp == 32 ? bswap32(data) : data;
+}
+
+static uint32_t ati_host_data_color(const uint8_t *data, unsigned int bypp)
+{
+    switch (bypp) {
+    case 1:
+        return data[0];
+    case 2:
+        return lduw_le_p(data);
+    case 3:
+        return data[0] | (uint32_t)data[1] << 8 |
+               (uint32_t)data[2] << 16;
+    case 4:
+        return ldl_le_p(data);
+    default:
+        g_assert_not_reached();
+    }
+}
+
+static bool ati_host_data_color_write(ATIVGAState *s, const ATI2DCtx *ctx,
+                                      unsigned int bank,
+                                      unsigned int dwords, bool draw)
+{
+    uint8_t stream[3 + ATI_HOST_DATA_BANK_DWORDS * sizeof(uint32_t)];
+    uint32_t pixels[ARRAY_SIZE(stream)];
+    unsigned int bypp = ctx->bpp / 8;
+    unsigned int total;
+    unsigned int offset = 0;
+    bool success = true;
+
+    memcpy(stream, s->host_data.pending, s->host_data.pending_count);
+    total = s->host_data.pending_count;
+    for (unsigned int i = 0; i < dwords; i++) {
+        uint8_t word[sizeof(uint32_t)];
+
+        stl_le_p(word, ati_rage128_host_data_swap_word(
+            s, s->host_data.acc[bank + i], ctx->bpp));
+        memcpy(stream + total, word, sizeof(word));
+        total += sizeof(word);
+    }
+
+    while (total - offset >= bypp && s->host_data.active) {
+        unsigned int count = MIN((total - offset) / bypp,
+                                 ctx->dst.width - s->host_data.col);
+
+        if (draw) {
+            for (unsigned int i = 0; i < count; i++) {
+                pixels[i] = make_filler(
+                    ctx->bpp,
+                    ati_host_data_color(&stream[offset + i * bypp], bypp));
+            }
+            if (!ati_host_data_blit_pixels(s, ctx, pixels, count,
+                                           s->host_data.col, true)) {
+                s->host_data.active = false;
+                success = false;
+                break;
+            }
+        }
+        offset += count * bypp;
+        ati_host_data_advance(s, ctx, count);
+    }
+
+    if (s->host_data.active) {
+        s->host_data.pending_count = total - offset;
+        memcpy(s->host_data.pending, stream + offset,
+               s->host_data.pending_count);
+    } else {
+        s->host_data.pending_count = 0;
+        memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
+    }
+    return success;
+}
+
+static bool ati_host_data_mono_blit(ATIVGAState *s, const ATI2DCtx *ctx,
+                                    const uint32_t *pixels,
+                                    const bool *foreground,
+                                    unsigned int count,
+                                    uint32_t src_datatype,
+                                    unsigned int start_col)
+{
+    uint8_t rop = ctx->rop3 >> 16;
+    bool pattern_needed = ((rop ^ (rop >> 4)) & 0x0f) != 0;
+    bool destination_needed = ati_2d_destination_needed(ctx);
+    bool preserve_destination = ati_2d_preserve_destination(ctx);
+    uint32_t pixel_mask = ati_pixel_mask(ctx->bpp);
+    unsigned int bypp = ctx->bpp / 8;
+    unsigned int dst_row;
+    unsigned int visible = 0;
+    unsigned int first = 0;
+
+    if (src_datatype == SRC_MONO_FRGD_BKGD) {
+        return ati_host_data_blit_pixels(s, ctx, pixels, count, start_col,
+                                         true);
+    }
+
+    dst_row = ctx->top_to_bottom ? s->host_data.row :
+              ctx->dst.height - 1 - s->host_data.row;
+    while (first < count) {
+        unsigned int last;
+        unsigned int logical_col;
+        unsigned int dst_col;
+        QemuRect run_rect;
+        QemuRect clipped;
+        uint8_t *bits;
+        uint64_t vram_offset;
+
+        while (first < count && !foreground[first]) {
+            first++;
+        }
+        last = first;
+        while (last < count && foreground[last]) {
+            last++;
+        }
+        if (last == first) {
+            break;
+        }
+        logical_col = start_col + first;
+        dst_col = ctx->left_to_right ? logical_col :
+                  ctx->dst.width - logical_col - (last - first);
+        qemu_rect_init(&run_rect, ctx->dst.x + dst_col,
+                       ctx->dst.y + dst_row, last - first, 1);
+        if (!qemu_rect_intersect(&run_rect, &ctx->scissor, &clipped)) {
+            first = last;
+            continue;
+        }
+        if (!ati_2d_prepare_surface(s, ctx, ctx->dst_offset,
+                                    ctx->dst_stride, &clipped,
+                                    "destination", true, &bits,
+                                    &vram_offset) ||
+            ((destination_needed ||
+              (last - first >= 4 && preserve_destination)) &&
+             !ati_2d_prepare_surface(s, ctx, ctx->dst_offset,
+                                     ctx->dst_stride, &clipped,
+                                     "destination", false, &bits,
+                                     &vram_offset))) {
+            return false;
+        }
+        visible += clipped.width;
+        first = last;
+    }
+    if (!ati_3d_consume_2d_work(s, visible)) {
         return false;
     }
-    if (src_source != DP_SRC_HOST) {
+
+    first = 0;
+    while (first < count) {
+        unsigned int last;
+
+        while (first < count && !foreground[first]) {
+            first++;
+        }
+        last = first;
+        while (last < count && foreground[last]) {
+            last++;
+        }
+        if (last == first) {
+            break;
+        }
+        if (last - first >= 4) {
+            if (!ati_host_data_blit_pixels(s, ctx, pixels + first,
+                                           last - first, start_col + first,
+                                           false)) {
+                return false;
+            }
+        } else {
+            for (unsigned int i = first; i < last; i++) {
+                unsigned int logical_col = start_col + i;
+                unsigned int dst_col = ctx->left_to_right ? logical_col :
+                                       ctx->dst.width - 1 - logical_col;
+                int x = ctx->dst.x + dst_col;
+                int y = ctx->dst.y + dst_row;
+                uint8_t dst_pixel[4] = { 0 };
+                uint32_t destination = 0;
+                uint32_t pattern = 0;
+                uint32_t source;
+                uint32_t result;
+
+                if (x < ctx->scissor.x || y < ctx->scissor.y ||
+                    x >= ctx->scissor.x + ctx->scissor.width ||
+                    y >= ctx->scissor.y + ctx->scissor.height) {
+                    continue;
+                }
+                if (pattern_needed &&
+                    !ati_2d_brush_pixel(ctx, x, y, &pattern)) {
+                    continue;
+                }
+                if (destination_needed) {
+                    if (!ati_2d_surface_read(s, ctx, false, x, y,
+                                             dst_pixel, bypp)) {
+                        return false;
+                    }
+                    destination = ati_load_pixel(ctx, dst_pixel);
+                }
+                source = pixels[i];
+                if (ctx->color_compare_active &&
+                    !ati_color_compare(ctx, &source, destination)) {
+                    continue;
+                }
+                result = ati_apply_rop3(rop, pattern, source,
+                                        destination) & pixel_mask;
+                if (ctx->write_mask_active) {
+                    uint32_t mask = ctx->write_mask & pixel_mask;
+
+                    result = (result & mask) | (destination & ~mask);
+                }
+                ati_store_pixel(ctx, dst_pixel,
+                                make_filler(ctx->bpp, result));
+                if (!ati_2d_surface_write(s, ctx, x, y, dst_pixel, bypp)) {
+                    return false;
+                }
+            }
+        }
+        first = last;
+    }
+    return true;
+}
+
+static bool ati_host_data_mono_write(ATIVGAState *s, const ATI2DCtx *ctx,
+                                     unsigned int bank, unsigned int dwords,
+                                     uint32_t src_datatype, bool draw)
+{
+    uint8_t stream[ATI_HOST_DATA_BANK_DWORDS * sizeof(uint32_t)];
+    uint32_t pixels[ARRAY_SIZE(stream) * 8];
+    bool foreground[ARRAY_SIZE(stream) * 8];
+    uint32_t byte_pix_order = s->regs.dp_datatype & DP_BYTE_PIX_ORDER;
+    uint32_t fg = make_filler(ctx->bpp, s->regs.dp_src_frgd_clr);
+    uint32_t bg = make_filler(ctx->bpp, s->regs.dp_src_bkgd_clr);
+    unsigned int total_bits = dwords * sizeof(uint32_t) * 8;
+    unsigned int bit_offset = 0;
+
+    s->host_data.pending_count = 0;
+    memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
+    for (unsigned int i = 0; i < dwords; i++) {
+        stl_le_p(&stream[i * sizeof(uint32_t)],
+                 ati_rage128_host_data_swap_word(
+            s, s->host_data.acc[bank + i], ctx->bpp));
+    }
+
+    while (bit_offset < total_bits && s->host_data.active) {
+        unsigned int old_row = s->host_data.row;
+        unsigned int count = MIN(total_bits - bit_offset,
+                                 ctx->dst.width - s->host_data.col);
+        unsigned int start_col = s->host_data.col;
+
+        if (draw) {
+            for (unsigned int i = 0; i < count; i++) {
+                unsigned int stream_bit = bit_offset + i;
+                uint8_t byte_val = stream[stream_bit / 8];
+                unsigned int bit = stream_bit % 8;
+
+                foreground[i] = byte_val &
+                                BIT(byte_pix_order ? bit : 7 - bit);
+                pixels[i] = foreground[i] ? fg : bg;
+            }
+            if (!ati_host_data_mono_blit(s, ctx, pixels, foreground, count,
+                                         src_datatype, start_col)) {
+                s->host_data.active = false;
+                return false;
+            }
+        }
+        bit_offset += count;
+        ati_host_data_advance(s, ctx, count);
+        if (s->host_data.row != old_row &&
+            ctx->src_source == DP_SRC_HOST_BYTEALIGN) {
+            bit_offset = QEMU_ALIGN_UP(bit_offset, 8);
+        }
+    }
+    return true;
+}
+
+static bool ati_host_data_consume(ATIVGAState *s, unsigned int bank,
+                                  unsigned int dwords)
+{
+    ATI2DCtx ctx;
+    QemuRect visible;
+    uint32_t src_source = s->regs.dp_mix & DP_SRC_SOURCE;
+    uint32_t src_datatype = s->regs.dp_datatype & DP_SRC_DATATYPE;
+    uint8_t rop;
+    bool pattern_needed;
+    bool draw;
+
+    if (!s->host_data.active || !dwords) {
+        return false;
+    }
+    g_assert(bank <= ATI_HOST_DATA_BANK_DWORDS &&
+             dwords <= ATI_HOST_DATA_BANK_DWORDS - bank);
+    if (src_source != DP_SRC_HOST &&
+        src_source != DP_SRC_HOST_BYTEALIGN) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "host_data_blt: unsupported src_source %x\n", src_source);
+        s->host_data.active = false;
         return false;
     }
     if (src_datatype != SRC_MONO_FRGD_BKGD && src_datatype != SRC_MONO_FRGD &&
@@ -359,95 +1564,84 @@ bool ati_host_data_flush(ATIVGAState *s)
         qemu_log_mask(LOG_GUEST_ERROR,
                       "host_data_blt: undefined src_datatype %x\n",
                       src_datatype);
+        s->host_data.active = false;
         return false;
     }
 
     setup_2d_blt_ctx(s, &ctx);
+    rop = ctx.rop3 >> 16;
+    pattern_needed = ((rop ^ (rop >> 4)) & 0x0f) != 0;
 
+    if (!ctx.dst.width || !ctx.dst.height) {
+        s->host_data.active = false;
+        return false;
+    }
+    if (s->host_data.row >= ctx.dst.height ||
+        s->host_data.col >= ctx.dst.width) {
+        s->host_data.active = false;
+        return false;
+    }
+    if ((uint64_t)ctx.dst.width * ctx.dst.height > ATI_2D_MAX_PIXELS) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "host_data_blt: pixel count exceeds limit\n");
+        s->host_data.active = false;
+        return false;
+    }
     if (!ctx.bpp) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "host_data_blt: invalid bpp from datatype\n");
-        return false;
-    }
-    if (ctx.bpp == 24) {
-        qemu_log_mask(LOG_UNIMP,
-                      "host_data_blt: unsupported in 24 bits mode\n");
-        return false;
-    }
-    if (!ctx.left_to_right || !ctx.top_to_bottom) {
-        qemu_log_mask(LOG_UNIMP,
-                      "host_data_blt: unsupported blit direction %c%c\n",
-                      ctx.left_to_right ? '>' : '<',
-                      ctx.top_to_bottom ? 'v' : '^');
-        return false;
-    }
-
-    bypp = ctx.bpp / 8;
-    pix_count = ATI_HOST_DATA_ACC_BITS;
-    if (src_datatype == SRC_COLOR) {
-        pix_count /= ctx.bpp;
-        memcpy(pix_buf, s->host_data.acc, sizeof(s->host_data.acc));
-    } else {
-        /* Expand monochrome bits to color pixels */
-        uint32_t byte_pix_order = s->regs.dp_datatype & DP_BYTE_PIX_ORDER;
-        uint32_t fg = make_filler(ctx.bpp, s->regs.dp_src_frgd_clr);
-        uint32_t bg = make_filler(ctx.bpp, s->regs.dp_src_bkgd_clr);
-
-        if (ctx.need_swap) {
-            bswap32s(&fg);
-            bswap32s(&bg);
-        }
-        idx = 0;
-        for (int word = 0; word < 4; word++) {
-            for (int byte = 0; byte < 4; byte++) {
-                uint8_t byte_val = s->host_data.acc[word] >> (byte * 8);
-                for (int i = 0; i < 8; i++) {
-                    bool is_fg = byte_val & BIT(byte_pix_order ? i : 7 - i);
-                    stn_he_p(&pix_buf[idx], bypp, is_fg ? fg : bg);
-                    idx += bypp;
-                }
-            }
-        }
-    }
-
-    /* Copy and then modify blit ctx for use in a chunked blit */
-    chunk = ctx;
-    chunk.src_bits = pix_buf;
-    chunk.src.y = 0;
-    chunk.src_stride = ATI_HOST_DATA_ACC_BITS * bypp;
-
-    /* Blit one scanline chunk at a time */
-    row = s->host_data.row;
-    col = s->host_data.col;
-    idx = 0;
-    DPRINTF("blt %dpx @ row: %d, col: %d\n", pix_count, row, col);
-    while (idx < pix_count && row < ctx.dst.height) {
-        unsigned pix_in_scanline = MIN(pix_count - idx,
-                                       ctx.dst.width - col);
-        chunk.src.x = idx;
-        /* Build a rect for this scanline chunk */
-        chunk.dst.x = ctx.dst.x + col;
-        chunk.dst.y = ctx.dst.y + row;
-        chunk.dst.width = pix_in_scanline;
-        chunk.dst.height = 1;
-        DPRINTF("blt %dpx span @ row: %d, col: %d to dst (%d,%d)\n",
-                pix_in_scanline, row, col, chunk.dst.x, chunk.dst.y);
-        if (ati_2d_do_blt(&chunk, s->use_pixman)) {
-            ati_set_dirty(&chunk);
-        }
-        idx += pix_in_scanline;
-        col += pix_in_scanline;
-        if (col >= ctx.dst.width) {
-            col = 0;
-            row += 1;
-        }
-    }
-
-    /* Track state of the overall blit for use by the next flush */
-    s->host_data.row = row;
-    s->host_data.col = col;
-    if (s->host_data.row >= ctx.dst.height) {
         s->host_data.active = false;
+        return false;
+    }
+    qemu_rect_intersect(&ctx.dst, &ctx.scissor, &visible);
+    draw = visible.width > 0 && visible.height > 0;
+    if (draw && pattern_needed && !ati_2d_brush_supported(&ctx)) {
+        qemu_log_mask(LOG_UNIMP, "Unsupported ATI 2D brush type %u\n",
+                      ctx.brush_type);
+        s->host_data.active = false;
+        return false;
+    }
+
+    if (src_datatype == SRC_COLOR) {
+        if (!ati_host_data_color_write(s, &ctx, bank, dwords, draw)) {
+            return false;
+        }
+    } else {
+        if (!ati_host_data_mono_write(s, &ctx, bank, dwords, src_datatype,
+                                      draw)) {
+            return false;
+        }
+    }
+
+    return s->host_data.active;
+}
+
+bool ati_host_data_write(ATIVGAState *s, uint32_t data, bool last)
+{
+    if (!s->host_data.active) {
+        return false;
+    }
+
+    if (s->dev_id != PCI_DEVICE_ID_ATI_RAGE128_PF) {
+        data = ati_radeon_host_data_swap_word(s, data);
+    }
+    s->host_data.acc[s->host_data.next] = data;
+    if (last) {
+        ati_host_data_consume(s, 0, s->host_data.next + 1);
+        if (s->host_data.active) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "HOST_DATA blit ended before all data was written\n");
+        }
+        s->host_data.active = false;
+        s->host_data.next = 0;
+        s->host_data.pending_count = 0;
+        memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
+    } else {
+        s->host_data.next++;
+        if (s->host_data.next == ATI_HOST_DATA_BANK_DWORDS) {
+            ati_host_data_consume(s, 0, ATI_HOST_DATA_BANK_DWORDS);
+            s->host_data.next = 0;
+        }
     }
 
     return s->host_data.active;
@@ -455,9 +1649,21 @@ bool ati_host_data_flush(ATIVGAState *s)
 
 void ati_host_data_finish(ATIVGAState *s)
 {
-    if (ati_host_data_flush(s)) {
+    unsigned int dwords;
+
+    if (!s->host_data.active) {
+        return;
+    }
+    dwords = s->host_data.next;
+    if (dwords) {
+        ati_host_data_consume(s, 0, dwords);
+    }
+    if (s->host_data.active) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "HOST_DATA blit ended before all data was written\n");
     }
     s->host_data.active = false;
+    s->host_data.next = 0;
+    s->host_data.pending_count = 0;
+    memset(s->host_data.pending, 0, sizeof(s->host_data.pending));
 }

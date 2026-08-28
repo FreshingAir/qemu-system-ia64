@@ -77,7 +77,7 @@ class HPI2000Boot(QemuSystemTest):
         self.assertIn(b"PCI Root Bridge I/O:  published", output)
         self.assertIn(b"PCI Host Bridge:       published", output)
         self.assertIn(b"ACPI MCFG (PCIe):     suppressed", output)
-        self.assertIn(b"ACPI SSDT (CPU/PS2):    published", output)
+        self.assertIn(b"ACPI SSDT (CPU/UART/PS2): published", output)
         self.assertIn(b"SCSI controller:      LSI53C895A", output)
         self.assertIn(b"Console In:           Serial/PS2 ready", output)
         self.assertIn(b"NVRAM Variables:      enabled", output)

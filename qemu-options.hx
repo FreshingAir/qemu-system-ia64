@@ -2513,7 +2513,7 @@ SRST
 ERST
 
 DEF("vga", HAS_ARG, QEMU_OPTION_vga,
-    "-vga [std|cirrus|vmware|qxl|xenfb|tcx|cg3|virtio|none]\n"
+    "-vga [std|cirrus|vmware|qxl|xenfb|tcx|cg3|virtio|ati|quadro2|none]\n"
     "                select video card type\n", QEMU_ARCH_ALL)
 SRST
 ``-vga type``
@@ -2536,6 +2536,12 @@ SRST
         VMWare SVGA-II compatible adapter. Use it if you have
         sufficiently recent XFree86/XOrg server or Windows guest with a
         driver for this card.
+
+    ``ati``
+        ATI Rage 128 Pro, Radeon RV100, or ES1000 compatible adapter.
+
+    ``quadro2``
+        NVIDIA Quadro2 Pro compatible adapter.
 
     ``qxl``
         QXL paravirtual graphic card. It is VGA compatible (including

@@ -67,8 +67,14 @@
 #define IA64_VBE_IO_DATA             0x01d0U
 #define IA64_VGA_FB_BASE             0x00000000c4000000ULL
 #define IA64_VGA_MMIO_BASE           0x00000000c8000000ULL
+#define IA64_VGA_LARGE_FB_BASE       0x00000000c8000000ULL
+#define IA64_VGA_LARGE_MMIO_BASE     0x00000000d0000000ULL
 #define IA64_VGA_LEGACY_BASE         0x00000000000a0000ULL
 #define IA64_ATI_BIOS_0_SCRATCH      0x0010U
+#define IA64_ATI_VENDOR_ID           0x1002U
+#define IA64_ATI_RV100_DEVICE_ID     0x5159U
+#define IA64_ATI_ES1000_DEVICE_ID    0x515eU
+#define IA64_ATI_TEST_ROM_BASE       0x00000000d0020000ULL
 #define IA64_BDA_VIDEO_MODE          0x00000449ULL
 #define IA64_BDA_VIDEO_COLUMNS       0x0000044aULL
 #define IA64_BDA_VIDEO_PAGE_SIZE     0x0000044cULL
@@ -371,6 +377,50 @@ static void test_int10_rom(void)
     g_assert_cmphex(lduw_le_p(vector + 2), ==,
                     IA64_INT10_ROM_BASE >> 4);
     qtest_quit(qts);
+}
+
+static void assert_ati_model_int10_rom(const char *args, uint16_t device)
+{
+    uint8_t rom[IA64_INT10_ROM_SIZE];
+    uint16_t ati_header;
+    uint16_t ati_pll;
+    unsigned int checksum = 0;
+    QTestState *qts = ia64_vpc_start(args);
+    size_t i;
+
+    qtest_memread(qts, IA64_INT10_ROM_BASE, rom, sizeof(rom));
+    g_assert_cmphex(lduw_le_p(rom + IA64_INT10_ROM_PCIR_OFFSET + 4), ==,
+                    IA64_ATI_VENDOR_ID);
+    g_assert_cmphex(lduw_le_p(rom + IA64_INT10_ROM_PCIR_OFFSET + 6), ==,
+                    device);
+    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_SIGNATURE_OFFSET, 10,
+                    "761295520", 10);
+    ati_header = lduw_le_p(rom + 0x48);
+    g_assert_cmphex(ati_header, ==, IA64_INT10_ROM_ATI_HEADER_OFFSET);
+    ati_pll = lduw_le_p(rom + ati_header + 0x30);
+    g_assert_cmphex(ati_pll, ==, IA64_INT10_ROM_ATI_PLL_OFFSET);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x08), ==, 23000);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x0e), ==, 2700);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x10), ==, 4);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x12), ==, 12000);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x16), ==, 35000);
+    for (i = 0; i < sizeof(rom); i++) {
+        checksum += rom[i];
+    }
+    g_assert_cmphex(checksum & 0xff, ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_int10_rv100_rom(void)
+{
+    assert_ati_model_int10_rom(
+        "-vga ati -global ati-vga.model=rv100", IA64_ATI_RV100_DEVICE_ID);
+}
+
+static void test_int10_es1000_rom(void)
+{
+    assert_ati_model_int10_rom(
+        "-vga ati -global ati-vga.model=es1000", IA64_ATI_ES1000_DEVICE_ID);
 }
 
 static void test_int10_vbe_for_device(const char *extra_args)
@@ -793,6 +843,8 @@ static void test_int10_vbe_invalid_properties(void)
                            "xmax and ymax must be set together");
     assert_vga_start_fails("ati-vga.vgamem_mb=128",
                            "not addressable through the IA-64 framebuffer");
+    assert_vga_start_fails("ati-vga.x-linear-aper-size=100663296",
+                           "must be a power of two");
 
     /* Use a complete property set for validation that happens after realize. */
     const char *argv[] = {
@@ -1496,6 +1548,128 @@ static void test_pci_default_layout(void)
         g_free(lsi);
     }
     assert_pci_device(&gbus.bus, &expected_e1000);
+    qtest_quit(qts);
+}
+
+static void test_pci_es1000_model(void)
+{
+    QTestState *qts = ia64_vpc_start(
+        "-vga ati -global ati-vga.model=es1000");
+    QGenericPCIBus gbus;
+    QPCIDevice *vga;
+    uint32_t saved_bar;
+    uint8_t signature[4];
+
+    ia64_qpci_init(&gbus, qts);
+    vga = qpci_device_find(&gbus.bus, QPCI_DEVFN(5, 0));
+    g_assert_nonnull(vga);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_VENDOR_ID), ==, 0x1002);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_DEVICE_ID), ==, 0x515e);
+    g_assert_cmphex(qpci_config_readb(vga, PCI_REVISION_ID), ==, 0x02);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_CLASS_DEVICE), ==,
+                    PCI_CLASS_DISPLAY_VGA);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    0x103c);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_SUBSYSTEM_ID), ==, 0x31fb);
+    g_assert_cmphex(qpci_config_readb(vga, PCI_CACHE_LINE_SIZE), ==, 0x10);
+    g_assert_cmphex(qpci_config_readb(vga, PCI_LATENCY_TIMER), ==, 0x40);
+    g_assert_cmphex(qpci_config_readb(vga, PCI_MIN_GNT), ==, 0x08);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_0), ==,
+                    IA64_VGA_LARGE_FB_BASE |
+                    PCI_BASE_ADDRESS_MEM_PREFETCH);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_2), ==,
+                    IA64_VGA_LARGE_MMIO_BASE);
+
+    saved_bar = qpci_config_readl(vga, PCI_BASE_ADDRESS_0);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_0, UINT32_MAX);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_0), ==,
+                    0xf8000008U);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_0, saved_bar);
+    saved_bar = qpci_config_readl(vga, PCI_BASE_ADDRESS_1);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_1, UINT32_MAX);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_1), ==,
+                    0xffffff01U);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_1, saved_bar);
+    saved_bar = qpci_config_readl(vga, PCI_BASE_ADDRESS_2);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_2, UINT32_MAX);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_2), ==,
+                    0xffff0000U);
+    qpci_config_writel(vga, PCI_BASE_ADDRESS_2, saved_bar);
+
+    g_assert_cmphex(qpci_config_readb(vga, PCI_CAPABILITY_LIST), ==, 0x50);
+    g_assert_cmphex(qpci_config_readb(vga, 0x50), ==, PCI_CAP_ID_PM);
+    g_assert_cmphex(qpci_config_readb(vga, 0x51), ==, 0x00);
+    g_assert_cmphex(qpci_config_readw(vga, 0x50 + PCI_PM_PMC), ==, 0x0602);
+    g_assert_cmphex(qpci_config_readw(vga, 0x50 + PCI_PM_CTRL), ==, 0x0000);
+
+    saved_bar = qpci_config_readl(vga, PCI_ROM_ADDRESS);
+    qpci_config_writel(vga, PCI_ROM_ADDRESS, UINT32_MAX);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_ROM_ADDRESS), ==,
+                    0xfffe0001U);
+    qpci_config_writel(vga, PCI_ROM_ADDRESS,
+                       IA64_ATI_TEST_ROM_BASE | PCI_ROM_ADDRESS_ENABLE);
+    g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE), ==, 0xaa55);
+    {
+        uint16_t pcir = qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + 0x18);
+
+        qtest_memread(qts, IA64_ATI_TEST_ROM_BASE + pcir,
+                      signature, sizeof(signature));
+        g_assert_cmpmem(signature, sizeof(signature), "PCIR", 4);
+        g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + pcir + 4),
+                        ==, IA64_ATI_VENDOR_ID);
+        g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + pcir + 6),
+                        ==, IA64_ATI_ES1000_DEVICE_ID);
+    }
+    qpci_config_writel(vga, PCI_ROM_ADDRESS, saved_bar);
+    g_free(vga);
+    qtest_quit(qts);
+}
+
+static void test_pci_rv100_model(void)
+{
+    QTestState *qts = ia64_vpc_start(
+        "-vga ati -global ati-vga.model=rv100");
+    QGenericPCIBus gbus;
+    QPCIDevice *vga;
+    uint32_t saved_bar;
+    uint16_t pcir;
+    uint8_t signature[4];
+
+    ia64_qpci_init(&gbus, qts);
+    vga = qpci_device_find(&gbus.bus, QPCI_DEVFN(5, 0));
+    g_assert_nonnull(vga);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_VENDOR_ID), ==,
+                    IA64_ATI_VENDOR_ID);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_DEVICE_ID), ==,
+                    IA64_ATI_RV100_DEVICE_ID);
+    g_assert_cmphex(qpci_config_readb(vga, PCI_REVISION_ID), ==, 0x00);
+    g_assert_cmphex(qpci_config_readw(vga, PCI_CLASS_DEVICE), ==,
+                    PCI_CLASS_DISPLAY_VGA);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_0), ==,
+                    IA64_VGA_LARGE_FB_BASE |
+                    PCI_BASE_ADDRESS_MEM_PREFETCH);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_BASE_ADDRESS_2), ==,
+                    IA64_VGA_LARGE_MMIO_BASE);
+    /* Keep the pre-existing RV100 PCI configuration migration-compatible. */
+    g_assert_cmphex(qpci_config_readb(vga, PCI_CAPABILITY_LIST), ==, 0x00);
+
+    saved_bar = qpci_config_readl(vga, PCI_ROM_ADDRESS);
+    qpci_config_writel(vga, PCI_ROM_ADDRESS, UINT32_MAX);
+    g_assert_cmphex(qpci_config_readl(vga, PCI_ROM_ADDRESS), ==,
+                    0xffff0001U);
+    qpci_config_writel(vga, PCI_ROM_ADDRESS,
+                       IA64_ATI_TEST_ROM_BASE | PCI_ROM_ADDRESS_ENABLE);
+    g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE), ==, 0xaa55);
+    pcir = qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + 0x18);
+    qtest_memread(qts, IA64_ATI_TEST_ROM_BASE + pcir,
+                  signature, sizeof(signature));
+    g_assert_cmpmem(signature, sizeof(signature), "PCIR", 4);
+    g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + pcir + 4), ==,
+                    IA64_ATI_VENDOR_ID);
+    g_assert_cmphex(qtest_readw(qts, IA64_ATI_TEST_ROM_BASE + pcir + 6), ==,
+                    IA64_ATI_RV100_DEVICE_ID);
+    qpci_config_writel(vga, PCI_ROM_ADDRESS, saved_bar);
+    g_free(vga);
     qtest_quit(qts);
 }
 
@@ -2220,6 +2394,10 @@ int main(int argc, char **argv)
     qtest_add_func("/ia64-vpc/acpi-reset-register",
                    test_acpi_reset_register);
     qtest_add_func("/ia64-vpc/vga/int10-rom", test_int10_rom);
+    qtest_add_func("/ia64-vpc/vga/int10-rom-rv100",
+                   test_int10_rv100_rom);
+    qtest_add_func("/ia64-vpc/vga/int10-rom-es1000",
+                   test_int10_es1000_rom);
     qtest_add_func("/ia64-vpc/vga/int10-vbe", test_int10_vbe);
     qtest_add_func("/ia64-vpc/vga/int10-vbe-std", test_int10_vbe_std);
     qtest_add_func("/ia64-vpc/vga/int10-vbe-4k", test_int10_vbe_4k);
@@ -2275,6 +2453,8 @@ int main(int argc, char **argv)
     qtest_add_func("/ia64-vpc/nvram/extended-file",
                    test_nvram_extended_file);
     qtest_add_func("/ia64-vpc/pci/default-layout", test_pci_default_layout);
+    qtest_add_func("/ia64-vpc/pci/es1000-model", test_pci_es1000_model);
+    qtest_add_func("/ia64-vpc/pci/rv100-model", test_pci_rv100_model);
     qtest_add_func("/ia64-vpc/pci/itanium-no-default-ahci",
                    test_pci_itanium_no_default_ahci);
     qtest_add_func("/ia64-vpc/pci/explicit-cmd646-slot0",

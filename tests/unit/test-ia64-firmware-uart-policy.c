@@ -279,6 +279,14 @@ static int test_platform_ssdt_legacy_policy(void)
     static const UINT8 cpu0_enabled[] = { 'C', '0', 'E', 'N' };
     static const UINT8 cpu63_enabled[] = { 'E', '0', '6', '3' };
     static const UINT8 uart[] = { 'U', 'A', 'R', '0' };
+    static const UINT8 uart_enabled[] = { 'U', '0', 'E', 'N' };
+    static const UINT8 uart_hid[] = {
+        0x08, '_', 'H', 'I', 'D', 0x0c, 0x41, 0xd0, 0x05, 0x01,
+    };
+    static const UINT8 uart_io[] = {
+        0x47, 0x01, 0xf8, 0x03, 0xf8, 0x03, 0x01, 0x08,
+    };
+    static const UINT8 uart_irq[] = { 0x22, 0x10, 0x00 };
     static const UINT8 ps2_enabled[] = { 'P', '2', 'E', 'N' };
     static const UINT8 ps2_keyboard[] = { 'P', 'S', '2', 'K' };
     static const UINT8 ps2_mouse[] = { 'P', 'S', '2', 'M' };
@@ -308,7 +316,7 @@ static int test_platform_ssdt_legacy_policy(void)
         mSsdtAmlTemplate, sizeof(mSsdtAmlTemplate),
         ps2m_device, sizeof(ps2m_device));
 
-    if (IA64_SSDT_AML_SIZE != 2194U ||
+    if (IA64_SSDT_AML_SIZE != 2258U ||
         pci0_scope_offset == ~(UINTN)0 || ps2k_offset <= pci0_scope_offset ||
         ps2m_offset <= ps2k_offset ||
         !byte_sequence_present(mSsdtAmlTemplate,
@@ -323,9 +331,21 @@ static int test_platform_ssdt_legacy_policy(void)
         !byte_sequence_present(mSsdtAmlTemplate,
                                sizeof(mSsdtAmlTemplate),
                                cpu63_enabled, sizeof(cpu63_enabled)) ||
-        byte_sequence_present(mSsdtAmlTemplate,
-                              sizeof(mSsdtAmlTemplate),
-                              uart, sizeof(uart)) ||
+        !byte_sequence_present(mSsdtAmlTemplate,
+                               sizeof(mSsdtAmlTemplate),
+                               uart, sizeof(uart)) ||
+        !byte_sequence_present(mSsdtAmlTemplate,
+                               sizeof(mSsdtAmlTemplate),
+                               uart_enabled, sizeof(uart_enabled)) ||
+        !byte_sequence_present(mSsdtAmlTemplate,
+                               sizeof(mSsdtAmlTemplate),
+                               uart_hid, sizeof(uart_hid)) ||
+        !byte_sequence_present(mSsdtAmlTemplate,
+                               sizeof(mSsdtAmlTemplate),
+                               uart_io, sizeof(uart_io)) ||
+        !byte_sequence_present(mSsdtAmlTemplate,
+                               sizeof(mSsdtAmlTemplate),
+                               uart_irq, sizeof(uart_irq)) ||
         !byte_sequence_present(mSsdtAmlTemplate,
                                sizeof(mSsdtAmlTemplate),
                                ps2_enabled, sizeof(ps2_enabled)) ||

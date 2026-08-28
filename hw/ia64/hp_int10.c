@@ -36,6 +36,7 @@
 #define HP_INT10_ROM_PRODUCT          0x01a0U
 #define HP_INT10_ROM_REVISION         0x01c0U
 #define HP_INT10_ROM_MODES            0x01d0U
+#define HP_INT10_ROM_NVIDIA_BMP       0x0600U
 #define HP_INT10_VECTOR_ADDR          (0x10U * 4U)
 
 #define HP_INT10_IO_BASE              0x000001e0U
@@ -71,6 +72,12 @@
 #define HP_INT10_ATI_PLL_DIVIDER      4U
 #define HP_INT10_ATI_PLL_MIN_FREQ     12000U
 #define HP_INT10_ATI_PLL_MAX_FREQ     35000U
+
+#define HP_INT10_NVIDIA_VENDOR_ID     0x10deU
+#define HP_INT10_NVIDIA_BMP_MAJOR     0x05U
+#define HP_INT10_NVIDIA_BMP_MINOR     0x06U
+#define HP_INT10_NVIDIA_PLL_MIN_KHZ   128000U
+#define HP_INT10_NVIDIA_PLL_MAX_KHZ   350000U
 
 enum {
     HP_INT10_REG_AX,
@@ -455,8 +462,8 @@ static bool hp_int10_build_vbe_config(HPIA64Int10 *s, Error **errp)
         HP_INT10_NATIVE_MODE_24,
         HP_INT10_NATIVE_MODE_32,
     };
-    PCIIORegion *fb = &s->vga->io_regions[0];
-    PCIIORegion *mmio = &s->vga->io_regions[2];
+    PCIIORegion *fb = &s->vga->io_regions[s->framebuffer_bar];
+    PCIIORegion *mmio = &s->vga->io_regions[s->mmio_bar];
     qemu_edid_info edid_info = {
         .vendor = "HWP",
         .name = "QEMU HP IA64",
@@ -478,9 +485,10 @@ static bool hp_int10_build_vbe_config(HPIA64Int10 *s, Error **errp)
 
     if (fb->memory == NULL || mmio->memory == NULL) {
         error_setg(errp,
-                   "VGA device '%s' does not provide framebuffer BAR 0 "
-                   "and MMIO BAR 2",
-                   object_get_typename(OBJECT(s->vga)));
+                   "VGA device '%s' does not provide framebuffer BAR %u "
+                   "and MMIO BAR %u",
+                   object_get_typename(OBJECT(s->vga)),
+                   s->framebuffer_bar, s->mmio_bar);
         return false;
     }
     s->framebuffer_size = fb->size;
@@ -1235,6 +1243,46 @@ static void hp_int10_install_ati_bios_info(uint8_t *rom, uint16_t vendor)
              HP_INT10_ATI_PLL_MAX_FREQ);
 }
 
+static void hp_int10_install_nvidia_bios_info(uint8_t *rom, uint16_t vendor)
+{
+    uint8_t *bmp = rom + HP_INT10_ROM_NVIDIA_BMP;
+    uint8_t checksum = 0;
+    size_t i;
+
+    if (vendor != HP_INT10_NVIDIA_VENDOR_ID) {
+        return;
+    }
+
+    /*
+     * Minimal, synthetic NV15 BMP 5.06 metadata.  This is generated from
+     * the public BMP layout rather than copied from an NVIDIA option ROM.
+     * The card is already initialised by QEMU, so legacy init-script
+     * pointers intentionally remain zero.
+     */
+    memcpy(bmp, "\xff\x7f" "NV\0", 5);
+    bmp[5] = HP_INT10_NVIDIA_BMP_MAJOR;
+    bmp[6] = HP_INT10_NVIDIA_BMP_MINOR;
+    for (i = 0; i < 7; i++) {
+        checksum += bmp[i];
+    }
+    bmp[7] = -checksum;
+
+    /* BIOS version 03.15.00.01 and the two emulated DDC CRTC pairs. */
+    bmp[10] = 0x01;
+    bmp[11] = 0x00;
+    bmp[12] = 0x15;
+    bmp[13] = 0x03;
+    bmp[54] = 0;
+    bmp[55] = 0xff;
+    bmp[56] = 1;
+    bmp[58] = 0x3f;
+    bmp[59] = 0x3e;
+    bmp[60] = 0x37;
+    bmp[61] = 0x36;
+    stl_le_p(bmp + 67, HP_INT10_NVIDIA_PLL_MAX_KHZ);
+    stl_le_p(bmp + 71, HP_INT10_NVIDIA_PLL_MIN_KHZ);
+}
+
 static void hp_int10_install_rom(HPIA64Int10 *s)
 {
     uint8_t rom[HP_INT10_ROM_SIZE] = { 0 };
@@ -1279,6 +1327,7 @@ static void hp_int10_install_rom(HPIA64Int10 *s)
     rom[HP_INT10_ROM_PCIR_OFFSET + 0x15] = 0x80;
     memcpy(rom + 0x60, "QEMU HP IA64 INT10", 19);
     hp_int10_install_ati_bios_info(rom, vendor);
+    hp_int10_install_nvidia_bios_info(rom, vendor);
     memcpy(rom + HP_INT10_ROM_HANDLER, hp_int10_handler,
            sizeof(hp_int10_handler));
     memcpy(rom + HP_INT10_ROM_OEM, hp_int10_oem,
@@ -1384,10 +1433,14 @@ bool hp_ia64_int10_init(HPIA64Int10 *s,
     g_assert(config->service_io != NULL);
     g_assert(config->vga_io != NULL);
     g_assert(config->region_name != NULL);
+    g_assert(config->framebuffer_bar < PCI_NUM_REGIONS);
+    g_assert(config->mmio_bar < PCI_NUM_REGIONS);
 
     s->vga = config->vga;
     s->vga_io = config->vga_io;
     s->framebuffer_base = config->framebuffer_base;
+    s->framebuffer_bar = config->framebuffer_bar;
+    s->mmio_bar = config->mmio_bar;
     if (!hp_int10_read_properties(s, errp) ||
         !hp_int10_build_vbe_config(s, errp)) {
         return false;

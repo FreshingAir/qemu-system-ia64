@@ -2125,6 +2125,8 @@ PCIDevice *pci_vga_new(void)
         return pci_new(-1, "cirrus-vga");
     case VGA_ATI:
         return pci_new(-1, "ati-vga");
+    case VGA_NVIDIA_QUADRO2:
+        return pci_new(-1, "nvidia-quadro2");
     case VGA_QXL:
         return pci_new(-1, "qxl-vga");
     case VGA_STD:

@@ -9,6 +9,7 @@
 #include "hw/core/qdev-properties.h"
 #include "hw/core/sysbus.h"
 #include "hw/display/ati_int.h"
+#include "hw/display/nvidia_quadro2.h"
 #include "hw/ia64/hp_int10.h"
 #include "hw/ia64/hp_i2000.h"
 #include "hw/ia64/hp_ia64.h"
@@ -78,6 +79,8 @@
 #define HP_I2000_RAGE128_FB_BAR      UINT32_C(0x90000000)
 #define HP_I2000_RAGE128_IO_BAR      UINT32_C(0x00001000)
 #define HP_I2000_RAGE128_MMIO_BAR    UINT32_C(0x94000000)
+#define HP_I2000_QUADRO2_FB_BAR      UINT32_C(0x90000000)
+#define HP_I2000_QUADRO2_MMIO_BAR    UINT32_C(0x98000000)
 #define HP_I2000_VGA_LEGACY_BASE     UINT64_C(0x000a0000)
 #define HP_I2000_VGA_LEGACY_SIZE     UINT64_C(0x00020000)
 #define HP_I2000_IDE_CHANNELS         2U
@@ -135,7 +138,7 @@ struct HPI2000MachineState {
     Intel460GXRootHostState *roots[HP_I2000_PCI_ROOT_COUNT];
     Intel460GXDMA *dma[HP_I2000_PCI_ROOT_COUNT];
     Intel82468GXIFBState *ifb;
-    PCIDevice *rage128;
+    PCIDevice *vga;
     HPIA64Int10 int10;
     PCIDevice *i82559;
     PCIDevice *lsi;
@@ -814,24 +817,31 @@ static bool hp_i2000_create_pci_devices(HPI2000MachineState *s,
     BusState *scsi_bus;
     unsigned int channel, unit, irq;
 
-    s->rage128 = pci_vga_new();
-    if (s->rage128) {
-        if (!object_dynamic_cast(OBJECT(s->rage128), TYPE_ATI_VGA)) {
-            error_setg(errp, "%s supports ATI VGA or no VGA",
+    s->vga = pci_vga_new();
+    if (s->vga) {
+        bool is_ati = object_dynamic_cast(OBJECT(s->vga), TYPE_ATI_VGA);
+        bool is_quadro2 = object_dynamic_cast(OBJECT(s->vga),
+                                              TYPE_NVIDIA_QUADRO2);
+
+        if (!is_ati && !is_quadro2) {
+            error_setg(errp,
+                       "%s supports ATI VGA, NVIDIA Quadro2 Pro, or no VGA",
                        TYPE_HP_I2000_MACHINE);
-            object_unref(OBJECT(s->rage128));
-            s->rage128 = NULL;
+            object_unref(OBJECT(s->vga));
+            s->vga = NULL;
             return false;
         }
-        s->rage128->devfn = PCI_DEVFN(HP_I2000_RAGE128_SLOT, 0);
-        qdev_prop_set_string(DEVICE(s->rage128), "model", "rage128p");
-        qdev_prop_set_uint32(DEVICE(s->rage128), "vgamem_mb", 64);
-        qdev_prop_set_uint32(DEVICE(s->rage128), "xres", 1280);
-        qdev_prop_set_uint32(DEVICE(s->rage128), "yres", 1024);
-        qdev_prop_set_uint32(DEVICE(s->rage128), "xmax", 1280);
-        qdev_prop_set_uint32(DEVICE(s->rage128), "ymax", 1024);
-        qdev_prop_set_string(DEVICE(s->rage128), "romfile", "");
-        if (!pci_realize_and_unref(s->rage128, root0, errp)) {
+        s->vga->devfn = PCI_DEVFN(HP_I2000_RAGE128_SLOT, 0);
+        if (is_ati) {
+            qdev_prop_set_string(DEVICE(s->vga), "model", "rage128p");
+        }
+        qdev_prop_set_uint32(DEVICE(s->vga), "vgamem_mb", 64);
+        qdev_prop_set_uint32(DEVICE(s->vga), "xres", 1280);
+        qdev_prop_set_uint32(DEVICE(s->vga), "yres", 1024);
+        qdev_prop_set_uint32(DEVICE(s->vga), "xmax", 1280);
+        qdev_prop_set_uint32(DEVICE(s->vga), "ymax", 1024);
+        qdev_prop_set_string(DEVICE(s->vga), "romfile", "");
+        if (!pci_realize_and_unref(s->vga, root0, errp)) {
             return false;
         }
         memory_region_init_alias(
@@ -939,17 +949,27 @@ static void hp_i2000_configure_pci(HPI2000MachineState *s)
         pci_default_write_config(
             usb, PCI_INTERRUPT_LINE, HP_I2000_IFB_USB_GSI, 1);
     }
-    if (s->rage128) {
-        pci_default_write_config(s->rage128, PCI_BASE_ADDRESS_0,
+    if (s->vga && object_dynamic_cast(OBJECT(s->vga), TYPE_ATI_VGA)) {
+        pci_default_write_config(s->vga, PCI_BASE_ADDRESS_0,
                                  HP_I2000_RAGE128_FB_BAR, 4);
-        pci_default_write_config(s->rage128, PCI_BASE_ADDRESS_1,
+        pci_default_write_config(s->vga, PCI_BASE_ADDRESS_1,
                                  HP_I2000_RAGE128_IO_BAR, 4);
-        pci_default_write_config(s->rage128, PCI_BASE_ADDRESS_2,
+        pci_default_write_config(s->vga, PCI_BASE_ADDRESS_2,
                                  HP_I2000_RAGE128_MMIO_BAR, 4);
         pci_default_write_config(
-            s->rage128, PCI_COMMAND,
+            s->vga, PCI_COMMAND,
             PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
-        pci_default_write_config(s->rage128, PCI_INTERRUPT_LINE,
+        pci_default_write_config(s->vga, PCI_INTERRUPT_LINE,
+                                 HP_I2000_RAGE128_GSI, 1);
+    } else if (s->vga) {
+        pci_default_write_config(s->vga, PCI_BASE_ADDRESS_0,
+                                 HP_I2000_QUADRO2_MMIO_BAR, 4);
+        pci_default_write_config(s->vga, PCI_BASE_ADDRESS_1,
+                                 HP_I2000_QUADRO2_FB_BAR, 4);
+        pci_default_write_config(
+            s->vga, PCI_COMMAND,
+            PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER, 2);
+        pci_default_write_config(s->vga, PCI_INTERRUPT_LINE,
                                  HP_I2000_RAGE128_GSI, 1);
     }
     if (s->lsi) {
@@ -980,17 +1000,22 @@ static void hp_i2000_configure_pci(HPI2000MachineState *s)
 static bool hp_i2000_init_int10(HPI2000MachineState *s, Error **errp)
 {
     HPIA64Int10Config config;
+    bool is_quadro2;
 
-    if (!s->rage128) {
+    if (!s->vga) {
         return true;
     }
+    is_quadro2 = object_dynamic_cast(OBJECT(s->vga), TYPE_NVIDIA_QUADRO2);
 
     config = (HPIA64Int10Config) {
         .owner = OBJECT(s),
-        .vga = s->rage128,
+        .vga = s->vga,
         .service_io = intel_460gx_root_host_io(s->roots[0]),
         .vga_io = &s->root_io[0],
-        .framebuffer_base = HP_I2000_RAGE128_FB_BAR,
+        .framebuffer_base = is_quadro2 ? HP_I2000_QUADRO2_FB_BAR :
+                                        HP_I2000_RAGE128_FB_BAR,
+        .framebuffer_bar = is_quadro2 ? 1 : 0,
+        .mmio_bar = is_quadro2 ? 0 : 2,
         .region_name = "hp-i2000.int10-pci-io",
     };
     return hp_ia64_int10_init(&s->int10, &config, errp);
@@ -1357,7 +1382,7 @@ static void hp_i2000_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_cpu_type = IA64_CPU_TYPE_NAME("merced");
     mc->default_ram_size = HP_I2000_MIN_RAM_SIZE;
     mc->default_ram_id = "hp-i2000.ram";
-    mc->default_display = "ati";
+    mc->default_display = "quadro2";
     mc->default_nic = "i82559c";
     mc->default_machine_opts = "firmware=ia64-firmware.bin";
     mc->max_cpus = 2;

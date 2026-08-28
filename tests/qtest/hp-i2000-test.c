@@ -25,6 +25,7 @@
 #define HP_I2000_LOW_DESCRIPTOR_SIZE  840U
 #define HP_I2000_HIGH_DESCRIPTOR_SIZE 856U
 #define HP_I2000_RAGE128_ROM_BASE     UINT64_C(0x000c0000)
+#define HP_I2000_QUADRO2_BMP_OFFSET   UINT64_C(0x00000600)
 #define HP_I2000_RAGE128_ROM_SIZE     0x0800U
 #define HP_I2000_RAGE128_PCIR_OFFSET  0x0020U
 #define HP_I2000_INT10_HANDLER_OFFSET 0x0100U
@@ -36,6 +37,49 @@
 #define HP_I2000_INT10_TRIGGER        0x4941U
 #define HP_I2000_VBE2_SIGNATURE       UINT32_C(0x32454256)
 #define HP_I2000_RAGE128_FB_BASE      UINT64_C(0x90000000)
+#define HP_I2000_QUADRO2_FB_BASE      UINT64_C(0x90000000)
+#define HP_I2000_QUADRO2_MMIO_BASE    UINT64_C(0x98000000)
+#define HP_I2000_QUADRO2_VRAM_SIZE    (64 * MiB)
+#define HP_I2000_QUADRO2_PRAMIN       UINT64_C(0x00700000)
+#define HP_I2000_QUADRO2_OBJECT_CACHE 128U
+#define HP_I2000_QUADRO2_PMC_BOOT_0   UINT64_C(0x00000000)
+#define HP_I2000_QUADRO2_PFB_FIFO     UINT64_C(0x0010020c)
+#define HP_I2000_QUADRO2_PFB_CFG0     UINT64_C(0x00100200)
+#define HP_I2000_QUADRO2_PFB_CFG1     UINT64_C(0x00100204)
+#define HP_I2000_QUADRO2_PEXTDEV_BOOT UINT64_C(0x00101000)
+#define HP_I2000_QUADRO2_PMC_INTR     UINT64_C(0x00000100)
+#define HP_I2000_QUADRO2_PMC_INTR_EN  UINT64_C(0x00000140)
+#define HP_I2000_QUADRO2_PMC_ENABLE   UINT64_C(0x00000200)
+#define HP_I2000_QUADRO2_PFIFO_INTR_EN UINT64_C(0x00002140)
+#define HP_I2000_QUADRO2_PFIFO_INTR   UINT64_C(0x00002100)
+#define HP_I2000_QUADRO2_PFIFO_RAMHT  UINT64_C(0x00002210)
+#define HP_I2000_QUADRO2_PFIFO_RAMFC  UINT64_C(0x00002214)
+#define HP_I2000_QUADRO2_PFIFO_MODE   UINT64_C(0x00002504)
+#define HP_I2000_QUADRO2_PFIFO_DMA_PUSH UINT64_C(0x00003220)
+#define HP_I2000_QUADRO2_PFIFO_DMA_STATE UINT64_C(0x00003228)
+#define HP_I2000_QUADRO2_PFIFO_DMA_GET UINT64_C(0x00003244)
+#define HP_I2000_QUADRO2_PFIFO_DMA_ERROR_INVALID_METHOD (2U << 29)
+#define HP_I2000_QUADRO2_PFIFO_DMA_ERROR_INVALID_COMMAND (4U << 29)
+#define HP_I2000_QUADRO2_PFIFO_DMA_PUSH_STATUS BIT(12)
+#define HP_I2000_QUADRO2_PGRAPH_INTR UINT64_C(0x00400100)
+#define HP_I2000_QUADRO2_PGRAPH_NSTATUS UINT64_C(0x00400104)
+#define HP_I2000_QUADRO2_PGRAPH_NSOURCE UINT64_C(0x00400108)
+#define HP_I2000_QUADRO2_PGRAPH_STATUS UINT64_C(0x00400700)
+#define HP_I2000_QUADRO2_PGRAPH_FIFO_ACCESS UINT64_C(0x00400720)
+#define HP_I2000_QUADRO2_PGRAPH_INTR_ERROR BIT(20)
+#define HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION BIT(26)
+#define HP_I2000_QUADRO2_PGRAPH_NSOURCE_ILLEGAL_METHOD BIT(6)
+#define HP_I2000_QUADRO2_USER         UINT64_C(0x00800000)
+#define HP_I2000_QUADRO2_USER_DMA_PUT UINT64_C(0x00000040)
+#define HP_I2000_QUADRO2_USER_DMA_GET UINT64_C(0x00000044)
+#define HP_I2000_QUADRO2_PCRTC_INTR   UINT64_C(0x00600100)
+#define HP_I2000_QUADRO2_PCRTC_INTR_EN UINT64_C(0x00600140)
+#define HP_I2000_QUADRO2_PCRTC_START  UINT64_C(0x00600800)
+#define HP_I2000_QUADRO2_CRTC_INDEX   UINT64_C(0x006013d4)
+#define HP_I2000_QUADRO2_CRTC_DATA    UINT64_C(0x006013d5)
+#define HP_I2000_QUADRO2_INTR_PCRTC   BIT(24)
+#define HP_I2000_QUADRO2_RAMHT_VALID  BIT(31)
+#define HP_I2000_QUADRO2_RAMHT_GRAPHICS BIT(16)
 #define HP_I2000_VGA_PLANAR_SIZE      (256 * KiB)
 #define HP_I2000_VGA_LEGACY_BASE      UINT64_C(0x000a0000)
 #define HP_I2000_BDA_VIDEO_MODE       UINT64_C(0x00000449)
@@ -49,12 +93,15 @@
 #define HP_I2000_VBE_DATA_PORT        0x01d0U
 #define HP_I2000_VBE_ENABLE_INDEX     0x0004U
 #define HP_I2000_VGA_MISC_READ_PORT   0x03ccU
+#define HP_I2000_VGA_MISC_WRITE_PORT  0x03c2U
 #define HP_I2000_VGA_SEQ_INDEX_PORT   0x03c4U
 #define HP_I2000_VGA_SEQ_DATA_PORT    0x03c5U
 #define HP_I2000_VGA_CRTC_INDEX_PORT  0x03d4U
 #define HP_I2000_VGA_CRTC_DATA_PORT   0x03d5U
 #define HP_I2000_VGA_GFX_INDEX_PORT   0x03ceU
 #define HP_I2000_VGA_GFX_DATA_PORT    0x03cfU
+#define HP_I2000_VGA_ATTR_INDEX_PORT  0x03c0U
+#define HP_I2000_VGA_STATUS_PORT      0x03daU
 #define HP_I2000_PIC_MASTER_COMMAND   0x20U
 #define HP_I2000_PIC_MASTER_DATA      0x21U
 #define HP_I2000_PIC_SLAVE_COMMAND    0xa0U
@@ -116,6 +163,135 @@ static void hp_i2000_assert_ppm_pixel(const char *filename, unsigned width,
     g_assert_cmphex(pixel[0], ==, red);
     g_assert_cmphex(pixel[1], ==, green);
     g_assert_cmphex(pixel[2], ==, blue);
+}
+
+static void hp_i2000_quadro2_crtc_write(QTestState *qts, uint8_t index,
+                                        uint8_t value)
+{
+    qtest_writeb(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                       HP_I2000_QUADRO2_CRTC_INDEX, index);
+    qtest_writeb(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                       HP_I2000_QUADRO2_CRTC_DATA, value);
+}
+
+static uint8_t hp_i2000_quadro2_crtc_read(QTestState *qts, uint8_t index)
+{
+    qtest_writeb(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                       HP_I2000_QUADRO2_CRTC_INDEX, index);
+    return qtest_readb(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                            HP_I2000_QUADRO2_CRTC_DATA);
+}
+
+static void hp_i2000_quadro2_ddc_lines(QTestState *qts, bool clock,
+                                       bool data)
+{
+    hp_i2000_quadro2_crtc_write(qts, 0x3f,
+                                BIT(0) | (clock ? BIT(5) : 0) |
+                                (data ? BIT(4) : 0));
+}
+
+static void hp_i2000_quadro2_ddc_start(QTestState *qts)
+{
+    hp_i2000_quadro2_ddc_lines(qts, true, true);
+    hp_i2000_quadro2_ddc_lines(qts, true, false);
+    hp_i2000_quadro2_ddc_lines(qts, false, false);
+}
+
+static void hp_i2000_quadro2_ddc_stop(QTestState *qts)
+{
+    hp_i2000_quadro2_ddc_lines(qts, false, false);
+    hp_i2000_quadro2_ddc_lines(qts, true, false);
+    hp_i2000_quadro2_ddc_lines(qts, true, true);
+}
+
+static bool hp_i2000_quadro2_ddc_send(QTestState *qts, uint8_t value)
+{
+    unsigned int i;
+
+    for (i = 0; i < 8; i++) {
+        bool bit = value & (0x80U >> i);
+
+        hp_i2000_quadro2_ddc_lines(qts, false, bit);
+        hp_i2000_quadro2_ddc_lines(qts, true, bit);
+        hp_i2000_quadro2_ddc_lines(qts, false, bit);
+    }
+    hp_i2000_quadro2_ddc_lines(qts, false, true);
+    hp_i2000_quadro2_ddc_lines(qts, true, true);
+    value = hp_i2000_quadro2_crtc_read(qts, 0x3e);
+    hp_i2000_quadro2_ddc_lines(qts, false, true);
+    return !(value & BIT(3));
+}
+
+static uint8_t hp_i2000_quadro2_ddc_read(QTestState *qts, bool acknowledge)
+{
+    uint8_t value = 0;
+    unsigned int i;
+
+    for (i = 0; i < 8; i++) {
+        hp_i2000_quadro2_ddc_lines(qts, false, true);
+        hp_i2000_quadro2_ddc_lines(qts, true, true);
+        value = (value << 1) |
+                !!(hp_i2000_quadro2_crtc_read(qts, 0x3e) & BIT(3));
+        hp_i2000_quadro2_ddc_lines(qts, false, true);
+    }
+    hp_i2000_quadro2_ddc_lines(qts, false, !acknowledge);
+    hp_i2000_quadro2_ddc_lines(qts, true, !acknowledge);
+    hp_i2000_quadro2_ddc_lines(qts, false, true);
+    return value;
+}
+
+static uint32_t hp_i2000_quadro2_dma_header(uint32_t method,
+                                            unsigned int subchannel,
+                                            unsigned int count)
+{
+    g_assert_cmphex(method & 3, ==, 0);
+    g_assert_cmpuint(subchannel, <, 8);
+    g_assert_cmpuint(count, <, 0x800);
+    return method | (subchannel << 13) | (count << 18);
+}
+
+static uint32_t hp_i2000_quadro2_ramht_hash(uint32_t handle,
+                                            unsigned int channel,
+                                            unsigned int bits)
+{
+    uint32_t hash = 0;
+    uint32_t mask = (1U << bits) - 1;
+
+    while (handle) {
+        hash ^= handle & mask;
+        handle >>= bits;
+    }
+    return (hash ^ (channel << (bits - 4))) & mask;
+}
+
+static void hp_i2000_quadro2_ramht_insert(QTestState *qts,
+                                          uint32_t ramht_offset,
+                                          unsigned int ramht_bits,
+                                          unsigned int channel,
+                                          uint32_t handle,
+                                          uint32_t engine,
+                                          uint32_t instance)
+{
+    uint32_t entries = 1U << ramht_bits;
+    uint32_t slot = hp_i2000_quadro2_ramht_hash(handle, channel,
+                                                ramht_bits);
+    unsigned int i;
+
+    for (i = 0; i < entries; i++, slot = (slot + 1) & (entries - 1)) {
+        uint64_t address = HP_I2000_QUADRO2_MMIO_BASE +
+                           HP_I2000_QUADRO2_PRAMIN + ramht_offset + slot * 8;
+
+        if (!(qtest_readl(qts, address + 4) &
+              HP_I2000_QUADRO2_RAMHT_VALID)) {
+            qtest_writel(qts, address, handle);
+            qtest_writel(qts, address + 4,
+                         HP_I2000_QUADRO2_RAMHT_VALID |
+                         engine |
+                         (channel << 24) | (instance >> 4));
+            return;
+        }
+    }
+    g_assert_not_reached();
 }
 
 static QTestState *hp_i2000_start(const char *memory)
@@ -408,7 +584,9 @@ static uint8_t hp_i2000_vga_indexed_read(QTestState *qts,
     return hp_i2000_inb(qts, data_port);
 }
 
-static void hp_i2000_assert_int10_rom(QTestState *qts)
+static void hp_i2000_assert_int10_rom_device(QTestState *qts,
+                                              uint16_t vendor,
+                                              uint16_t device)
 {
     uint8_t rom[HP_I2000_RAGE128_ROM_SIZE];
     uint8_t vector[4];
@@ -421,8 +599,8 @@ static void hp_i2000_assert_int10_rom(QTestState *qts)
     pcir = lduw_le_p(rom + 0x18);
     g_assert_cmphex(pcir, ==, HP_I2000_RAGE128_PCIR_OFFSET);
     g_assert_cmpmem(rom + pcir, 4, "PCIR", 4);
-    g_assert_cmphex(lduw_le_p(rom + pcir + 4), ==, 0x1002);
-    g_assert_cmphex(lduw_le_p(rom + pcir + 6), ==, 0x5046);
+    g_assert_cmphex(lduw_le_p(rom + pcir + 4), ==, vendor);
+    g_assert_cmphex(lduw_le_p(rom + pcir + 6), ==, device);
     g_assert_cmpuint(lduw_le_p(rom + pcir + 0x10) * 512U, ==,
                      sizeof(rom));
     g_assert_cmphex(hp_i2000_checksum(rom, sizeof(rom)), ==, 0);
@@ -433,6 +611,11 @@ static void hp_i2000_assert_int10_rom(QTestState *qts)
                     HP_I2000_INT10_HANDLER_OFFSET);
     g_assert_cmphex(lduw_le_p(vector + 2), ==,
                     HP_I2000_RAGE128_ROM_BASE >> 4);
+}
+
+static void hp_i2000_assert_int10_rom(QTestState *qts)
+{
+    hp_i2000_assert_int10_rom_device(qts, 0x1002, 0x5046);
 }
 
 static void hp_i2000_int10_write_request(
@@ -1204,15 +1387,7 @@ static void test_hp_i2000_graphics_defaults(void)
 {
     QTestState *qts = hp_i2000_start_defaults("");
 
-    hp_i2000_assert_rage128(qts);
-    g_assert_cmphex(qtest_readl(qts, UINT64_C(0x940000f8)), ==, 0x04000000);
-    qtest_writel(qts, UINT64_C(0x90001000), 0x12345678);
-    g_assert_cmphex(qtest_readl(qts, UINT64_C(0x90001000)), ==, 0x12345678);
-
-    hp_i2000_config_writel(qts, 0, PCI_DEVFN(5, 0), PCI_BASE_ADDRESS_0, 0);
-    hp_i2000_config_writew(qts, 0, PCI_DEVFN(5, 0), PCI_COMMAND, 0);
-    qtest_system_reset(qts);
-    hp_i2000_assert_rage128(qts);
+    hp_i2000_assert_device(qts, 0, PCI_DEVFN(5, 0), 0x10de, 0x0153);
     qtest_quit(qts);
 }
 
@@ -1232,6 +1407,1326 @@ static void test_hp_i2000_graphics_options(void)
     qts = hp_i2000_start_with_options("-vga ati");
     hp_i2000_assert_rage128(qts);
     qtest_quit(qts);
+}
+
+static void test_hp_i2000_quadro2(void)
+{
+    static const uint8_t edid_header[] = {
+        0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00,
+    };
+    const unsigned int devfn = PCI_DEVFN(5, 0);
+    const uint32_t marker = 0x1234abcd;
+    const uint32_t scanout_offset = 0x1000;
+    const uint32_t ramht_offset = 0x10000;
+    const uint32_t ramfc_offset = 0x18000;
+    const uint32_t push_dma_instance = 0x19000;
+    const uint32_t vram_dma_instance = 0x19010;
+    const uint32_t surface_instance = 0x19020;
+    const uint32_t rectangle_instance = 0x19030;
+    const uint32_t blit_instance = 0x19040;
+    const uint32_t rop_instance = 0x19050;
+    const uint32_t pattern_instance = 0x19060;
+    const uint32_t scaled_instance = 0x19070;
+    const uint32_t fb_dma_instance = 0x19080;
+    const uint32_t clip_instance = 0x19090;
+    const uint32_t line_instance = 0x190a0;
+    const uint32_t nv4_scaled_instance = 0x190b0;
+    const uint32_t alternate_surface_instance = 0x190c0;
+    const uint32_t colliding_rop_instance = 0x19820;
+    const uint32_t cache_filler_instance = 0x20000;
+    const uint32_t push_offset = 0x20000;
+    const uint32_t source_offset = 0x400000;
+    const uint32_t dest_offset = 0x500000;
+    const uint32_t scaled_source_offset = 0x410000;
+    const uint32_t scaled_dest_offset = 0x510000;
+    const uint32_t overlap_offset = 0x520000;
+    const uint32_t scaled_unsigned_dest_offset = 0x530000;
+    const uint32_t scaled_unsigned_x = 0x8000;
+    const uint32_t pitch = 256;
+    const uint32_t dma_handle = 0x80000001;
+    const uint32_t surface_handle = 0x80000002;
+    const uint32_t rectangle_handle = 0x80000003;
+    const uint32_t blit_handle = 0x80000004;
+    const uint32_t rop_handle = 0x80000005;
+    const uint32_t pattern_handle = 0x80000006;
+    const uint32_t scaled_handle = 0x80000007;
+    const uint32_t nvidiafb_surface_handle = 0x80000010;
+    const uint32_t nvidiafb_rop_handle = 0x80000011;
+    const uint32_t nvidiafb_pattern_handle = 0x80000012;
+    const uint32_t nvidiafb_clip_handle = 0x80000013;
+    const uint32_t nvidiafb_line_handle = 0x80000014;
+    const uint32_t nvidiafb_blit_handle = 0x80000015;
+    const uint32_t nvidiafb_gdi_handle = 0x80000016;
+    const uint32_t nvidiafb_scaled_handle = 0x80000017;
+    const uint32_t alternate_surface_handle = 0x80000018;
+    const uint32_t colliding_rop_handle = 0x80000019;
+    const uint32_t cache_filler_handle = 0x90000000;
+    const uint32_t mono_background = 0x00112233;
+    const uint32_t mono_foreground = 0x00aabbcc;
+    const uint32_t transparent_foreground = 0x7faabbcc;
+    const uint32_t rop_pattern = 0xf0f0f0f0;
+    const uint32_t rop_source = 0xcccccccc;
+    const uint32_t rop_destination = 0xaaaaaaaa;
+    const uint32_t line_color = 0x00010203;
+    const uint32_t cpoly_color0 = 0x00030405;
+    const uint32_t cpoly_color1 = 0x00060708;
+    uint32_t push[2048];
+    unsigned int push_count = 0;
+    uint8_t edid_actual[sizeof(edid_header)];
+    uint8_t bmp_header[8];
+    uint8_t bmp_checksum = 0;
+    uint32_t pmc_enable;
+    g_autofree char *tmpdir = NULL;
+    g_autofree char *ppm = NULL;
+    g_autoptr(GError) error = NULL;
+    QTestState *qts = hp_i2000_start_with_options("-vga quadro2");
+    unsigned int i;
+    unsigned int x;
+    unsigned int y;
+
+    hp_i2000_assert_device(qts, 0, devfn, 0x10de, 0x0153);
+    g_assert_cmphex(hp_i2000_config_readb(
+                        qts, 0, devfn, PCI_REVISION_ID), ==, 0xa4);
+    g_assert_cmphex(hp_i2000_config_readw(
+                        qts, 0, devfn, PCI_CLASS_DEVICE), ==, 0x0300);
+    g_assert_cmphex(hp_i2000_config_readw(
+                        qts, 0, devfn, PCI_SUBSYSTEM_VENDOR_ID), ==, 0x10de);
+    g_assert_cmphex(hp_i2000_config_readw(
+                        qts, 0, devfn, PCI_SUBSYSTEM_ID), ==, 0x006d);
+    g_assert_cmphex(hp_i2000_config_readw(
+                        qts, 0, devfn, PCI_COMMAND), ==,
+                    PCI_COMMAND_IO | PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    g_assert_cmphex(hp_i2000_config_readl(
+                        qts, 0, devfn, PCI_BASE_ADDRESS_0), ==, 0x98000000);
+    g_assert_cmphex(hp_i2000_config_readl(
+                        qts, 0, devfn, PCI_BASE_ADDRESS_1), ==, 0x90000008);
+    g_assert_cmphex(hp_i2000_config_readb(
+                        qts, 0, devfn, PCI_INTERRUPT_LINE), ==, 16);
+    g_assert_cmphex(hp_i2000_config_readb(
+                        qts, 0, devfn, PCI_INTERRUPT_PIN), ==, 1);
+
+    g_assert_cmphex(hp_i2000_config_readb(
+                        qts, 0, devfn, PCI_CAPABILITY_LIST), ==, 0x60);
+    g_assert_cmphex(hp_i2000_config_readb(qts, 0, devfn, 0x60), ==,
+                    PCI_CAP_ID_PM);
+    g_assert_cmphex(hp_i2000_config_readb(qts, 0, devfn, 0x61), ==, 0x44);
+    g_assert_cmphex(hp_i2000_config_readb(qts, 0, devfn, 0x44), ==,
+                    PCI_CAP_ID_AGP);
+    g_assert_cmphex(hp_i2000_config_readb(qts, 0, devfn, 0x46), ==, 0x20);
+    g_assert_cmphex(hp_i2000_config_readl(qts, 0, devfn, 0x48), ==,
+                    0x1f000017);
+
+    g_assert_cmphex(qtest_readl(
+                        qts, HP_I2000_QUADRO2_MMIO_BASE +
+                             HP_I2000_QUADRO2_PMC_BOOT_0), ==, 0x015000a4);
+    g_assert_cmphex(qtest_readl(
+                        qts, HP_I2000_QUADRO2_MMIO_BASE +
+                             HP_I2000_QUADRO2_PFB_FIFO), ==, 0x04000000);
+    g_assert_cmphex(qtest_readl(
+                        qts, HP_I2000_QUADRO2_MMIO_BASE +
+                             HP_I2000_QUADRO2_PFB_CFG1), ==, 0x15);
+    g_assert_cmphex(qtest_readl(
+                        qts, HP_I2000_QUADRO2_MMIO_BASE +
+                             HP_I2000_QUADRO2_PEXTDEV_BOOT), ==, 0x50);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFB_CFG0, marker);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFB_CFG0), ==, marker);
+
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE +
+                      HP_I2000_QUADRO2_VRAM_SIZE - 16, marker);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PRAMIN), ==, marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + 4, ~marker);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    HP_I2000_QUADRO2_VRAM_SIZE - 12), ==,
+                    ~marker);
+
+    /*
+     * Exercise the NV10 RAMHT/RAMFC DMA-pusher path with the same object
+     * classes used by native 2D drivers: surfaces, pattern, ROP, clip, line,
+     * GDI rectangle/text, scaled image, and image blit.
+     */
+    qtest_memset(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + ramht_offset, 0, 4096);
+    qtest_memset(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + ramfc_offset, 0, 32);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + push_dma_instance,
+                 0x00003002);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + push_dma_instance + 4,
+                 0x7fff);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + push_dma_instance + 8,
+                 push_offset | 2);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + push_dma_instance + 12, 2);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + vram_dma_instance,
+                 0x0000303d);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + vram_dma_instance + 4,
+                 HP_I2000_QUADRO2_VRAM_SIZE - 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + vram_dma_instance + 8, 0);
+    /* Native nvidiafb uses a separate classless linear framebuffer DMA. */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance,
+                 0x00003000);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance + 4,
+                 HP_I2000_QUADRO2_VRAM_SIZE - 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance + 8, 2);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance + 12, 2);
+
+    /* Match the NV10+ graphics-object seeds installed by nvidiafb. */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + surface_instance,
+                 0x01008062);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + surface_instance + 8,
+                 (fb_dma_instance >> 4) | (fb_dma_instance << 12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + rectangle_instance,
+                 0x0100804a);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + rectangle_instance + 4, 2);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + blit_instance,
+                 0x0100809f);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + blit_instance + 8,
+                 (surface_instance >> 4) | (surface_instance << 12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + rop_instance,
+                 0x01008043);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + pattern_instance,
+                 0x01008044);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + pattern_instance + 4, 2);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + clip_instance,
+                 0x01008019);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + line_instance,
+                 0x0100a05c);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + scaled_instance, 0x89);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + nv4_scaled_instance,
+                 0x01018077);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + nv4_scaled_instance + 8,
+                 (surface_instance >> 4) | (surface_instance << 12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + alternate_surface_instance,
+                 0x01008062);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN +
+                      alternate_surface_instance + 8,
+                 (fb_dma_instance >> 4) | (fb_dma_instance << 12));
+
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, dma_handle, 0,
+                                  vram_dma_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, surface_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  surface_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  rectangle_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  rectangle_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, blit_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  blit_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, rop_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  rop_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, pattern_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  pattern_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0, scaled_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  scaled_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_surface_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  surface_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_rop_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  rop_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_pattern_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  pattern_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_clip_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  clip_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_line_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  line_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_blit_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  blit_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_gdi_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  rectangle_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  nvidiafb_scaled_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  nv4_scaled_instance);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  alternate_surface_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  alternate_surface_instance);
+
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + ramfc_offset + 0x0c,
+                 push_dma_instance >> 4);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + ramfc_offset + 0x14,
+                 0x00086078);
+
+    for (i = 0; i < 8; i++) {
+        push[push_count++] = 0;
+    }
+    /*
+     * Replay nvidiafb's NVResetGraphics object bindings and format setup.
+     * LINE_FORMAT is intentionally between RECT_FORMAT and ROP_SET: an
+     * unsupported class 0x5c method would raise PGRAPH ILLEGAL_METHOD here
+     * before the driver reaches its ROP and clipping setup.
+     */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 0, 1);
+    push[push_count++] = nvidiafb_surface_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 1, 1);
+    push[push_count++] = nvidiafb_pattern_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 2, 1);
+    push[push_count++] = nvidiafb_rop_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 3, 1);
+    push[push_count++] = nvidiafb_clip_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 4, 1);
+    push[push_count++] = nvidiafb_line_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 5, 1);
+    push[push_count++] = nvidiafb_blit_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 6, 1);
+    push[push_count++] = nvidiafb_gdi_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 7, 1);
+    push[push_count++] = nvidiafb_scaled_handle;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 0, 4);
+    push[push_count++] = 6;
+    push[push_count++] = (pitch << 16) | pitch;
+    push[push_count++] = 0;
+    push[push_count++] = 0;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 1, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 6, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 4, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x310, 1, 4);
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 1);
+    push[push_count++] = 0xcc;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 3, 2);
+    push[push_count++] = 0;
+    push[push_count++] = (4U << 16) | 64U;
+
+    /* Cover every ROP3 truth table with all P/S/D combinations per pixel. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x310, 1, 4);
+    push[push_count++] = 0;
+    push[push_count++] = rop_pattern;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    for (i = 0; i <= UINT8_MAX; i++) {
+        push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 1);
+        push[push_count++] = i;
+        push[push_count++] = hp_i2000_quadro2_dma_header(0x3fc, 6, 3);
+        push[push_count++] = rop_source;
+        push[push_count++] = ((i & 63U) << 16) | (8U + (i >> 6));
+        push[push_count++] = (1U << 16) | 1U;
+    }
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x310, 1, 4);
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 1);
+    push[push_count++] = 0xcc;
+
+    /*
+     * NV4 GDI's one-color C upload leaves zero bits transparent.  The first
+     * upload also checks that bits beyond the final five pixels are ignored.
+     */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x7ec, 6, 5);
+    push[push_count++] = (4U << 16);
+    push[push_count++] = (5U << 16) | 64U;
+    push[push_count++] = transparent_foreground;
+    push[push_count++] = (1U << 16) | 5U;
+    push[push_count++] = (4U << 16) | 2U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x800, 6, 1);
+    push[push_count++] = BIT(31) | BIT(4) | BIT(2) | BIT(0);
+
+    /* CGA6 reverses bits in each byte; 0x9fc is the last C data alias. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x304, 6, 1);
+    push[push_count++] = 1;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x7ec, 6, 5);
+    push[push_count++] = (5U << 16) | 2U;
+    push[push_count++] = (6U << 16) | 8U;
+    push[push_count++] = transparent_foreground;
+    push[push_count++] = (1U << 16) | 8U;
+    push[push_count++] = 5U << 16;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x9fc, 6, 1);
+    push[push_count++] = BIT(1);
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x304, 6, 1);
+    push[push_count++] = 2;
+
+    /* nvidiafb reverses each source byte, yielding LE bitmap bits here. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0xbe4, 6, 7);
+    push[push_count++] = (1U << 16) | 2U;
+    push[push_count++] = (3U << 16) | 7U;
+    push[push_count++] = mono_background;
+    push[push_count++] = mono_foreground;
+    push[push_count++] = (2U << 16) | 32U;
+    push[push_count++] = (2U << 16) | 32U;
+    push[push_count++] = (1U << 16) | 2U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0xc00, 6, 2);
+    push[push_count++] = 0x15;
+    push[push_count++] = 0x0e;
+
+    /* GDI inherits the currently bound pattern and ROP context objects. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x310, 1, 4);
+    push[push_count++] = 0;
+    push[push_count++] = 0x00ff00ff;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 1);
+    push[push_count++] = 0xca;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0xbe4, 6, 7);
+    push[push_count++] = (1U << 16) | 10U;
+    push[push_count++] = (2U << 16) | 11U;
+    push[push_count++] = mono_background;
+    push[push_count++] = mono_foreground;
+    push[push_count++] = (1U << 16) | 32U;
+    push[push_count++] = (1U << 16) | 32U;
+    push[push_count++] = (1U << 16) | 10U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0xc00, 6, 1);
+    push[push_count++] = 1;
+
+    /* Transparent pixels bypass the ROP; foreground still uses ROP/pattern. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x7ec, 6, 5);
+    push[push_count++] = (6U << 16) | 10U;
+    push[push_count++] = (7U << 16) | 12U;
+    push[push_count++] = mono_foreground;
+    push[push_count++] = (1U << 16) | 2U;
+    push[push_count++] = (6U << 16) | 10U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x800, 6, 1);
+    push[push_count++] = 1;
+
+    /*
+     * Replay the class 0x5c sequence used by Xorg's NV solid-line hooks.
+     * Native objects inherit the bound surface, clip, pattern, and ROP.
+     */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 3, 2);
+    push[push_count++] = (3U << 16) | 42U;
+    push[push_count++] = (1U << 16) | 6U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x304, 4, 1);
+    push[push_count++] = mono_foreground;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 2);
+    push[push_count++] = (3U << 16) | 40U;
+    push[push_count++] = (3U << 16) | 50U;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 3, 2);
+    push[push_count++] = 0;
+    push[push_count++] = (4U << 16) | 64U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 1);
+    push[push_count++] = 0xcc;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x304, 4, 1);
+    push[push_count++] = line_color;
+
+    /* A LIN excludes its second endpoint. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 2);
+    push[push_count++] = 20U;
+    push[push_count++] = 24U;
+
+    /* Xorg includes the last pixel by submitting a one-pixel second LIN. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 4);
+    push[push_count++] = 26U;
+    push[push_count++] = 30U;
+    push[push_count++] = 30U;
+    push[push_count++] = (1U << 16) | 30U;
+
+    /* Exercise the documented minor-axis tie direction. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 2);
+    push[push_count++] = 34U;
+    push[push_count++] = (2U << 16) | 38U;
+
+    /* The caller's second endpoint stays excluded after raster reordering. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 2);
+    push[push_count++] = (2U << 16) | 56U;
+    push[push_count++] = 52U;
+
+    /* LINE32 accepts separate, sign-extended X/Y coordinate words. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x4f0, 4, 4);
+    push[push_count++] = -2;
+    push[push_count++] = 3;
+    push[push_count++] = 4;
+    push[push_count++] = 3;
+
+    /* POLYLINE continues from a seed vertex and retains each endpoint. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 1);
+    push[push_count++] = 8;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x500, 4, 1);
+    push[push_count++] = 12;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x540, 4, 1);
+    push[push_count++] = (3U << 16) | 12U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x57c, 4, 1);
+    push[push_count++] = (3U << 16) | 16U;
+
+    /* POLYLINE32 has the same continuation rule with separate words. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x480, 4, 2);
+    push[push_count++] = 58;
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x5f8, 4, 2);
+    push[push_count++] = 58;
+    push[push_count++] = 0;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x5f8, 4, 2);
+    push[push_count++] = 62;
+    push[push_count++] = 0;
+
+    /* CPOLYLINE applies each color before drawing to the paired point. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 4, 1);
+    push[push_count++] = (3U << 16) | 40U;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x678, 4, 2);
+    push[push_count++] = cpoly_color0;
+    push[push_count++] = 40;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x678, 4, 2);
+    push[push_count++] = cpoly_color1;
+    push[push_count++] = 44;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 0, 1);
+    push[push_count++] = surface_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x184, 0, 2);
+    push[push_count++] = dma_handle;
+    push[push_count++] = dma_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 0, 4);
+    push[push_count++] = 7;
+    push[push_count++] = (pitch << 16) | pitch;
+    push[push_count++] = source_offset;
+    push[push_count++] = source_offset;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 2, 1);
+    push[push_count++] = pattern_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 2, 8);
+    push[push_count++] = 3;
+    push[push_count++] = 2;
+    push[push_count++] = 0;
+    push[push_count++] = 1;
+    push[push_count++] = 0;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+    push[push_count++] = UINT32_MAX;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 3, 1);
+    push[push_count++] = rop_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 3, 1);
+    push[push_count++] = 0xcc;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 1, 1);
+    push[push_count++] = rectangle_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x188, 1, 2);
+    push[push_count++] = pattern_handle;
+    push[push_count++] = rop_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x198, 1, 1);
+    push[push_count++] = surface_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x2fc, 1, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 1, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x3fc, 1, 1);
+    push[push_count++] = 0x00ff0000;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 1, 2);
+    push[push_count++] = (3U << 16) | 2;
+    push[push_count++] = (5U << 16) | 3;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x30c, 0, 1);
+    push[push_count++] = dest_offset;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 4, 1);
+    push[push_count++] = blit_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x18c, 4, 2);
+    push[push_count++] = pattern_handle;
+    push[push_count++] = rop_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x19c, 4, 1);
+    push[push_count++] = surface_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x2fc, 4, 1);
+    push[push_count++] = 3;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 4, 3);
+    push[push_count++] = (2U << 16) | 3;
+    push[push_count++] = (4U << 16) | 7;
+    push[push_count++] = (3U << 16) | 5;
+
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x30c, 0, 1);
+    push[push_count++] = scaled_dest_offset;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0, 5, 1);
+    push[push_count++] = scaled_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x184, 5, 1);
+    push[push_count++] = dma_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x198, 5, 1);
+    push[push_count++] = surface_handle;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x2fc, 5, 9);
+    push[push_count++] = 1;
+    push[push_count++] = 4;
+    push[push_count++] = 3;
+    push[push_count++] = (6U << 16) | 10;
+    push[push_count++] = (4U << 16) | 4;
+    push[push_count++] = (6U << 16) | 10;
+    push[push_count++] = (4U << 16) | 4;
+    push[push_count++] = 1U << 19;
+    push[push_count++] = 1U << 19;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 5, 4);
+    push[push_count++] = (2U << 16) | 2;
+    push[push_count++] = 8 | 0x00010000;
+    push[push_count++] = scaled_source_offset;
+    push[push_count++] = 0;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x30c, 0, 1);
+    push[push_count++] = dest_offset;
+
+    /* An overlapping same-surface blit must behave like a directional copy. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 0, 4);
+    push[push_count++] = 7;
+    push[push_count++] = (pitch << 16) | pitch;
+    push[push_count++] = overlap_offset;
+    push[push_count++] = overlap_offset;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 4, 3);
+    push[push_count++] = 0;
+    push[push_count++] = 1;
+    push[push_count++] = (1U << 16) | 4;
+
+    /* xy16 output coordinates are unsigned, including bit 15. */
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 0, 4);
+    push[push_count++] = 1;
+    push[push_count++] = (UINT32_C(0xffff) << 16) | pitch;
+    push[push_count++] = scaled_unsigned_dest_offset;
+    push[push_count++] = scaled_unsigned_dest_offset;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x2fc, 5, 9);
+    push[push_count++] = 1;
+    push[push_count++] = 4;
+    push[push_count++] = 3;
+    push[push_count++] = scaled_unsigned_x;
+    push[push_count++] = (1U << 16) | 1;
+    push[push_count++] = scaled_unsigned_x;
+    push[push_count++] = (1U << 16) | 1;
+    push[push_count++] = 1U << 20;
+    push[push_count++] = 1U << 20;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x400, 5, 4);
+    push[push_count++] = (1U << 16) | 2;
+    push[push_count++] = 8 | 0x00010000;
+    push[push_count++] = scaled_source_offset;
+    push[push_count++] = 0;
+    push[push_count++] = hp_i2000_quadro2_dma_header(0x300, 0, 4);
+    push[push_count++] = 7;
+    push[push_count++] = (pitch << 16) | pitch;
+    push[push_count++] = source_offset;
+    push[push_count++] = dest_offset;
+    g_assert_cmpuint(push_count, <=, ARRAY_SIZE(push));
+
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE, 0x5a, pitch * 12);
+    for (i = 0; i <= UINT8_MAX; i++) {
+        qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE +
+                          (8U + (i >> 6)) * pitch + (i & 63U) * 4,
+                     rop_destination);
+    }
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE + source_offset, 0,
+                 pitch * 8);
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE + dest_offset, 0,
+                 pitch * 8);
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE + scaled_dest_offset, 0,
+                 pitch * 12);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + scaled_source_offset,
+                 0xffff0000);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + scaled_source_offset + 4,
+                 0xff00ff00);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + scaled_source_offset + 8,
+                 0xff0000ff);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + scaled_source_offset + 12,
+                 0xffffffff);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + overlap_offset,
+                 0x11111111);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + overlap_offset + 4,
+                 0x22222222);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + overlap_offset + 8,
+                 0x33333333);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + overlap_offset + 12,
+                 0x44444444);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + overlap_offset + 16,
+                 0x55555555);
+    qtest_writeb(qts, HP_I2000_QUADRO2_FB_BASE +
+                      scaled_unsigned_dest_offset + scaled_unsigned_x, 0);
+    for (i = 0; i < push_count; i++) {
+        qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + i * 4,
+                     push[i]);
+    }
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_RAMHT,
+                 0x03000000 | (ramht_offset >> 8));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_RAMFC,
+                 ramfc_offset >> 8);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_MODE, 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_DMA_PUSH, 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT,
+                 push_count * 4);
+
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER +
+                                    HP_I2000_QUADRO2_USER_DMA_GET), ==,
+                    push_count * 4);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_DMA_GET), ==,
+                    push_count * 4);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_DMA_STATE) &
+                    0xe0000000, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) &
+                    (BIT(0) | BIT(12)), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_STATUS), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_INTR) & BIT(0),
+                    ==, 0);
+    /* P, S, and D enumerate all eight truth-table inputs in every byte. */
+    for (i = 0; i <= UINT8_MAX; i++) {
+        uint32_t expected = i | (i << 8) | (i << 16) | (i << 24);
+
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         (8U + (i >> 6)) * pitch +
+                                         (i & 63U) * 4), ==, expected);
+    }
+    for (y = 0; y < 4; y++) {
+        for (x = 0; x < 8; x++) {
+            uint32_t expected = 0x5a5a5a5a;
+
+            if (y >= 1 && y <= 2 && x >= 2 && x < 7) {
+                uint32_t bitmap = y == 1 ? 0x15 : 0x0e;
+
+                expected = bitmap & BIT(x - 2) ?
+                           mono_foreground : mono_background;
+            } else if (y == 3 && x < 4) {
+                expected = line_color;
+            }
+            g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                             y * pitch + x * 4), ==,
+                            expected);
+        }
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + pitch +
+                                    10 * 4), ==, 0x5aaa5acc);
+    for (x = 0; x < 8; x++) {
+        uint32_t expected = x == 2 || x == 4 || x == 6 ?
+                            transparent_foreground : 0x5a5a5a5a;
+
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         4 * pitch + x * 4), ==, expected);
+    }
+    for (x = 0; x < 8; x++) {
+        uint32_t expected = x == 6 ?
+                            transparent_foreground : 0x5a5a5a5a;
+
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         5 * pitch + x * 4), ==, expected);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    6 * pitch + 10 * 4), ==, 0x5aaa5acc);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    6 * pitch + 11 * 4), ==, 0x5a5a5a5a);
+    for (x = 40; x < 50; x++) {
+        uint32_t expected = 0x5a5a5a5a;
+
+        if (x == 40) {
+            expected = cpoly_color0;
+        } else if (x >= 42 && x < 48) {
+            expected = 0x5aaa5acc;
+        }
+
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         3 * pitch + x * 4), ==, expected);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    19 * 4), ==, 0x5a5a5a5a);
+    for (x = 20; x < 24; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         x * 4), ==, line_color);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    24 * 4), ==, 0x5a5a5a5a);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    25 * 4), ==, 0x5a5a5a5a);
+    for (x = 26; x <= 30; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         x * 4), ==, line_color);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    31 * 4), ==, 0x5a5a5a5a);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    34 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + pitch +
+                                    35 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + pitch +
+                                    36 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 2 * pitch +
+                                    37 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 2 * pitch +
+                                    38 * 4), ==, 0x5a5a5a5a);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    52 * 4), ==, 0x5a5a5a5a);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + pitch +
+                                    53 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + pitch +
+                                    54 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 2 * pitch +
+                                    55 * 4), ==, line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 2 * pitch +
+                                    56 * 4), ==, line_color);
+    for (x = 0; x < 4; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         3 * pitch + x * 4), ==,
+                        line_color);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    3 * pitch + 4 * 4), ==, 0x5a5a5a5a);
+    for (x = 8; x < 12; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + x * 4),
+                        ==, line_color);
+    }
+    for (y = 0; y < 3; y++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         y * pitch + 12 * 4), ==,
+                        line_color);
+    }
+    for (x = 12; x < 16; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         3 * pitch + x * 4), ==,
+                        line_color);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    3 * pitch + 16 * 4), ==, 0x5a5a5a5a);
+    for (y = 1; y <= 3; y++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         y * pitch + 58 * 4), ==,
+                        line_color);
+    }
+    for (x = 58; x < 62; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + x * 4),
+                        ==, line_color);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 62 * 4),
+                    ==, 0x5a5a5a5a);
+    for (y = 1; y <= 3; y++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                         y * pitch + 40 * 4), ==,
+                        cpoly_color0);
+    }
+    for (x = 40; x < 44; x++) {
+        g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + x * 4),
+                        ==, cpoly_color1);
+    }
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 44 * 4),
+                    ==, 0x5a5a5a5a);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    source_offset + 2 * pitch + 3 * 4), ==,
+                    0x00ff0000);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + dest_offset +
+                                    4 * pitch + 7 * 4), ==, 0x00ff0000);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    scaled_dest_offset + 6 * pitch + 10 * 4),
+                    ==, 0xffff0000);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    scaled_dest_offset + 6 * pitch + 13 * 4),
+                    ==, 0xff00ff00);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    scaled_dest_offset + 9 * pitch + 10 * 4),
+                    ==, 0xff0000ff);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    scaled_dest_offset + 9 * pitch + 13 * 4),
+                    ==, 0xffffffff);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    overlap_offset + 4), ==, 0x11111111);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    overlap_offset + 8), ==, 0x22222222);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    overlap_offset + 12), ==, 0x33333333);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    overlap_offset + 16), ==, 0x44444444);
+    g_assert_cmphex(qtest_readb(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    scaled_unsigned_dest_offset +
+                                    scaled_unsigned_x), ==, 76);
+
+    /* NV15 accepts the old NV4 jump encoding and skips the intervening word. */
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x800,
+                 0x20000808);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x804,
+                 0xffffffff);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x808,
+                 hp_i2000_quadro2_dma_header(0x50, 0, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x80c,
+                 marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_GET, 0x800);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT, 0x810);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER +
+                                    HP_I2000_QUADRO2_USER_DMA_GET), ==,
+                    0x810);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER + 0x48), ==,
+                    marker);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(12),
+                    ==, 0);
+
+    /* The low-two-bits new jump is NV1A+ and must fault on Quadro2/NV15. */
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x820,
+                 0x00000825);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_GET, 0x820);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT, 0x824);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                    HP_I2000_QUADRO2_PFIFO_DMA_STATE) &
+                    0xe0000000U, ==,
+                    HP_I2000_QUADRO2_PFIFO_DMA_ERROR_INVALID_COMMAND);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_DMA_PUSH) &
+                    HP_I2000_QUADRO2_PFIFO_DMA_PUSH_STATUS, ==,
+                    HP_I2000_QUADRO2_PFIFO_DMA_PUSH_STATUS);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(12),
+                    ==, BIT(12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_INTR, BIT(12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_DMA_STATE, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_DMA_PUSH, 1);
+
+    /* Only OBJECT and REF_CNT are built in before NV1A. */
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x840,
+                 hp_i2000_quadro2_dma_header(0x54, 0, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x844, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_GET, 0x840);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT, 0x848);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                    HP_I2000_QUADRO2_PFIFO_DMA_STATE) &
+                    0xe0000000U, ==,
+                    HP_I2000_QUADRO2_PFIFO_DMA_ERROR_INVALID_METHOD);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(12),
+                    ==, BIT(12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_INTR, BIT(12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_DMA_STATE, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_DMA_PUSH, 1);
+
+    /* Class 0x5c's method arrays end at CPOLYLINE[15].XY (0x67c). */
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x860,
+                 hp_i2000_quadro2_dma_header(0, 4, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x864,
+                 nvidiafb_line_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x868,
+                 hp_i2000_quadro2_dma_header(0x680, 4, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x86c, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_GET, 0x860);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT, 0x870);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER +
+                                    HP_I2000_QUADRO2_USER_DMA_GET), ==,
+                    0x870);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_DMA_STATE) &
+                    0xe0000000U, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(12),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_INTR) &
+                    HP_I2000_QUADRO2_PGRAPH_INTR_ERROR, ==,
+                    HP_I2000_QUADRO2_PGRAPH_INTR_ERROR);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSTATUS) &
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION, ==,
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSOURCE) &
+                    HP_I2000_QUADRO2_PGRAPH_NSOURCE_ILLEGAL_METHOD, ==,
+                    HP_I2000_QUADRO2_PGRAPH_NSOURCE_ILLEGAL_METHOD);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PGRAPH_INTR,
+                 HP_I2000_QUADRO2_PGRAPH_INTR_ERROR);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSTATUS) &
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION, ==,
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSOURCE), ==, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PGRAPH_FIFO_ACCESS, 1);
+
+    /* The one-color C data aliases end at 0x9fc. */
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x880,
+                 hp_i2000_quadro2_dma_header(0, 6, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x884,
+                 nvidiafb_gdi_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x888,
+                 hp_i2000_quadro2_dma_header(0xa00, 6, 1));
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + push_offset + 0x88c, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_GET, 0x880);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER +
+                      HP_I2000_QUADRO2_USER_DMA_PUT, 0x890);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER +
+                                    HP_I2000_QUADRO2_USER_DMA_GET), ==,
+                    0x890);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(12),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_INTR) &
+                    HP_I2000_QUADRO2_PGRAPH_INTR_ERROR, ==,
+                    HP_I2000_QUADRO2_PGRAPH_INTR_ERROR);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSTATUS) &
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION, ==,
+                    HP_I2000_QUADRO2_PGRAPH_NSTATUS_PROTECTION);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PGRAPH_NSOURCE) &
+                    HP_I2000_QUADRO2_PGRAPH_NSOURCE_ILLEGAL_METHOD, ==,
+                    HP_I2000_QUADRO2_PGRAPH_NSOURCE_ILLEGAL_METHOD);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PGRAPH_INTR,
+                 HP_I2000_QUADRO2_PGRAPH_INTR_ERROR);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PGRAPH_FIFO_ACCESS, 1);
+
+    /* PIO submissions share the same bound object state. */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_MODE, 0);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER + 0x2010), ==,
+                    0x1ffc);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_USER + 0x2000), ==, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000, rectangle_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000 + 0x3fc, 0x0000ff00);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000 + 0x400, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000 + 0x404,
+                 (1U << 16) | 1);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + dest_offset),
+                    ==, 0x0000ff00);
+
+    /*
+     * A PGRAPH-only reset retains PFIFO's subchannel bindings.  Reprogram
+     * the lost engine state without rebinding either graphics object.  Keep
+     * a second surface on a higher-numbered subchannel so rehydration cannot
+     * accidentally replace the most recently bound active surface.
+     */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xe000,
+                 alternate_surface_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER, nvidiafb_surface_handle);
+    pmc_enable = qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                  HP_I2000_QUADRO2_PMC_ENABLE);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PMC_ENABLE,
+                 pmc_enable & ~BIT(12));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PMC_ENABLE, pmc_enable);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x300, 6);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x304,
+                 (pitch << 16) | pitch);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x308, source_offset);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x30c, dest_offset);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x2fc, 3);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x3fc, marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x400, 1U << 16);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x404,
+                 (1U << 16) | 1U);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    dest_offset + 4), ==, marker);
+
+    /* A single MMIO submission cannot monopolize the main loop. */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000 + 0x400, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x2000 + 0x404,
+                 (2048U << 16) | 4096);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PFIFO_INTR) & BIT(0),
+                    ==, BIT(0));
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_INTR, BIT(0));
+
+    /*
+     * A sparse negative-slope line may have an out-of-VRAM lower-right
+     * bounding corner even though every pixel it writes is in VRAM.
+     */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance + 4,
+                 2 * HP_I2000_QUADRO2_VRAM_SIZE - 1);
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE +
+                      HP_I2000_QUADRO2_VRAM_SIZE - 20, 0, 20);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x300, 6);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x304, (8U << 16) | 8U);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x30c,
+                 HP_I2000_QUADRO2_VRAM_SIZE - 20);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x6000,
+                 nvidiafb_clip_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x6000 + 0x300, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x6000 + 0x304,
+                 (3U << 16) | 2U);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x4000,
+                 nvidiafb_rop_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x4000 + 0x300, 0xcc);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x8000,
+                 nvidiafb_line_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x8000 + 0x2fc, 3);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x8000 + 0x304, line_color);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x8000 + 0x400, 2U << 16);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x8000 + 0x404, 2U);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    HP_I2000_QUADRO2_VRAM_SIZE - 4), ==,
+                    line_color);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    HP_I2000_QUADRO2_VRAM_SIZE - 8), ==,
+                    line_color);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + fb_dma_instance + 4,
+                 HP_I2000_QUADRO2_VRAM_SIZE - 1);
+
+    /* Cache eviction must not replace an object bound on this channel. */
+    for (i = 0; i < 2 * HP_I2000_QUADRO2_OBJECT_CACHE; i++) {
+        uint32_t handle = cache_filler_handle + i;
+        uint32_t instance = cache_filler_instance + i * 16;
+
+        qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                          HP_I2000_QUADRO2_PRAMIN + instance, 0x01008043);
+        hp_i2000_quadro2_ramht_insert(
+            qts, ramht_offset, 9, 0, handle,
+            HP_I2000_QUADRO2_RAMHT_GRAPHICS, instance);
+        qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                          HP_I2000_QUADRO2_USER + 0xe000, handle);
+    }
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PRAMIN + colliding_rop_instance,
+                 0x01008043);
+    hp_i2000_quadro2_ramht_insert(qts, ramht_offset, 9, 0,
+                                  colliding_rop_handle,
+                                  HP_I2000_QUADRO2_RAMHT_GRAPHICS,
+                                  colliding_rop_instance);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER, nvidiafb_surface_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xe000,
+                 colliding_rop_handle);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x300, 6);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x304,
+                 (pitch << 16) | pitch);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x30c, dest_offset);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x6000 + 0x300, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x6000 + 0x304,
+                 (4U << 16) | 64U);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x4000 + 0x300, 0xcc);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x2fc, 3);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x3fc, marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x400, 2U << 16);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0xc000 + 0x404,
+                 (1U << 16) | 1U);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE +
+                                    dest_offset + 8), ==, marker);
+
+    hp_i2000_assert_int10_rom_device(qts, 0x10de, 0x0153);
+    hp_i2000_assert_int10_vbe(qts);
+    qtest_memread(qts, HP_I2000_RAGE128_ROM_BASE +
+                       HP_I2000_QUADRO2_BMP_OFFSET,
+                  bmp_header, sizeof(bmp_header));
+    g_assert_cmpmem(bmp_header, 5, "\xff\x7f" "NV\0", 5);
+    for (i = 0; i < ARRAY_SIZE(bmp_header); i++) {
+        bmp_checksum += bmp_header[i];
+    }
+    g_assert_cmpuint(bmp_checksum, ==, 0);
+    g_assert_cmpuint(qtest_readl(qts, HP_I2000_RAGE128_ROM_BASE +
+                                     HP_I2000_QUADRO2_BMP_OFFSET + 67), ==,
+                     350000);
+    g_assert_cmpuint(qtest_readl(qts, HP_I2000_RAGE128_ROM_BASE +
+                                     HP_I2000_QUADRO2_BMP_OFFSET + 71), ==,
+                     128000);
+
+    /* Read the EDID through the NV15 extended-CRTC DDC GPIO pins. */
+    hp_i2000_outb(qts, HP_I2000_VGA_MISC_WRITE_PORT, 0x01);
+    hp_i2000_quadro2_ddc_start(qts);
+    g_assert_true(hp_i2000_quadro2_ddc_send(qts, 0xa0));
+    g_assert_true(hp_i2000_quadro2_ddc_send(qts, 0));
+    hp_i2000_quadro2_ddc_start(qts);
+    g_assert_true(hp_i2000_quadro2_ddc_send(qts, 0xa1));
+    for (i = 0; i < ARRAY_SIZE(edid_actual); i++) {
+        edid_actual[i] = hp_i2000_quadro2_ddc_read(
+            qts, i + 1 < ARRAY_SIZE(edid_actual));
+    }
+    hp_i2000_quadro2_ddc_stop(qts);
+    g_assert_cmpmem(edid_actual, sizeof(edid_actual), edid_header,
+                    sizeof(edid_header));
+
+    /* PCRTC vblank is routed through PMC and uses write-one-to-clear. */
+    qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PMC_INTR_EN, 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PCRTC_INTR_EN, 1);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PCRTC_INTR) & 1,
+                    ==, 1);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PMC_INTR) &
+                    HP_I2000_QUADRO2_INTR_PCRTC,
+                    ==, HP_I2000_QUADRO2_INTR_PCRTC);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PCRTC_INTR, 1);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PMC_INTR) &
+                    HP_I2000_QUADRO2_INTR_PCRTC, ==, 0);
+    /* Unrelated interrupt masks must not stop the PCRTC timer. */
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_INTR_EN, 0);
+    qtest_clock_step(qts, NANOSECONDS_PER_SECOND / 60 + 1);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                    HP_I2000_QUADRO2_PCRTC_INTR) & 1,
+                    ==, 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PCRTC_INTR, 1);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PCRTC_INTR_EN, 0);
+    qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+
+    /*
+     * Seed ordinary VGA packed-pixel registers through VBE, then leave VBE
+     * and select the framebuffer solely through NV15 native registers.
+     */
+    hp_i2000_outw(qts, HP_I2000_VBE_INDEX_PORT, VBE_DISPI_INDEX_XRES);
+    hp_i2000_outw(qts, HP_I2000_VBE_DATA_PORT, 640);
+    hp_i2000_outw(qts, HP_I2000_VBE_INDEX_PORT, VBE_DISPI_INDEX_YRES);
+    hp_i2000_outw(qts, HP_I2000_VBE_DATA_PORT, 480);
+    hp_i2000_outw(qts, HP_I2000_VBE_INDEX_PORT, VBE_DISPI_INDEX_BPP);
+    hp_i2000_outw(qts, HP_I2000_VBE_DATA_PORT, 32);
+    hp_i2000_outw(qts, HP_I2000_VBE_INDEX_PORT, VBE_DISPI_INDEX_ENABLE);
+    hp_i2000_outw(qts, HP_I2000_VBE_DATA_PORT,
+                  VBE_DISPI_ENABLED | VBE_DISPI_LFB_ENABLED |
+                  VBE_DISPI_NOCLEARMEM);
+    hp_i2000_outb(qts, HP_I2000_VGA_SEQ_INDEX_PORT, 0);
+    hp_i2000_outb(qts, HP_I2000_VGA_SEQ_DATA_PORT, 1);
+    hp_i2000_outb(qts, HP_I2000_VGA_SEQ_DATA_PORT, 3);
+    hp_i2000_quadro2_crtc_write(qts, 0x19, 0x20);
+    hp_i2000_quadro2_crtc_write(qts, 0x42, 0);
+    hp_i2000_quadro2_crtc_write(qts, 0x28, 3);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PCRTC_START, scanout_offset);
+    hp_i2000_inb(qts, HP_I2000_VGA_STATUS_PORT);
+    hp_i2000_outb(qts, HP_I2000_VGA_ATTR_INDEX_PORT, 0x20);
+    qtest_memset(qts, HP_I2000_QUADRO2_FB_BASE + scanout_offset, 0,
+                 640 * 480 * 4);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + scanout_offset,
+                 0x00ff0000);
+
+    tmpdir = g_dir_make_tmp("hp-i2000-quadro2-XXXXXX", &error);
+    g_assert_no_error(error);
+    g_assert_nonnull(tmpdir);
+    ppm = g_build_filename(tmpdir, "native.ppm", NULL);
+    qtest_qmp_assert_success(qts,
+                             "{'execute':'screendump','arguments':"
+                             " {'filename':%s}}", ppm);
+    hp_i2000_assert_ppm_pixel(ppm, 640, 480, 0, 0, 0xff, 0, 0);
+
+    hp_i2000_config_writel(qts, 0, devfn, PCI_BASE_ADDRESS_0, 0);
+    hp_i2000_config_writew(qts, 0, devfn, PCI_COMMAND, 0);
+    qtest_system_reset(qts);
+    g_assert_cmphex(hp_i2000_config_readl(
+                        qts, 0, devfn, PCI_BASE_ADDRESS_0), ==, 0x98000000);
+    g_assert_cmphex(qtest_readl(
+                        qts, HP_I2000_QUADRO2_MMIO_BASE +
+                             HP_I2000_QUADRO2_PMC_BOOT_0), ==, 0x015000a4);
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_unlink(ppm), ==, 0);
+    g_assert_cmpint(g_rmdir(tmpdir), ==, 0);
 }
 
 static void test_hp_i2000_int10(void)
@@ -1509,6 +3004,52 @@ static void hp_i2000_wait_for_migration(QTestState *qts)
     }
 }
 
+static void test_hp_i2000_quadro2_migration(void)
+{
+    g_autofree char *path = g_strdup_printf(
+        "%s/hp-i2000-quadro2-migration.XXXXXX", g_get_tmp_dir());
+    g_autofree char *uri = NULL;
+    const uint32_t register_marker = 0x51a7c0de;
+    const uint32_t vram_marker = 0x4e563135;
+    QTestState *qts;
+    int fd;
+
+    fd = g_mkstemp(path);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    uri = g_strdup_printf("file:%s", path);
+
+    qts = hp_i2000_start_with_options("-vga quadro2");
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFB_CFG0, register_marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_FB_BASE + 0x1000, vram_marker);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_PFIFO_MODE, 0);
+    qtest_writel(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                      HP_I2000_QUADRO2_USER + 0x50, register_marker);
+    hp_i2000_outb(qts, HP_I2000_VGA_MISC_WRITE_PORT, 0x01);
+    hp_i2000_quadro2_ddc_start(qts);
+    qtest_qmp_assert_success(
+        qts, "{'execute':'migrate','arguments':{'uri':%s}}", uri);
+    hp_i2000_wait_for_migration(qts);
+    qtest_quit(qts);
+
+    qts = hp_i2000_start_with_options("-vga quadro2 -incoming defer");
+    qtest_qmp_assert_success(
+        qts, "{'execute':'migrate-incoming','arguments':"
+             "{'uri':%s,'exit-on-error':false}}", uri);
+    hp_i2000_wait_for_migration(qts);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_MMIO_BASE +
+                                     HP_I2000_QUADRO2_PFB_CFG0), ==,
+                    register_marker);
+    g_assert_cmphex(qtest_readl(qts, HP_I2000_QUADRO2_FB_BASE + 0x1000),
+                    ==, vram_marker);
+    hp_i2000_quadro2_ddc_stop(qts);
+    qtest_quit(qts);
+
+    g_assert_cmpint(g_unlink(path), ==, 0);
+}
+
 static void test_hp_i2000_migration(void)
 {
     g_autofree char *path = g_strdup_printf(
@@ -1609,8 +3150,11 @@ int main(int argc, char **argv)
                    test_hp_i2000_graphics_defaults);
     qtest_add_func("/hp-i2000/graphics-options",
                    test_hp_i2000_graphics_options);
+    qtest_add_func("/hp-i2000/quadro2", test_hp_i2000_quadro2);
     qtest_add_func("/hp-i2000/int10", test_hp_i2000_int10);
     qtest_add_func("/hp-i2000/nvram", test_hp_i2000_nvram);
+    qtest_add_func("/hp-i2000/quadro2-migration",
+                   test_hp_i2000_quadro2_migration);
     qtest_add_func("/hp-i2000/migration", test_hp_i2000_migration);
     return g_test_run();
 }

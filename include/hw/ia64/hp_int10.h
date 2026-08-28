@@ -34,6 +34,8 @@ typedef struct HPIA64Int10 {
     AddressSpace *vga_io;
     hwaddr framebuffer_base;
     uint64_t framebuffer_size;
+    uint8_t framebuffer_bar;
+    uint8_t mmio_bar;
 
     HPIA64Int10Registers request;
     HPIA64Int10Registers result;
@@ -69,6 +71,8 @@ typedef struct HPIA64Int10Config {
     AddressSpace *vga_io;
 
     hwaddr framebuffer_base;
+    uint8_t framebuffer_bar;
+    uint8_t mmio_bar;
     const char *region_name;
 } HPIA64Int10Config;
 

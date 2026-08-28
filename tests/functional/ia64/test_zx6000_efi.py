@@ -30,7 +30,7 @@ ZX6000_EFI_TEST_FIRMWARE_OUTPUT = (
     b"ACPI MADT (SAPIC):    published",
     b"ACPI MCFG (PCIe):     suppressed",
     b"ACPI HCDP/PCDP:       published",
-    b"ACPI SSDT (CPU/PS2):    published",
+    b"ACPI SSDT (CPU/UART/PS2): published",
     b"PCI Root Bridge I/O:  published",
     b"PCI Host Bridge:       published",
     b"BOOT path:            zx6000 LSI53C1030 disk, CMD649 optical + FAT resolver",

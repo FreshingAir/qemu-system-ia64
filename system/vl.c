@@ -226,6 +226,7 @@ static const struct {
     { .driver = "qxl-vga",              .flag = &default_vga       },
     { .driver = "virtio-vga",           .flag = &default_vga       },
     { .driver = "ati-vga",              .flag = &default_vga       },
+    { .driver = "nvidia-quadro2",       .flag = &default_vga       },
     { .driver = "vhost-user-vga",       .flag = &default_vga       },
     { .driver = "virtio-vga-gl",        .flag = &default_vga       },
     { .driver = "virtio-vga-rutabaga",  .flag = &default_vga       },
@@ -982,6 +983,11 @@ static const VGAInterfaceInfo vga_interfaces[VGA_TYPE_MAX] = {
         .opt_name = "ati",
         .name = "ATI VGA",
         .class_names = { "ati-vga" },
+    },
+    [VGA_NVIDIA_QUADRO2] = {
+        .opt_name = "quadro2",
+        .name = "NVIDIA Quadro2 Pro",
+        .class_names = { "nvidia-quadro2" },
     },
     [VGA_VMWARE] = {
         .opt_name = "vmware",

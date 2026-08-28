@@ -92,9 +92,12 @@
 #define PCI_VGA_MMIO_BAR              0xc8000000U
 #define PCI_VGA_ATI_RAGE128_ID        0x50461002U
 #define PCI_VGA_ATI_RV100_ID          0x51591002U
+#define PCI_VGA_ATI_ES1000_ID         0x515e1002U
+#define PCI_VGA_NVIDIA_QUADRO2_ID     0x015310deU
 #define PCI_VGA_STD_ID                0x11111234U
 #define PCI_VGA_ATI_FB_SIZE           0x04000000ULL
 #define PCI_VGA_ATI_RV100_FB_SIZE     0x08000000ULL
+#define PCI_VGA_NVIDIA_QUADRO2_FB_SIZE 0x08000000ULL
 #define PCI_VGA_STD_FB_SIZE           0x01000000ULL
 #define PCI_NEC_OHCI_ID               0x00351033U
 #define PCI_NEC_OHCI_MMIO_SIZE        0x00001000ULL
@@ -14648,6 +14651,7 @@ static BOOLEAN efi_init_platform_tables(void)
 
     {
         static const UINT8 ps2_enabled_name[4] = { 'P', '2', 'E', 'N' };
+        static const UINT8 uart_enabled_name[4] = { 'U', '0', 'E', 'N' };
 
         fw_copy_mem(mSsdt.Aml, mSsdtAmlTemplate, sizeof(mSsdt.Aml));
         for (i = 0; i < FW_MAX_CPUS; i++) {
@@ -14658,6 +14662,8 @@ static BOOLEAN efi_init_platform_tables(void)
         (void)acpi_ssdt_set_named_byte(
             &mSsdt, ps2_enabled_name,
             fw_handoff_i8042_enabled() && !i2000_profile ? 0x0fU : 0);
+        (void)acpi_ssdt_set_named_byte(
+            &mSsdt, uart_enabled_name, vpc_profile ? 0x0fU : 0);
         init_sdt_header(&mSsdt.Hdr, EFI_SIGNATURE_32('S', 'S', 'D', 'T'),
                         sizeof(mSsdt));
         mSsdt.Hdr.Revision = 2;
@@ -30595,6 +30601,11 @@ static FW_PCI_IO_DEVICE mPciIoDevices[FW_PCI_IO_DEVICE_COUNT] = {
 FW_STATIC_ASSERT(FW_ARRAY_SIZE(mPciIoDevices) == FW_PCI_IO_DEVICE_COUNT,
                  pci_io_device_count);
 
+static EFI_STATUS pci_io_bar_info(const FW_PCI_IO_DEVICE *Dev,
+                                  UINT8 BarIndex, UINT32 *RawValue,
+                                  UINT64 *Base, UINT64 *Length,
+                                  BOOLEAN *IsIo, BOOLEAN *Is64);
+
 typedef struct {
     UINT16 Segment;
     UINTN RootIndex;
@@ -30712,6 +30723,7 @@ static void fw_platform_pci_device_location(
 }
 
 static BOOLEAN fw_platform_graphics_init(UINT32 ExpectedId,
+                                         UINT8 FramebufferBar,
                                          UINT64 ApertureSize)
 {
     FW_PLATFORM_PCI_LOCATION location;
@@ -30720,12 +30732,13 @@ static BOOLEAN fw_platform_graphics_init(UINT32 ExpectedId,
     FW_PCI_IO_DEVICE *graphics = &mPciIoDevices[5];
 
     if (!fw_platform_pci_find(ExpectedId, 0x030000U, &location) ||
-        !fw_platform_pci_mmio_bar(&location, 0, ApertureSize,
+        !fw_platform_pci_mmio_bar(&location, FramebufferBar, ApertureSize,
                                   &raw_bar, &cpu_base)) {
         return 0;
     }
     fw_platform_pci_device_location(graphics, &location);
     graphics->ExpectedId = ExpectedId;
+    graphics->ExpectedBarIndex = FramebufferBar;
     graphics->ExpectedBarValue = raw_bar;
     graphics->ExpectedBarLength = ApertureSize;
     mGraphicsFramebufferBase = cpu_base;
@@ -30786,19 +30799,66 @@ static BOOLEAN fw_platform_lsi_init(VOID)
     return 1;
 }
 
+static BOOLEAN fw_vpc_graphics_init(VOID)
+{
+    FW_PCI_IO_DEVICE *graphics = &mPciIoDevices[5];
+    UINT32 id = (UINT32)pci_config_read_value(0, 0, 5, 0, 0, 4);
+    UINT64 aperture_base;
+    UINT64 aperture_size;
+    UINT32 raw_bar;
+    BOOLEAN is_io;
+    BOOLEAN is_64;
+
+    switch (id) {
+    case PCI_VGA_ATI_RAGE128_ID:
+    case PCI_VGA_ATI_RV100_ID:
+    case PCI_VGA_ATI_ES1000_ID:
+    case PCI_VGA_STD_ID:
+        break;
+    default:
+        return 0;
+    }
+
+    /*
+     * x-linear-aper-size is deliberately configurable on QEMU's ATI
+     * device.  Size BAR 0 instead of inferring its length from the device
+     * ID so EFI PCI I/O and GOP never expose memory outside that aperture.
+     */
+    if (pci_io_bar_info(graphics, 0, &raw_bar, &aperture_base,
+                        &aperture_size, &is_io, &is_64) != EFI_SUCCESS ||
+        is_io || is_64) {
+        return 0;
+    }
+
+    graphics->ExpectedId = id;
+    graphics->ExpectedBarIndex = 0;
+    graphics->ExpectedBarValue = raw_bar;
+    graphics->ExpectedBarLength = aperture_size;
+    mGraphicsFramebufferBase = aperture_base;
+    mGraphicsFramebufferApertureSize = aperture_size;
+    return 1;
+}
+
 static void fw_platform_pci_devices_init(void)
 {
     if (!mPlatformProfile.Present) {
+        if (!fw_vpc_graphics_init()) {
+            mGraphicsHandle = NULL;
+        }
         return;
     }
     if (mPlatformProfile.Descriptor.PlatformId ==
             IA64_PLATFORM_ID_HP_I2000) {
-        (void)fw_platform_graphics_init(PCI_VGA_ATI_RAGE128_ID,
-                                        PCI_VGA_ATI_FB_SIZE);
+        if (!fw_platform_graphics_init(PCI_VGA_ATI_RAGE128_ID, 0,
+                                       PCI_VGA_ATI_FB_SIZE)) {
+            (void)fw_platform_graphics_init(
+                PCI_VGA_NVIDIA_QUADRO2_ID, 1,
+                PCI_VGA_NVIDIA_QUADRO2_FB_SIZE);
+        }
         (void)fw_platform_lsi_init();
     } else if (mPlatformProfile.Descriptor.PlatformId ==
                    IA64_PLATFORM_ID_HP_ZX6000) {
-        (void)fw_platform_graphics_init(PCI_VGA_ATI_RV100_ID,
+        (void)fw_platform_graphics_init(PCI_VGA_ATI_RV100_ID, 0,
                                         PCI_VGA_ATI_RV100_FB_SIZE);
         (void)fw_platform_ohci_init(PCI_NEC_OHCI_ID,
                                     PCI_NEC_OHCI_MMIO_SIZE);
@@ -30905,7 +30965,9 @@ static UINT32 fw_pci_io_device_id(const FW_PCI_IO_DEVICE *Dev)
 static BOOLEAN fw_pci_vga_id_supported(UINT32 Id)
 {
     return Id == PCI_VGA_ATI_RAGE128_ID ||
-           Id == PCI_VGA_ATI_RV100_ID || Id == PCI_VGA_STD_ID;
+           Id == PCI_VGA_ATI_RV100_ID ||
+           Id == PCI_VGA_ATI_ES1000_ID ||
+           Id == PCI_VGA_NVIDIA_QUADRO2_ID || Id == PCI_VGA_STD_ID;
 }
 
 static UINT32 fw_pci_io_expected_bar_value(const FW_PCI_IO_DEVICE *Dev)
@@ -31047,11 +31109,6 @@ static EFI_STATUS pci_io_bar_address(const FW_PCI_IO_DEVICE *Dev,
     *Address = base + Offset;
     return EFI_SUCCESS;
 }
-
-static EFI_STATUS pci_io_bar_info(const FW_PCI_IO_DEVICE *Dev,
-                                  UINT8 BarIndex, UINT32 *RawValue,
-                                  UINT64 *Base, UINT64 *Length,
-                                  BOOLEAN *IsIo, BOOLEAN *Is64);
 
 typedef struct {
     BOOLEAN initialized;
@@ -35403,7 +35460,7 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
         uart_puts("ACPI MCFG (PCIe):     published\r\n");
     }
     uart_puts("ACPI HCDP/PCDP:       published\r\n");
-    uart_puts("ACPI SSDT (CPU/PS2):    published\r\n");
+    uart_puts("ACPI SSDT (CPU/UART/PS2): published\r\n");
     if (mPlatformProfile.Present && !mPciHost.Installed) {
         uart_puts("PCI Root Bridge I/O:  suppressed\r\n");
     } else {

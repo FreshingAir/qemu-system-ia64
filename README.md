@@ -3,8 +3,8 @@
 Experimental QEMU full-system emulation for IA-64 guests.
 
 > [!IMPORTANT]
-> This codebase was developed with assistance from large language models
-> (LLMs). Do not submit project-specific changes to upstream QEMU.
+> This is an independent, LLM-assisted QEMU fork. Report project-specific
+> issues here, not to upstream QEMU.
 
 ## Quick start
 
@@ -43,23 +43,31 @@ ninja -C build qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
   -display gtk
 ```
 
-Use `nvram=<path>` machine property to specify an NVRAM file. Set `nvram=none` for non-persistent EFI variables.
+Use the `nvram=<path>` machine property to specify an NVRAM file. Set
+`nvram=none` for non-persistent EFI variables.
 
 ## Machine profiles
 
 A machine must be selected explicitly with `-machine`.
 
-| Machine | Intended use | Default CPU |
-| --- | --- | --- |
-| `hp-i2000` | Older IA-64 operating systems, with experimental real-machine emulation | `merced` (fixed) |
-| `hp-zx6000` | Most IA-64 operating systems, with experimental real-machine emulation | `madison-zx6000` (fixed) |
-| `itanium2-vpc` | Most IA-64 operating systems | `montecito` |
-| `itanium-vpc` | Older IA-64 operating systems | `merced` |
+| Machine | Intended use | Default CPU | Default VGA |
+| --- | --- | --- | --- |
+| `hp-i2000` | Older IA-64 operating systems | `merced` (fixed) | NVIDIA Quadro2 Pro |
+| `hp-zx6000` | Most IA-64 operating systems | `madison-zx6000` (fixed) | ATI Radeon RV100 |
+| `itanium2-vpc` | Most IA-64 operating systems | `montecito` | ATI Rage 128 Pro |
+| `itanium-vpc` | Older IA-64 operating systems | `merced` | ATI Rage 128 Pro |
 
 `ia64-vpc` is an alias of `itanium2-vpc`. The HP profiles reject `-cpu`
-overrides; the virtual PC profiles allow them and providing flexible configurations.
-All profiles use `ia64-firmware.bin` by default unless overridden with `-bios`.
-Emulation of `hp-i2000` and `hp-zx6000` is still experimental and incomplete.
+overrides; the virtual PC profiles allow them. All profiles use
+`ia64-firmware.bin` by default unless overridden with `-bios`. The HP machine
+profiles remain experimental.
+
+Use `-vga quadro2` for Quadro2 Pro or `-vga ati` for an ATI adapter. The ATI
+`model` property accepts `rage128p`, `rv100`, and `es1000`; for example:
+
+```sh
+-vga ati -global ati-vga.model=es1000
+```
 
 ## Common options
 
