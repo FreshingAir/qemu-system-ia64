@@ -95,6 +95,7 @@ behavior, floating-point handling, and device support remain experimental.
 ## Related projects
 
 - [IA-64 ATI XPDM driver](https://github.com/syunnPC/qemu-system-ia64-ati-xpdm)
+- [IA-64 NVIDIA XPDM driver](https://github.com/syunnPC/qemu-system-ia64-nv-xpdm)
 
 ### Screenshots
 
