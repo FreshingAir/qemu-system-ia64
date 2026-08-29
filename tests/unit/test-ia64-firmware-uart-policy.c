@@ -291,7 +291,7 @@ static int test_platform_ssdt_legacy_policy(void)
     static const UINT8 ps2_keyboard[] = { 'P', 'S', '2', 'K' };
     static const UINT8 ps2_mouse[] = { 'P', 'S', '2', 'M' };
     static const UINT8 pci0_scope[] = {
-        0x10, 0x49, 0x07, 0x5c, 0x2e,
+        0x10, 0x49, 0x0b, 0x5c, 0x2e,
         '_', 'S', 'B', '_', 'P', 'C', 'I', '0',
     };
     static const UINT8 ps2k_device[] = {
@@ -309,6 +309,9 @@ static int test_platform_ssdt_legacy_policy(void)
     UINTN pci0_scope_offset = byte_sequence_offset(
         mSsdtAmlTemplate, sizeof(mSsdtAmlTemplate),
         pci0_scope, sizeof(pci0_scope));
+    UINTN uart_offset = byte_sequence_offset(
+        mSsdtAmlTemplate, sizeof(mSsdtAmlTemplate),
+        uart, sizeof(uart));
     UINTN ps2k_offset = byte_sequence_offset(
         mSsdtAmlTemplate, sizeof(mSsdtAmlTemplate),
         ps2k_device, sizeof(ps2k_device));
@@ -317,7 +320,9 @@ static int test_platform_ssdt_legacy_policy(void)
         ps2m_device, sizeof(ps2m_device));
 
     if (IA64_SSDT_AML_SIZE != 2258U ||
-        pci0_scope_offset == ~(UINTN)0 || ps2k_offset <= pci0_scope_offset ||
+        pci0_scope_offset == ~(UINTN)0 || uart_offset == ~(UINTN)0 ||
+        ps2k_offset == ~(UINTN)0 || ps2m_offset == ~(UINTN)0 ||
+        uart_offset <= pci0_scope_offset || ps2k_offset <= uart_offset ||
         ps2m_offset <= ps2k_offset ||
         !byte_sequence_present(mSsdtAmlTemplate,
                                sizeof(mSsdtAmlTemplate),
@@ -331,9 +336,6 @@ static int test_platform_ssdt_legacy_policy(void)
         !byte_sequence_present(mSsdtAmlTemplate,
                                sizeof(mSsdtAmlTemplate),
                                cpu63_enabled, sizeof(cpu63_enabled)) ||
-        !byte_sequence_present(mSsdtAmlTemplate,
-                               sizeof(mSsdtAmlTemplate),
-                               uart, sizeof(uart)) ||
         !byte_sequence_present(mSsdtAmlTemplate,
                                sizeof(mSsdtAmlTemplate),
                                uart_enabled, sizeof(uart_enabled)) ||
