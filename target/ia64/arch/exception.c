@@ -418,9 +418,13 @@ static void ia64_deliver_exception(CPUState *cs, IA64Exception excp,
     qemu_log_mask(CPU_LOG_INT,
                   "ia64 exception excp=%u vector=0x%04x ip=0x%016" PRIx64
                   " fault=0x%016" PRIx64 " slot=%u psr=0x%016" PRIx64
-                  " ifa=0x%016" PRIx64 " isr=0x%016" PRIx64 "\n",
+                  " ifa=0x%016" PRIx64 " isr=0x%016" PRIx64
+                  " iva=0x%016" PRIx64 " iip=0x%016" PRIx64
+                  " ipsr=0x%016" PRIx64 " ifs=0x%016" PRIx64 "\n",
                   excp, ia64_ivt_vectors[excp], cpu->env.ip, fault_addr,
-                  slot, cpu->env.psr, cpu->env.cr_ifa, cpu->env.cr_isr);
+                  slot, cpu->env.psr, cpu->env.cr_ifa, cpu->env.cr_isr,
+                  cpu->env.cr_iva, cpu->env.cr_iip, cpu->env.cr_ipsr,
+                  cpu->env.cr_ifs);
     psr_ic_inflight = cpu->env.exception_state.psr_ic_inflight;
     collect = cpu->env.psr & IA64_PSR_IC;
     trace_ia64_exception_deliver(cs->cpu_index, excp, vector, cpu->env.ip,
@@ -491,6 +495,18 @@ static void ia64_deliver_exception(CPUState *cs, IA64Exception excp,
     cpu->env.exception_state.psr_ic_inflight = false;
 
     cpu->env.ip = (cpu->env.cr_iva & ~0x7fffULL) | vector;
+    /*
+     * PSR.IT is preserved across delivery, so an interruption taken from a
+     * physical (IT=0) context vectors to the IVA address in physical mode.
+     * The IVA normally lives in region 7 (0xe000...), whose region bits are
+     * not part of a physical address; reduce to the implemented physical
+     * form (bit63 UC attribute + physical payload).  Otherwise the handler
+     * fetch is rejected as an unimplemented address and the CPU loops on
+     * UNIMPL_INST_ADDR (guest stalls at "Starting Windows").
+     */
+    if (!(cpu->env.psr & IA64_PSR_IT)) {
+        cpu->env.ip = ia64_pa_canonicalize(&cpu->env, cpu->env.ip);
+    }
     cpu->env.instruction_group_start = true;
     if (excp == IA64_EXCP_EXTINT) {
         cs->halted = 0;

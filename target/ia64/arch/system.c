@@ -783,6 +783,10 @@ void ia64_write_cr(CPUIA64State *env, uint32_t cr_num, uint64_t value)
         ia64_itm_update(env, value);
         break;
     case 2:
+        qemu_log_mask(CPU_LOG_INT, "ia64 cr_iva WRITE ip=%016" PRIx64
+                      " psr=%016" PRIx64 " old=0x%016" PRIx64
+                      " new=0x%016" PRIx64 "\n", env->ip, env->psr,
+                      env->cr[IA64_CR_IVA], value);
         if (ia64_firmware_owns_iva(env->cr[IA64_CR_IVA]) !=
             ia64_firmware_owns_iva(value)) {
             /*
