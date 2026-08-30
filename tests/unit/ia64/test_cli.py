@@ -20,7 +20,10 @@ def test_cpu_models(qemu: str) -> None:
     lines = [line.strip() for line in result.stdout.splitlines()]
     models = [line for line in lines
               if line and line != "Available CPUs:"]
-    expected = ["itanium", "itanium2", "madison", "merced", "montecito"]
+    expected = [
+        "itanium", "itanium2", "madison", "madison-zx6000", "merced",
+        "montecito",
+    ]
     if result.returncode != 0 or models != expected:
         raise RuntimeError(
             f"unexpected CPU model list: {models!r}\n{result.stdout}")

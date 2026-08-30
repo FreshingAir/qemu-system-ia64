@@ -58,6 +58,9 @@ EFI_STATUS fw_scsi_reset_channel(VOID);
 FW_LSI_SCRIPT_RESULT fw_scsi_reset_target(UINT8 target,
                                            UINT64 timeout_100ns);
 
+VOID *fw_serial_device_path(VOID);
+UINTN fw_serial_device_path_size(VOID);
+
 BOOLEAN fw_legacy_io_protocols_install(VOID);
 
 #endif /* IA64_FIRMWARE_FW_LEGACY_IO_H */

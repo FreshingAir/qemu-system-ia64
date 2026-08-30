@@ -17,6 +17,21 @@
 
 static char isoimage[] = "cdrom-boot-iso-XXXXXX";
 
+static const char *ia64_nvram_option(const char *machine)
+{
+    if (!g_str_equal(qtest_get_arch(), "ia64")) {
+        return "";
+    }
+    if (g_str_equal(machine, "ia64-vpc") ||
+        g_str_equal(machine, "itanium-vpc") ||
+        g_str_equal(machine, "itanium2-vpc") ||
+        g_str_equal(machine, "hp-i2000") ||
+        g_str_equal(machine, "hp-zx6000")) {
+        return ",nvram=none";
+    }
+    return "";
+}
+
 static int exec_xorrisofs(const char **args)
 {
     gchar *out_err = NULL;
@@ -96,10 +111,12 @@ cleanup:
  */
 static void test_cdrom_param(gconstpointer data)
 {
+    const char *machine = data;
     QTestState *qts;
     char *resp;
 
-    qts = qtest_initf("-M %s -cdrom %s", (const char *)data, isoimage);
+    qts = qtest_initf("-M %s%s -cdrom %s", machine,
+                      ia64_nvram_option(machine), isoimage);
     resp = qtest_hmp(qts, "info block");
     g_assert(strstr(resp, isoimage) != 0);
     g_free(resp);

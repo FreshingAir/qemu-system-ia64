@@ -10,6 +10,8 @@
 #ifndef HW_IA64_VPC_ABI_H
 #define HW_IA64_VPC_ABI_H
 
+#include "hw/ia64/ia64_firmware_compat.h"
+
 #define IA64_FW_HANDOFF_ADDR          0x00000000000ff000ULL
 #define IA64_FW_HANDOFF_MAGIC         0x4d41523436414951ULL /* "QIA64RAM" */
 #define IA64_FW_HANDOFF_VERSION       10ULL
@@ -17,18 +19,6 @@
 #define IA64_FW_COMPAT_HANDOFF_ADDR   (IA64_FW_HANDOFF_ADDR + 0x100ULL)
 #define IA64_FW_COMPAT_HANDOFF_MAGIC  0x504d4f4334364951ULL /* "QI64COMP" */
 #define IA64_FW_COMPAT_HANDOFF_VERSION 1ULL
-
-#define IA64_FW_COMPAT_LOADER_DIRECT_ALIAS (1ULL << 0)
-#define IA64_FW_COMPAT_EARLY_LOADER_MEMORY (1ULL << 1)
-#define IA64_FW_COMPAT_SPARSE_SAL_MDT      (1ULL << 2)
-#define IA64_FW_COMPAT_SAL_CODE_GP         (1ULL << 3)
-#define IA64_FW_COMPAT_COMBINED_RUNTIME    (1ULL << 4)
-#define IA64_FW_COMPAT_LEGACY_LOADER_MASK \
-    (IA64_FW_COMPAT_LOADER_DIRECT_ALIAS | \
-     IA64_FW_COMPAT_EARLY_LOADER_MEMORY | \
-     IA64_FW_COMPAT_SPARSE_SAL_MDT | \
-     IA64_FW_COMPAT_SAL_CODE_GP | \
-     IA64_FW_COMPAT_COMBINED_RUNTIME)
 
 #define IA64_FW_CONSOLE_SERIAL        0ULL
 #define IA64_FW_CONSOLE_VGA           1ULL
@@ -96,11 +86,7 @@
 #define IA64_LEGACY_IO_PORT_PA(port) \
     (IA64_LEGACY_IO_BASE + IA64_LEGACY_IO_PORT_OFFSET(port))
 
-/*
- * The architected console resource is the conventional COM1 I/O range.
- * IA64_UART_BASE remains a private MMIO decode for firmware and compatibility
- * with older guests; ACPI and HCDP must advertise IA64_UART_IO_PORT instead.
- */
+/* ACPI and HCDP advertise COM1; IA64_UART_BASE is an unadvertised alias. */
 #define IA64_UART_IO_PORT             0x00000000000003f8ULL
 #define IA64_UART_IO_SIZE             0x0000000000000008ULL
 
@@ -120,12 +106,7 @@ typedef struct __attribute__((packed)) IA64VpcHandoff {
     unsigned long long ThreadsPerCore;
 } IA64VpcHandoff;
 
-/*
- * Optional extension kept separate from IA64VpcHandoff so firmware that
- * understands only handoff version 10 continues to consume its base fields.
- * New firmware treats a missing extension as the historical compatibility
- * profile, preserving its behavior with older machine implementations.
- */
+/* A missing extension selects IA64_FW_COMPAT_ALL_MASK. */
 typedef struct __attribute__((packed)) IA64VpcCompatHandoff {
     unsigned long long Magic;
     unsigned long long Version;

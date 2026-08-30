@@ -47,6 +47,11 @@
      MPI_FW_HEADER_PID_PROD_INITIATOR_SCSI |   \
      MPI_FW_HEADER_PID_TYPE_SAS)
 
+#define MPTSPI1030_PRODUCT_ID                  \
+    (MPI_FW_HEADER_PID_FAMILY_1030C0_SCSI |    \
+     MPI_FW_HEADER_PID_PROD_INITIATOR_SCSI |   \
+     MPI_FW_HEADER_PID_TYPE_SCSI)
+
 struct MPTSASRequest {
     MPIMsgSCSIIORequest scsi_io;
     SCSIRequest *sreq;
@@ -80,8 +85,8 @@ static void mptsas_set_fault(MPTSASState *s, uint32_t code)
 }
 
 #define MPTSAS_FIFO_INVALID(s, name)                     \
-    ((s)->name##_head > ARRAY_SIZE((s)->name) ||         \
-     (s)->name##_tail > ARRAY_SIZE((s)->name))
+    ((s)->name##_head >= ARRAY_SIZE((s)->name) ||        \
+     (s)->name##_tail >= ARRAY_SIZE((s)->name))
 
 #define MPTSAS_FIFO_EMPTY(s, name)                       \
     ((s)->name##_head == (s)->name##_tail)
@@ -530,7 +535,7 @@ reply_maybe_async:
             reply.IOCStatus = MPI_IOCSTATUS_SCSI_INVALID_BUS;
             goto out;
         }
-        if (req->TargetID > s->max_devices) {
+        if (req->TargetID >= s->max_devices) {
             reply.IOCStatus = MPI_IOCSTATUS_SCSI_INVALID_TARGETID;
             goto out;
         }
@@ -560,6 +565,7 @@ out:
 static void mptsas_process_ioc_init(MPTSASState *s, MPIMsgIOCInit *req)
 {
     MPIMsgIOCInitReply reply;
+    unsigned int requested_devices;
 
     mptsas_fix_ioc_init_endianness(req);
 
@@ -567,10 +573,12 @@ static void mptsas_process_ioc_init(MPTSASState *s, MPIMsgIOCInit *req)
     QEMU_BUILD_BUG_ON(sizeof(s->doorbell_msg) < sizeof(*req));
     QEMU_BUILD_BUG_ON(sizeof(s->doorbell_reply) < sizeof(reply));
 
+    requested_devices = req->MaxDevices ? req->MaxDevices : 256;
     s->who_init               = req->WhoInit;
     s->reply_frame_size       = req->ReplyFrameSize;
-    s->max_buses              = req->MaxBuses;
-    s->max_devices            = req->MaxDevices ? req->MaxDevices : 256;
+    s->max_buses              = MIN(req->MaxBuses, 1);
+    s->max_devices            = MIN(requested_devices,
+                                    mptsas_max_devices(s));
     s->host_mfa_high_addr     = (hwaddr)req->HostMfaHighAddr << 32;
     s->sense_buffer_high_addr = (hwaddr)req->SenseBufferHighAddr << 32;
 
@@ -613,10 +621,12 @@ static void mptsas_process_ioc_facts(MPTSASState *s,
     QEMU_BUILD_BUG_ON(ARRAY_SIZE(s->reply_post) != ARRAY_SIZE(s->reply_free));
 
     reply.RequestFrameSize           = 128;
-    reply.ProductID                  = MPTSAS1068_PRODUCT_ID;
+    reply.ProductID                  = mptsas_is_spi(s) ?
+                                       MPTSPI1030_PRODUCT_ID :
+                                       MPTSAS1068_PRODUCT_ID;
     reply.CurrentHostMfaHighAddr     = s->host_mfa_high_addr >> 32;
     reply.GlobalCredits              = ARRAY_SIZE(s->request_post) - 1;
-    reply.NumberOfPorts              = MPTSAS_NUM_PORTS;
+    reply.NumberOfPorts              = mptsas_num_ports(s);
     reply.CurrentSenseBufferHighAddr = s->sense_buffer_high_addr >> 32;
     reply.CurReplyFrameSize          = s->reply_frame_size;
     reply.MaxDevices                 = s->max_devices;
@@ -647,11 +657,19 @@ static void mptsas_process_port_facts(MPTSASState *s,
     reply.PortNumber = req->PortNumber;
     reply.MsgContext = req->MsgContext;
 
-    if (req->PortNumber < MPTSAS_NUM_PORTS) {
-        reply.PortType      = MPI_PORTFACTS_PORTTYPE_SAS;
-        reply.MaxDevices    = MPTSAS_NUM_PORTS;
-        reply.PortSCSIID    = MPTSAS_NUM_PORTS;
-        reply.ProtocolFlags = MPI_PORTFACTS_PROTOCOL_LOGBUSADDR | MPI_PORTFACTS_PROTOCOL_INITIATOR;
+    if (req->PortNumber < mptsas_num_ports(s)) {
+        reply.PortType = mptsas_is_spi(s) ? MPI_PORTFACTS_PORTTYPE_SCSI :
+                                           MPI_PORTFACTS_PORTTYPE_SAS;
+        reply.MaxDevices = mptsas_max_devices(s);
+        reply.PortSCSIID = mptsas_is_spi(s) ?
+            s->spi_port_configuration &
+            MPI_SCSIPORTPAGE1_CFG_PORT_SCSI_ID_MASK : MPTSAS_NUM_PORTS;
+        reply.ProtocolFlags = MPI_PORTFACTS_PROTOCOL_INITIATOR;
+        if (!mptsas_is_spi(s)) {
+            reply.ProtocolFlags |= MPI_PORTFACTS_PROTOCOL_LOGBUSADDR;
+        }
+    } else {
+        reply.IOCStatus = MPI_IOCSTATUS_INVALID_FIELD;
     }
 
     mptsas_fix_port_facts_reply_endianness(&reply);
@@ -674,6 +692,10 @@ static void mptsas_process_port_enable(MPTSASState *s,
     reply.PortNumber = req->PortNumber;
     reply.Function   = req->Function;
     reply.MsgContext = req->MsgContext;
+
+    if (req->PortNumber >= mptsas_num_ports(s)) {
+        reply.IOCStatus = MPI_IOCSTATUS_INVALID_FIELD;
+    }
 
     mptsas_fix_port_enable_reply_endianness(&reply);
     mptsas_reply(s, (MPIDefaultReply *)&reply);
@@ -881,6 +903,7 @@ static void mptsas_doorbell_write(MPTSASState *s, uint32_t val)
         mptsas_soft_reset(s);
         break;
     case MPI_FUNCTION_IO_UNIT_RESET:
+        /* I/O unit reset is not implemented. */
         break;
     case MPI_FUNCTION_HANDSHAKE:
         s->doorbell_state = DOORBELL_WRITE;
@@ -949,13 +972,37 @@ static int mptsas_hard_reset(MPTSASState *s)
 {
     mptsas_soft_reset(s);
 
+    s->who_init = MPI_WHOINIT_NO_ONE;
+    s->doorbell_state = DOORBELL_NONE;
+    memset(s->doorbell_msg, 0, sizeof(s->doorbell_msg));
+    s->doorbell_idx = 0;
+    s->doorbell_cnt = 0;
+    memset(s->doorbell_reply, 0, sizeof(s->doorbell_reply));
+    s->doorbell_reply_idx = 0;
+    s->doorbell_reply_size = 0;
+
+    s->diagnostic_idx = 0;
+    s->diagnostic = 0;
     s->intr_mask = MPI_HIM_DIM | MPI_HIM_RIM;
+
+    memset(s->request_post, 0, sizeof(s->request_post));
+    memset(s->reply_post, 0, sizeof(s->reply_post));
+    memset(s->reply_free, 0, sizeof(s->reply_free));
 
     s->host_mfa_high_addr = 0;
     s->sense_buffer_high_addr = 0;
     s->reply_frame_size = 0;
-    s->max_devices = MPTSAS_NUM_PORTS;
+    s->max_devices = mptsas_max_devices(s);
     s->max_buses = 1;
+    s->ioc1_flags = 0;
+    s->ioc1_coalescing_timeout = 0;
+    s->ioc1_coalescing_depth = 0;
+    s->spi_port_configuration = MPTSPI_DEFAULT_PORT_CONFIGURATION;
+    s->spi_port_on_bus_timer = 0;
+    memset(s->spi_requested_params, 0, sizeof(s->spi_requested_params));
+    memset(s->spi_configuration, 0, sizeof(s->spi_configuration));
+
+    mptsas_update_interrupt(s);
 
     return 0;
 }
@@ -969,7 +1016,6 @@ static void mptsas_interrupt_status_write(MPTSASState *s)
         break;
 
     case DOORBELL_READ:
-        /* The reply can be read continuously, so leave the interrupt up.  */
         assert(s->intr_status & MPI_HIS_DOORBELL_INTERRUPT);
         if (s->doorbell_reply_idx == s->doorbell_reply_size) {
             s->doorbell_state = DOORBELL_NONE;
@@ -1261,8 +1307,20 @@ static void *mptsas_load_request(QEMUFile *f, SCSIRequest *sreq)
 
 static const struct SCSIBusInfo mptsas_scsi_info = {
     .tcq = true,
-    .max_target = MPTSAS_NUM_PORTS,
+    .max_target = MPTSAS_NUM_PORTS - 1,
     .max_lun = 1,
+
+    .get_sg_list = mptsas_get_sg_list,
+    .complete = mptsas_command_complete,
+    .cancel = mptsas_request_cancelled,
+    .save_request = mptsas_save_request,
+    .load_request = mptsas_load_request,
+};
+
+static const struct SCSIBusInfo mptspi_scsi_info = {
+    .tcq = true,
+    .max_target = MPTSPI_MAX_TARGETS - 1,
+    .max_lun = 255,
 
     .get_sg_list = mptsas_get_sg_list,
     .complete = mptsas_command_complete,
@@ -1313,19 +1371,20 @@ static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
     pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
                                  PCI_BASE_ADDRESS_MEM_TYPE_32, &s->diag_io);
 
-    if (!s->sas_addr) {
+    if (!mptsas_is_spi(s) && !s->sas_addr) {
         s->sas_addr = ((NAA_LOCALLY_ASSIGNED_ID << 24) |
                        IEEE_COMPANY_LOCALLY_ASSIGNED) << 36;
         s->sas_addr |= (pci_dev_bus_num(dev) << 16);
         s->sas_addr |= (PCI_SLOT(dev->devfn) << 8);
         s->sas_addr |= PCI_FUNC(dev->devfn);
     }
-    s->max_devices = MPTSAS_NUM_PORTS;
+    s->max_devices = mptsas_max_devices(s);
 
     s->request_bh = qemu_bh_new_guarded(mptsas_fetch_requests, s,
                                         &DEVICE(dev)->mem_reentrancy_guard);
 
-    scsi_bus_init(&s->bus, sizeof(s->bus), &dev->qdev, &mptsas_scsi_info);
+    scsi_bus_init(&s->bus, sizeof(s->bus), &dev->qdev,
+                  mptsas_is_spi(s) ? &mptspi_scsi_info : &mptsas_scsi_info);
 }
 
 static void mptsas_scsi_uninit(PCIDevice *dev)
@@ -1346,25 +1405,125 @@ static void mptsas_reset(DeviceState *dev)
 static int mptsas_post_load(void *opaque, int version_id)
 {
     MPTSASState *s = opaque;
+    const uint32_t spi_port_configuration_mask =
+        MPI_SCSIPORTPAGE1_CFG_PORT_SCSI_ID_MASK |
+        MPI_SCSIPORTPAGE1_CFG_PORT_RESPONSE_ID_MASK;
+    uint8_t expected_variant;
 
-    if (s->doorbell_idx > s->doorbell_cnt ||
+    expected_variant = object_dynamic_cast(OBJECT(s), TYPE_LSI53C1030) ?
+                       MPT_FUSION_VARIANT_LSI53C1030 :
+                       MPT_FUSION_VARIANT_SAS1068;
+
+    if (s->variant == UINT8_MAX) {
+        if (expected_variant != MPT_FUSION_VARIANT_SAS1068) {
+            return -EINVAL;
+        }
+        s->variant = MPT_FUSION_VARIANT_SAS1068;
+    } else if (s->variant != expected_variant) {
+        return -EINVAL;
+    }
+
+    if (s->doorbell_idx < 0 || s->doorbell_cnt < 0 ||
+        s->doorbell_reply_idx < 0 || s->doorbell_reply_size < 0 ||
+        s->doorbell_idx > s->doorbell_cnt ||
         s->doorbell_cnt > ARRAY_SIZE(s->doorbell_msg) ||
         s->doorbell_reply_idx > s->doorbell_reply_size ||
         s->doorbell_reply_size > ARRAY_SIZE(s->doorbell_reply) ||
         MPTSAS_FIFO_INVALID(s, request_post) ||
         MPTSAS_FIFO_INVALID(s, reply_post) ||
         MPTSAS_FIFO_INVALID(s, reply_free) ||
-        s->diagnostic_idx > 4) {
+        s->diagnostic_idx > 5 ||
+        s->doorbell_state > DOORBELL_READ) {
+        return -EINVAL;
+    }
+
+    if (s->ioc1_flags & ~(uint32_t)MPI_IOCPAGE1_REPLY_COALESCING) {
+        return -EINVAL;
+    }
+
+    if (mptsas_is_spi(s)) {
+        unsigned int port_id =
+            s->spi_port_configuration &
+            MPI_SCSIPORTPAGE1_CFG_PORT_SCSI_ID_MASK;
+
+        if (!s->max_devices || s->max_devices > MPTSPI_MAX_TARGETS ||
+            s->max_buses > 1 ||
+            (s->spi_port_configuration & ~spi_port_configuration_mask) ||
+            port_id >= MPTSPI_MAX_TARGETS) {
+            return -EINVAL;
+        }
+    } else if (s->ioc1_flags || s->ioc1_coalescing_timeout ||
+               s->ioc1_coalescing_depth) {
         return -EINVAL;
     }
 
     return 0;
 }
 
+static int mptsas_pre_load(void *opaque)
+{
+    MPTSASState *s = opaque;
+
+    s->variant = UINT8_MAX;
+    s->ioc1_flags = 0;
+    s->ioc1_coalescing_timeout = 0;
+    s->ioc1_coalescing_depth = 0;
+    s->spi_port_configuration = MPTSPI_DEFAULT_PORT_CONFIGURATION;
+    s->spi_port_on_bus_timer = 0;
+    return 0;
+}
+
+static bool mptspi_vmstate_needed(void *opaque)
+{
+    MPTSASState *s = opaque;
+
+    return mptsas_is_spi(s);
+}
+
+static bool mptsas_ioc1_vmstate_needed(void *opaque)
+{
+    MPTSASState *s = opaque;
+
+    return mptsas_is_spi(s) &&
+           (s->ioc1_flags || s->ioc1_coalescing_timeout ||
+            s->ioc1_coalescing_depth);
+}
+
+static const VMStateDescription vmstate_mptsas_ioc1 = {
+    .name = "mptsas/ioc-page-1",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mptsas_ioc1_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(ioc1_flags, MPTSASState),
+        VMSTATE_UINT32(ioc1_coalescing_timeout, MPTSASState),
+        VMSTATE_UINT8(ioc1_coalescing_depth, MPTSASState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
+static const VMStateDescription vmstate_mptspi_variant = {
+    .name = "mptsas/spi-variant",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = mptspi_vmstate_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT8(variant, MPTSASState),
+        VMSTATE_UINT32_ARRAY(spi_requested_params, MPTSASState,
+                             MPTSPI_MAX_TARGETS),
+        VMSTATE_UINT32_ARRAY(spi_configuration, MPTSASState,
+                             MPTSPI_MAX_TARGETS),
+        VMSTATE_UINT32(spi_port_configuration, MPTSASState),
+        VMSTATE_UINT32(spi_port_on_bus_timer, MPTSASState),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static const VMStateDescription vmstate_mptsas = {
     .name = "mptsas",
     .version_id = 0,
     .minimum_version_id = 0,
+    .pre_load = mptsas_pre_load,
     .post_load = mptsas_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_PCI_DEVICE(dev, MPTSASState),
@@ -1407,7 +1566,12 @@ static const VMStateDescription vmstate_mptsas = {
         VMSTATE_UINT64(host_mfa_high_addr, MPTSASState),
         VMSTATE_UINT64(sense_buffer_high_addr, MPTSASState),
         VMSTATE_END_OF_LIST()
-    }
+    },
+    .subsections = (const VMStateDescription * const []) {
+        &vmstate_mptsas_ioc1,
+        &vmstate_mptspi_variant,
+        NULL
+    },
 };
 
 static const Property mptsas_properties[] = {
@@ -1416,7 +1580,7 @@ static const Property mptsas_properties[] = {
     DEFINE_PROP_ON_OFF_AUTO("msi", MPTSASState, msi, ON_OFF_AUTO_AUTO),
 };
 
-static void mptsas1068_class_init(ObjectClass *oc, const void *data)
+static void mpt_fusion_class_init(ObjectClass *oc, const void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(oc);
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
@@ -1425,22 +1589,20 @@ static void mptsas1068_class_init(ObjectClass *oc, const void *data)
     pc->exit = mptsas_scsi_uninit;
     pc->romfile = 0;
     pc->vendor_id = PCI_VENDOR_ID_LSI_LOGIC;
-    pc->device_id = PCI_DEVICE_ID_LSI_SAS1068;
     pc->subsystem_vendor_id = PCI_VENDOR_ID_LSI_LOGIC;
-    pc->subsystem_id = 0x8000;
     pc->class_id = PCI_CLASS_STORAGE_SCSI;
     device_class_set_props(dc, mptsas_properties);
     device_class_set_legacy_reset(dc, mptsas_reset);
     dc->vmsd = &vmstate_mptsas;
-    dc->desc = "LSI SAS 1068";
     set_bit(DEVICE_CATEGORY_STORAGE, dc->categories);
 }
 
-static const TypeInfo mptsas_info = {
-    .name = TYPE_MPTSAS1068,
+static const TypeInfo mpt_fusion_info = {
+    .name = TYPE_MPT_FUSION,
     .parent = TYPE_PCI_DEVICE,
     .instance_size = sizeof(MPTSASState),
-    .class_init = mptsas1068_class_init,
+    .abstract = true,
+    .class_init = mpt_fusion_class_init,
     .interfaces = (const InterfaceInfo[]) {
         { INTERFACE_CONVENTIONAL_PCI_DEVICE },
         { },
@@ -1449,7 +1611,7 @@ static const TypeInfo mptsas_info = {
 
 static void mptsas_register_types(void)
 {
-    type_register_static(&mptsas_info);
+    type_register_static(&mpt_fusion_info);
 }
 
 type_init(mptsas_register_types)

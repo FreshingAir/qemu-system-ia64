@@ -146,10 +146,37 @@ qtests_alpha = ['boot-serial-test'] + \
 qtests_avr = [ 'boot-serial-test' ]
 
 qtests_ia64 = ['ia64-vpc-test'] + \
+  (config_all_devices.has_key('CONFIG_HP_I2000') ? \
+   ['hp-i2000-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_HP_ZX6000') ? \
+   ['hp-zx6000-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IDE_CMD649') ? \
+   ['ia64-cmd649-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_460GX_PID') ? \
+   ['intel-460gx-pid-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_460GX_HOST') ? \
+   ['intel-460gx-host-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_460GX_DMA_TEST') ? \
+   ['intel-460gx-dma-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_I2000_460GX_TEST') ? \
+   ['ia64-i2000-460gx-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_I2000_IO_TEST') ? \
+   ['ia64-i2000-io-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_ZX6000_ZX1_TEST') ? \
+   ['ia64-zx6000-zx1-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_I2000_EFI_TEST') ? \
+   ['ia64-i2000-efi-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_ZX6000_EFI_TEST') ? \
+   ['ia64-zx6000-efi-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_IA64_ISP12160_TEST') ? \
+   ['ia64-isp12160-test'] : []) + \
   (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : [])
 
 qtests_hppa = \
   qtests_filter + \
+  (config_all_devices.has_key('CONFIG_ASTRO') and \
+   config_all_devices.has_key('CONFIG_LSI_SCSI_PCI') ? \
+   ['hppa-astro-test'] : []) + \
   (config_all_devices.has_key('CONFIG_VGA') ? ['display-vga-test'] : [])
 
 qtests_loongarch64 = qtests_filter + \
@@ -304,6 +331,7 @@ qos_test_ss.add(
   'e1000-test.c',
   'eepro100-test.c',
   'es1370-test.c',
+  'lsi53c1030-test.c',
   'lsm303dlhc-mag-test.c',
   'isl_pmbus_vr-test.c',
   'max34451-test.c',
@@ -442,6 +470,12 @@ foreach dir : target_dirs
   endif
   qtest_env.set('G_TEST_DBUS_DAEMON', meson.project_source_root() / 'tests/dbus-daemon.sh')
   qtest_env.set('QTEST_QEMU_BINARY', './qemu-system-' + target_base)
+  if target_base == 'ia64'
+    qtest_env.set('QTEST_IA64_FIRMWARE',
+                  meson.project_build_root() /
+                  'roms/ia64-firmware/ia64-firmware.bin')
+    test_deps += [ia64_firmware_bin]
+  endif
   if have_tools and have_vhost_user_blk_server
     qtest_env.set('QTEST_QEMU_STORAGE_DAEMON_BINARY', './storage-daemon/qemu-storage-daemon')
     test_deps += [qsd]

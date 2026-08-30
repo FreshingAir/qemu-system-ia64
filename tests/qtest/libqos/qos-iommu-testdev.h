@@ -31,6 +31,7 @@ typedef struct QOSIOMMUTestdevDmaCfg {
 uint32_t qos_iommu_testdev_trigger_dma(QPCIDevice *dev, QPCIBar bar,
                                        uint64_t iova, uint64_t gpa,
                                        uint32_t len, uint32_t attrs);
+uint32_t qos_iommu_testdev_get_memtx_result(QPCIDevice *dev, QPCIBar bar);
 
 void qos_iommu_testdev_single_translation(const QOSIOMMUTestdevDmaCfg *dma,
                                           void *opaque,

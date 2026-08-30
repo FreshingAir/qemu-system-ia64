@@ -3,8 +3,16 @@
 
 #include "mpi.h"
 #include "hw/pci/pci_device.h"
+#include "hw/scsi/scsi.h"
 
 #define MPTSAS_NUM_PORTS 8
+#define MPTSPI_NUM_PORTS 1
+#define MPTSPI_MAX_TARGETS 16
+#define MPTSPI_HOST_ID 7
+#define MPTSPI_DEFAULT_PORT_CONFIGURATION \
+    (MPTSPI_HOST_ID | \
+     (1U << (MPTSPI_HOST_ID + \
+             MPI_SCSIPORTPAGE1_CFG_SHIFT_PORT_RESPONSE_ID)))
 #define MPTSAS_MAX_FRAMES 2048     /* Firmware limit at 65535 */
 
 #define MPTSAS_REQUEST_QUEUE_DEPTH 128
@@ -14,10 +22,19 @@
 
 typedef struct MPTSASRequest MPTSASRequest;
 
+#define TYPE_MPT_FUSION "mpt-fusion"
 #define TYPE_MPTSAS1068 "mptsas1068"
+#define TYPE_LSI53C1030 "lsi53c1030"
 typedef struct MPTSASState MPTSASState;
-DECLARE_INSTANCE_CHECKER(MPTSASState, MPT_SAS,
-                         TYPE_MPTSAS1068)
+DECLARE_INSTANCE_CHECKER(MPTSASState, MPT_FUSION,
+                         TYPE_MPT_FUSION)
+
+#define MPT_SAS(obj) MPT_FUSION(obj)
+
+typedef enum MPTFusionVariant {
+    MPT_FUSION_VARIANT_SAS1068,
+    MPT_FUSION_VARIANT_LSI53C1030,
+} MPTFusionVariant;
 
 enum {
     DOORBELL_NONE,
@@ -37,6 +54,7 @@ struct MPTSASState {
     uint64_t sas_addr;
 
     bool msi_in_use;
+    uint8_t variant;
 
     /* Doorbell register */
     uint32_t state;
@@ -78,8 +96,38 @@ struct MPTSASState {
     uint16_t max_buses;
     uint16_t reply_frame_size;
 
+    /* IOC configuration page 1 current values. */
+    uint32_t ioc1_flags;
+    uint32_t ioc1_coalescing_timeout;
+    uint8_t ioc1_coalescing_depth;
+
+    uint32_t spi_port_configuration;
+    uint32_t spi_port_on_bus_timer;
+    uint32_t spi_requested_params[MPTSPI_MAX_TARGETS];
+    uint32_t spi_configuration[MPTSPI_MAX_TARGETS];
+
     SCSIBus bus;
 };
+
+static inline SCSIBus *mpt_fusion_get_scsi_bus(PCIDevice *dev)
+{
+    return &MPT_FUSION(dev)->bus;
+}
+
+static inline bool mptsas_is_spi(const MPTSASState *s)
+{
+    return s->variant == MPT_FUSION_VARIANT_LSI53C1030;
+}
+
+static inline unsigned int mptsas_num_ports(const MPTSASState *s)
+{
+    return mptsas_is_spi(s) ? MPTSPI_NUM_PORTS : MPTSAS_NUM_PORTS;
+}
+
+static inline unsigned int mptsas_max_devices(const MPTSASState *s)
+{
+    return mptsas_is_spi(s) ? MPTSPI_MAX_TARGETS : MPTSAS_NUM_PORTS;
+}
 
 void mptsas_fix_scsi_io_endianness(MPIMsgSCSIIORequest *req);
 void mptsas_fix_scsi_io_reply_endianness(MPIMsgSCSIIOReply *reply);

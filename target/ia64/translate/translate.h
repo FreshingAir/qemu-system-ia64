@@ -178,6 +178,9 @@ void ia64_gen_qemu_st_i128(DisasContext *ctx, TCGv_i128 value, TCGv_i64 addr,
 void ia64_gen_atomic_xchg_i64(DisasContext *ctx, TCGv_i64 result,
                               TCGv_i64 addr, TCGv_i64 value, int mmu_idx,
                               MemOp memop);
+void ia64_gen_atomic_cmpxchg_i64(DisasContext *ctx, TCGv_i64 result,
+                                 TCGv_i64 addr, TCGv_i64 cmp,
+                                 TCGv_i64 value, int mmu_idx, MemOp memop);
 void ia64_gen_atomic_fetch_add_i64(DisasContext *ctx, TCGv_i64 result,
                                    TCGv_i64 addr, TCGv_i64 value, int mmu_idx,
                                    MemOp memop);

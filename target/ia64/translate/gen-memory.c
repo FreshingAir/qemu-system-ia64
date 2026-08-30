@@ -1172,8 +1172,9 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         gen_helper_check_semaphore_access(tcg_env, plan.address);
         ia64_gen_read_simple_ar(ccv, 32);
         ia64_gen_memory_release(insn);
-        gen_helper_cmpxchg(cpu_gr[op->destination], tcg_env, plan.address, ccv,
-                           value, tcg_constant_i32(plan.size));
+        ia64_gen_atomic_cmpxchg_i64(
+            ctx, cpu_gr[op->destination], plan.address, ccv, value,
+            ctx->memory.mmu_idx, plan.memop);
         ia64_gen_memory_acquire(insn);
         ia64_gen_gr_nat_clear(insn, op->destination);
         break;

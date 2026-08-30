@@ -1,193 +1,101 @@
 # qemu-system-ia64
 
-Experimental QEMU full-system emulation target for IA-64/Itanium guests.
+Experimental QEMU full-system emulation for IA-64 guests.
 
 > [!IMPORTANT]
-> This codebase was developed with assistance from large language models
-> (LLMs). Do not submit project-specific changes to upstream QEMU.
+> This is an independent, LLM-assisted QEMU fork. Report project-specific
+> issues here, not to upstream QEMU.
 
 ## Quick start
 
-### Prebuilt binaries
+### Download prebuilt binaries
 
-[GitHub Actions](https://github.com/syunnPC/qemu-system-ia64/actions/workflows/build.yml)
-is the canonical source for current Windows AMD64 and Linux AMD64/AArch64 host
-archives and the separate firmware artifact. Download one host archive and the
-firmware, then pass the extracted `ia64-firmware.bin` path to `-bios`.
+Download a host archive and the separate firmware artifact from
+[GitHub Actions](https://github.com/syunnPC/qemu-system-ia64/actions/workflows/build.yml).
+Builds are available for Windows AMD64 and Linux AMD64/AArch64.
+
+Place `ia64-firmware.bin` in the working directory, or pass its path with
+`-bios`. [GitHub Releases](https://github.com/syunnPC/qemu-system-ia64/releases)
+contains selected builds but may not be current.
 
 > [!WARNING]
-> The AMD64 jobs publish both broadly compatible standard builds and
-> `x86-64-v2-optimized` builds. The optimized builds require an x86-64-v2 host
-> and disable debugging and hardening features for additional emulator speed;
-> use them only with trusted guest software.
->
-> The optimized builds are experimental and may cause guest OS instability or
-> incorrect behavior. If you encounter a problem, retry with the corresponding
-> standard `Linux-AMD64` or `Windows-AMD64` artifact.
+> The `x86-64-v2-optimized` AMD64 builds require an x86-64-v2 host and disable
+> debugging and hardening features for additional speed. They are experimental
+> and may be unstable.
+> If a guest is unstable, use the matching standard build.
 
-[GitHub Releases](https://github.com/syunnPC/qemu-system-ia64/releases)
-retains selected builds for convenience, but may lag behind or omit some host
-archives. Use GitHub Actions for the latest binaries.
+### Build from source
 
-### Build
-
-Building the firmware requires an IA-64 ELF cross toolchain whose
-`ia64-linux-gnu-`-prefixed executables are on `PATH`.
+Building the firmware requires an IA-64 ELF cross toolchain with
+`ia64-linux-gnu-` tools on `PATH`.
 
 ```sh
 ./configure --target-list=ia64-softmmu --enable-gtk
 ninja -C build qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
 ```
 
-For Windows cross-build instructions and performance-oriented configurations,
-see [the IA-64 build guide](docs/devel/ia64-builds.rst).
-
-### Boot installation media
+### Command line example
 
 ```sh
 ./build/qemu-system-ia64 \
   -machine itanium2-vpc \
-  -bios ./build/roms/ia64-firmware/ia64-firmware.bin \
   -drive file=/path/to/guest-media.iso,media=cdrom,format=raw,readonly=on \
   -display gtk
 ```
 
-## Emulated platform
+Use the `nvram=<path>` machine property to specify an NVRAM file. Set
+`nvram=none` for non-persistent EFI variables.
 
-QEMU has no default IA-64 machine, so `-machine` is required. The canonical
-machine names are `itanium2-vpc` and `itanium-vpc`. `ia64-vpc` is 
-a backward-compatible alias of `itanium2-vpc`.
+## Machine profiles
 
-### Machine profiles
+A machine must be selected explicitly with `-machine`.
 
-| Machine | Target operating systems | Default CPU |
-| --- | --- | --- |
-| `itanium2-vpc` | Most IA-64 operating systems | `montecito` |
-| `itanium-vpc` | Older systems, such as Windows XP 64-Bit Edition (Version 2002) and earlier releases | `merced` |
+| Machine | Intended use | Default CPU | Default VGA |
+| --- | --- | --- | --- |
+| `hp-i2000` | Older IA-64 operating systems | `merced` (fixed) | NVIDIA Quadro2 Pro |
+| `hp-zx6000` | Most IA-64 operating systems | `madison-zx6000` (fixed) | ATI Radeon RV100 |
+| `itanium2-vpc` | Most IA-64 operating systems | `montecito` | ATI Rage 128 Pro |
+| `itanium-vpc` | Older IA-64 operating systems | `merced` | ATI Rage 128 Pro |
 
-`itanium-vpc` enables first-generation firmware and SAL
-compatibility workarounds and omits ICH9 AHCI by default.
+`ia64-vpc` is an alias of `itanium2-vpc`. The HP profiles reject `-cpu`
+overrides; the virtual PC profiles allow them. All profiles use
+`ia64-firmware.bin` by default unless overridden with `-bios`. The HP machine
+profiles remain experimental.
 
-Machine and CPU selection are independent. A `-cpu` override does not change
-the selected machine profile's firmware compatibility behavior.
-
-### Defaults and facilities
-
-| Component | Default | Options and limits |
-| --- | --- | --- |
-| vCPUs | 1 | 1 to 64 |
-| RAM | 2 GiB | Set with `-m` |
-| Firmware | None | Pass the project firmware with `-bios`; sources are under `roms/ia64-firmware/` |
-| Graphics | ATI-compatible PCI graphics | Standard VGA with `-vga std` |
-| Input | PS/2 | USB with `i8042=off` |
-| Network | 82540EM-compatible e1000 | User-mode and TAP backends; no EFI network boot |
-| Boot storage | LSI53C895A SCSI | Optional CMD646 IDE/ATAPI |
-
-The machines also provide OHCI/UHCI USB, local and I/O SAPIC, ACPI tables,
-RTC, watchdog, persistent NVRAM, serial and debug ports, and `savevm`/`loadvm`
-snapshot support.
-
-### CPU models
-
-| CPU | IA-32 execution | Additional instructions |
-| --- | --- | --- |
-| `merced` | Yes | None |
-| `madison` | Yes | `brl` |
-| `montecito` | No | `brl`; `ld16`/`st16`/`cmp8xchg16` families; `vmsw.0`/`vmsw.1` (architectural faults only) |
-
-## Runtime configuration
-
-### SMP and input
-
-Use `-accel tcg,thread=single` for one vCPU and
-`-accel tcg,thread=multi -smp N` for 2 to 64 vCPUs. With `i8042=off`, the
-machine adds a USB keyboard and absolute tablet without requiring `-usb`.
-
-> [!NOTE]
-> Having more processors does not necessarily guarantee better results.
-> As the number of cores increases, performance penalties can occur due to inter-core synchronisation and other factors.
-> In most cases, 2–4 SMPs are optimal, and we recommend a maximum of 8.
-
-### Graphics
-
-To set a preferred VBE resolution and 32 MiB of video memory, add:
+Use `-vga quadro2` for Quadro2 Pro or `-vga ati` for an ATI adapter. The ATI
+`model` property accepts `rage128p`, `rv100`, and `es1000`; for example:
 
 ```sh
--vga ati \
--global ati-vga.xres=3840 \
--global ati-vga.yres=2160 \
--global ati-vga.vgamem_mb=32
+-vga ati -global ati-vga.model=es1000
 ```
 
-Specify `xres` and `yres` together; `xres` must be a multiple of eight. Unless
-`xmax` and `ymax` are also supplied, the preferred resolution is the largest
-advertised through INT 10h VBE. The fixed PCI layout supports up to 64 MiB of
-video memory, and the predefined mode list extends through 5120x2880 at 32 bpp.
-The default is 1280x1024 with 16 MiB. Host monitor resolution is not detected
-automatically.
+## Common options
 
-The IA-64 XPDM driver for the emulated ATI device supports Windows XP through
-Windows Server 2008 R2 and is available from
-[qemu-system-ia64-ati-xpdm](https://github.com/syunnPC/qemu-system-ia64-ati-xpdm).
+| Purpose | Option |
+| --- | --- |
+| One vCPU | `-accel tcg,thread=single` |
+| Multiple vCPUs | `-accel tcg,thread=multi -smp N` |
+| User-mode networking | `-nic user,model=e1000` |
+| Disable networking | `-nic none` |
+| Serial console | `-serial stdio` |
+| AHCI HDD | `-drive ...,if=none,id=<id> -device ide-hd,drive=<id>,bus=ide.<number>` |
+| AHCI CD | `-drive ...,media=cdrom,readonly=on,if=none,id=<id> -device ide-cd,drive=<id>,bus=ide.<number>` |
 
-### Networking
+The HP profiles support up to two vCPUs; the virtual PC profiles support up to
+64. Two to four vCPUs are usually the best choice, and more than eight is not
+recommended.
 
-With libslirp, connect the default e1000 controller using
-`-nic user,model=e1000`. Standard TAP backends are also supported; use
-`-nic none` to omit the controller.
-
-### Serial, debug, and EFI variables
-
-Use `-serial stdio` for serial output. `-debug-port` exposes the transport
-described by the ACPI DBGP table; for example,
-`-debug-port tcp::4444,server=on,wait=on,nodelay=on`.
-
-EFI variables default to a 64 KiB `nvram` file beside the selected firmware.
-Use a separate file for each VM with
-`-machine itanium2-vpc,nvram=/path/to/guest.nvram`, or use `nvram=none` for
-process-local variables.
-
-## EFI firmware and shell
-
-The firmware waits three seconds for F2, F12, or Delete before boot. Any of
-these keys opens the EFI shell from the graphical or serial console.
-
-Common shell commands include:
-
-```text
-map
-ls fs0:\EFI\BOOT
-run fs0:\EFI\BOOT\TOOL.EFI argument
-boot fs0:
-bootorder Boot0001 Boot0000
-bootnext Boot0001
-```
-
-`boot fsN:` launches `\EFI\BOOT\BOOTIA64.EFI`. `bootnext` is consumed by the
-next automatic boot; boot-order changes persist when an NVRAM file is
-configured. Attach an installed EFI disk with, for example,
-`-drive file=/path/to/guest-disk.qcow2,format=qcow2`.
-
-## Tests
-
-Use the build-local Meson selected by `configure`:
-
-```sh
-build/pyvenv/bin/meson test -C build --suite ia64 --print-errorlogs
-build/pyvenv/bin/meson test -C build --suite qtest-ia64 --print-errorlogs
-build/pyvenv/bin/meson test -C build --suite func-ia64 --print-errorlogs
-build/pyvenv/bin/meson test -C build --suite func-ia64-thorough --print-errorlogs
-```
-
-See [the IA-64 testing guide](docs/devel/testing/ia64.rst) for focused runs and
-test-authoring rules.
+Press F2, F12, or Delete during startup to open the EFI shell.
 
 ## Status
 
-The emulator boots several IA-64 operating-systems. Automated tests
-cover four-vCPU Itanium 2 and 64-vCPU Merced configurations. Instruction
-emulation, privileged behavior, floating-point handling, and device support
-remain experimental.
+Several IA-64 operating systems boot, but instruction emulation, privileged
+behavior, floating-point handling, and device support remain experimental.
+
+## Related projects
+
+- [IA-64 ATI XPDM driver](https://github.com/syunnPC/qemu-system-ia64-ati-xpdm)
+- [IA-64 NVIDIA XPDM driver](https://github.com/syunnPC/qemu-system-ia64-nv-xpdm)
 
 ### Screenshots
 

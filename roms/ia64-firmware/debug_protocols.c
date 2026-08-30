@@ -22,13 +22,6 @@ struct _EFI_DEBUGPORT_PROTOCOL {
 
 typedef struct {
     FW_DEVICE_PATH_NODE Header;
-    UINT32 MemoryType;
-    EFI_PHYSICAL_ADDRESS StartingAddress;
-    EFI_PHYSICAL_ADDRESS EndingAddress;
-} __attribute__((packed)) FW_MEMORY_MAPPED_DEVICE_PATH_NODE;
-
-typedef struct {
-    FW_DEVICE_PATH_NODE Header;
     UINT8 Guid[16];
 } __attribute__((packed)) FW_VENDOR_DEVICE_PATH_NODE;
 

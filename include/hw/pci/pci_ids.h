@@ -164,6 +164,7 @@
 #define PCI_VENDOR_ID_LSI_LOGIC          0x1000
 #define PCI_DEVICE_ID_LSI_53C810         0x0001
 #define PCI_DEVICE_ID_LSI_53C895A        0x0012
+#define PCI_DEVICE_ID_LSI_53C1030        0x0030
 #define PCI_DEVICE_ID_LSI_SAS1068        0x0054
 #define PCI_DEVICE_ID_LSI_SAS1078        0x0060
 #define PCI_DEVICE_ID_LSI_SAS0079        0x0079
@@ -204,6 +205,7 @@
 
 #define PCI_VENDOR_ID_CMD                0x1095
 #define PCI_DEVICE_ID_CMD_646            0x0646
+#define PCI_DEVICE_ID_CMD_649            0x0649
 
 #define PCI_VENDOR_ID_REALTEK            0x10ec
 #define PCI_DEVICE_ID_REALTEK_8139       0x8139

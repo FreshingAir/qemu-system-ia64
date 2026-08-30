@@ -25,6 +25,21 @@
 
 const char common_args[] = "-nodefaults -machine none";
 
+static const char *ia64_nvram_option(const char *machine)
+{
+    if (!g_str_equal(qtest_get_arch(), "ia64")) {
+        return "";
+    }
+    if (g_str_equal(machine, "ia64-vpc") ||
+        g_str_equal(machine, "itanium-vpc") ||
+        g_str_equal(machine, "itanium2-vpc") ||
+        g_str_equal(machine, "hp-i2000") ||
+        g_str_equal(machine, "hp-zx6000")) {
+        return ",nvram=none";
+    }
+    return "";
+}
+
 static QList *qom_list_types(QTestState * qts, const char *implements,
                              bool abstract)
 {
@@ -308,12 +323,14 @@ static void add_machine_test_case(const char *mname)
     char *path, *args;
 
     path = g_strdup_printf("device/introspect/concrete/defaults/%s", mname);
-    args = g_strdup_printf("-M %s", mname);
+    args = g_strdup_printf("-M %s%s", mname,
+                           ia64_nvram_option(mname));
     qtest_add_data_func_full(path, args, test_device_intro_concrete, g_free);
     g_free(path);
 
     path = g_strdup_printf("device/introspect/concrete/nodefaults/%s", mname);
-    args = g_strdup_printf("-nodefaults -M %s", mname);
+    args = g_strdup_printf("-nodefaults -M %s%s", mname,
+                           ia64_nvram_option(mname));
     qtest_add_data_func_full(path, args, test_device_intro_concrete, g_free);
     g_free(path);
 }

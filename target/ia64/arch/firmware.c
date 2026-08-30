@@ -13,7 +13,6 @@
 #include "hw/ia64/ia64_vpc_abi.h"
 #include "qemu/atomic.h"
 
-#define FW_BOOT_NONSTANDARD_DIRECT_BASE 0x0000000080000000ULL
 #define FW_BOOT_NONSTANDARD_DIRECT_RR \
     ((1ULL << IA64_RR_RID_SHIFT) | \
      (13ULL << IA64_ITIR_PS_SHIFT) | IA64_RR_VE)
@@ -53,8 +52,8 @@ bool ia64_firmware_boot_miss_mapping(IA64CPU *cpu, uint64_t va,
         (rr & FW_BOOT_NONSTANDARD_DIRECT_RR_MASK) ==
             FW_BOOT_NONSTANDARD_DIRECT_RR &&
         !(env->cr_pta & IA64_PTA_VE) &&
-        phys >= FW_BOOT_NONSTANDARD_DIRECT_BASE) {
-        uint64_t direct_pa = phys - FW_BOOT_NONSTANDARD_DIRECT_BASE;
+        phys >= IA64_FW_LOADER_DIRECT_ALIAS_OFFSET) {
+        uint64_t direct_pa = phys - IA64_FW_LOADER_DIRECT_ALIAS_OFFSET;
 
         if (!cpu->boot_info_valid ||
             direct_pa >= cpu->boot_info.low_ram_size) {

@@ -20,6 +20,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "qemu/error-report.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
 #include "system/block-backend.h"
 #include "system/blockdev.h"
@@ -43,6 +44,11 @@ static void idebus_unrealize(BusState *bus)
 
     if (ibus->vmstate) {
         qemu_del_vm_change_state_handler(ibus->vmstate);
+        ibus->vmstate = NULL;
+    }
+    if (ibus->bh) {
+        qemu_bh_delete(ibus->bh);
+        ibus->bh = NULL;
     }
 }
 

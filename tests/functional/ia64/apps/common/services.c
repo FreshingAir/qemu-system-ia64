@@ -2019,24 +2019,35 @@ static BOOLEAN test_dsdt_crs(const TEST_TABLE_CONTEXT *Context)
            uart_window && end_tag;
 }
 
-static BOOLEAN test_ssdt_uart_crs(const TEST_TABLE_CONTEXT *Context)
+static BOOLEAN test_ssdt_legacy_crs(const TEST_TABLE_CONTEXT *Context)
 {
     static const UINT8 sb_name[4] = { '_', 'S', 'B', '_' };
     static const UINT8 pci0_name[4] = { 'P', 'C', 'I', '0' };
     static const UINT8 uart_name[4] = { 'U', 'A', 'R', '0' };
+    static const UINT8 ps2_enabled_name[4] = { 'P', '2', 'E', 'N' };
+    static const UINT8 keyboard_name[4] = { 'P', 'S', '2', 'K' };
+    static const UINT8 mouse_name[4] = { 'P', 'S', '2', 'M' };
     static const UINT8 crs_name[4] = { '_', 'C', 'R', 'S' };
+    static const UINT8 keyboard_resources[] = {
+        0x47, 0x01, 0x60, 0x00, 0x60, 0x00, 0x01, 0x01,
+        0x47, 0x01, 0x64, 0x00, 0x64, 0x00, 0x01, 0x01,
+        0x22, 0x02, 0x00, 0x79, 0x00,
+    };
+    static const UINT8 mouse_resources[] = {
+        0x22, 0x00, 0x10, 0x79, 0x00,
+    };
     const UINT8 *aml;
     UINTN aml_length;
-    const UINT8 *uart;
-    const UINT8 *resources;
+    const UINT8 *keyboard;
+    const UINT8 *mouse;
+    const UINT8 *keyboard_crs;
+    const UINT8 *mouse_crs;
     const UINT8 *scope_content;
     const UINT8 *scope_end;
-    UINTN resource_length;
+    UINTN keyboard_crs_length;
+    UINTN mouse_crs_length;
     UINTN scope_offset;
-    UINTN offset = 0;
     BOOLEAN under_pci0 = 0;
-    BOOLEAN io_address = 0;
-    BOOLEAN irq = 0;
 
     if (!Context->Valid) {
         return 0;
@@ -2044,11 +2055,25 @@ static BOOLEAN test_ssdt_uart_crs(const TEST_TABLE_CONTEXT *Context)
     aml = (const UINT8 *)Context->Ssdt + sizeof(TEST_SDT_HEADER);
     aml_length = get_u32((const UINT8 *)Context->Ssdt + 4) -
                  sizeof(TEST_SDT_HEADER);
-    uart = find_bytes(aml, aml_length, uart_name, sizeof(uart_name), 0);
-    if (uart == NULL ||
+    keyboard = find_bytes(aml, aml_length, keyboard_name,
+                          sizeof(keyboard_name), 0);
+    mouse = find_bytes(aml, aml_length, mouse_name, sizeof(mouse_name), 0);
+    if (keyboard == NULL || mouse == NULL ||
+        find_bytes(aml, aml_length, uart_name, sizeof(uart_name), 0) != NULL ||
+        find_bytes(aml, aml_length, pci0_name, sizeof(pci0_name), 0) == NULL ||
+        !aml_named_byte(aml, aml_length, ps2_enabled_name, 0) ||
         !aml_named_buffer(aml, aml_length, crs_name,
-                          (UINTN)(uart - aml), &resources,
-                          &resource_length)) {
+                          (UINTN)(keyboard - aml), &keyboard_crs,
+                          &keyboard_crs_length) ||
+        !aml_named_buffer(aml, aml_length, crs_name,
+                          (UINTN)(mouse - aml), &mouse_crs,
+                          &mouse_crs_length) ||
+        keyboard_crs_length != sizeof(keyboard_resources) ||
+        mouse_crs_length != sizeof(mouse_resources) ||
+        !ia64_bytes_equal(keyboard_crs, keyboard_resources,
+                          sizeof(keyboard_resources)) ||
+        !ia64_bytes_equal(mouse_crs, mouse_resources,
+                          sizeof(mouse_resources))) {
         return 0;
     }
     for (scope_offset = 0; scope_offset + 2U < aml_length;
@@ -2067,47 +2092,15 @@ static BOOLEAN test_ssdt_uart_crs(const TEST_TABLE_CONTEXT *Context)
                              pci0_name, sizeof(pci0_name)) &&
             find_bytes(scope_content + 10U,
                        (UINTN)(scope_end - scope_content - 10U),
-                       uart_name, sizeof(uart_name), 0) != NULL) {
+                       keyboard_name, sizeof(keyboard_name), 0) != NULL &&
+            find_bytes(scope_content + 10U,
+                       (UINTN)(scope_end - scope_content - 10U),
+                       mouse_name, sizeof(mouse_name), 0) != NULL) {
             under_pci0 = 1;
             break;
         }
     }
-    while (offset < resource_length) {
-        const UINT8 *descriptor = resources + offset;
-        UINTN length;
-
-        if ((descriptor[0] & 0x80U) != 0) {
-            if (offset + 3U > resource_length) {
-                return 0;
-            }
-            length = get_u16(descriptor + 1U);
-            if (length > resource_length - offset - 3U) {
-                return 0;
-            }
-            if (descriptor[0] == 0x8aU && length == 43U &&
-                descriptor[3] == 1U && descriptor[4] == 0x0dU &&
-                descriptor[5] == 0x03U &&
-                get_u64(descriptor + 14U) == TEST_UART_IO_PORT &&
-                get_u64(descriptor + 22U) == TEST_UART_IO_PORT + 7U &&
-                get_u64(descriptor + 30U) == 0 &&
-                get_u64(descriptor + 38U) == 8U) {
-                io_address = 1;
-            }
-            if (descriptor[0] == 0x89U && length == 6U &&
-                descriptor[3] == 0x03U && descriptor[4] == 1U &&
-                get_u32(descriptor + 5U) == 4U) {
-                irq = 1;
-            }
-            offset += 3U + length;
-        } else {
-            length = descriptor[0] & 7U;
-            if (length > resource_length - offset - 1U) {
-                return 0;
-            }
-            offset += 1U + length;
-        }
-    }
-    return under_pci0 && io_address && irq;
+    return under_pci0;
 }
 
 static BOOLEAN test_dsdt_prt(const TEST_TABLE_CONTEXT *Context)
@@ -2233,7 +2226,8 @@ static BOOLEAN test_acpi_table_bounds(const TEST_TABLE_CONTEXT *Context)
         !valid_sdt(&Context->MemoryMap, Context->Fadt,
                    SIG32('F', 'A', 'C', 'P'), 3, 244U) ||
         !valid_sdt(&Context->MemoryMap, Context->Madt,
-                   SIG32('A', 'P', 'I', 'C'), 2, 72U) ||
+                   SIG32('A', 'P', 'I', 'C'), 1, 72U) ||
+        Context->Madt->Revision != 1U ||
         !valid_sdt(&Context->MemoryMap, Context->Srat,
                    SIG32('S', 'R', 'A', 'T'), 1, 104U) ||
         !valid_sdt(&Context->MemoryMap, Context->Slit,
@@ -2269,13 +2263,15 @@ static BOOLEAN test_acpi_fadt_links_gas(const TEST_TABLE_CONTEXT *Context)
            get_u64(fadt + 132U) == (UINT64)(UINTN)Context->Facs &&
            get_u64(fadt + 140U) == (UINT64)(UINTN)Context->Dsdt &&
            get_u16(fadt + 46U) == 9U &&
+           get_u16(fadt + 109U) == 1U &&
            gas_matches(fadt + 116U, 1, 8, TEST_PM_IO_BASE + 0x0cU) &&
            fadt[128U] == 1U &&
            gas_matches(fadt + 148U, 1, 32, TEST_PM_IO_BASE) &&
            gas_matches(fadt + 172U, 1, 16, TEST_PM_IO_BASE + 4U) &&
            gas_matches(fadt + 208U, 1, 32, TEST_PM_IO_BASE + 8U) &&
-           (flags & (1U << 0)) != 0 && (flags & (1U << 10)) != 0 &&
-           (flags & (1U << 13)) != 0 && (flags & (1U << 4)) == 0;
+           (flags & (1U << 0)) != 0 && (flags & (1U << 5)) != 0 &&
+           (flags & (1U << 10)) != 0 && (flags & (1U << 13)) != 0 &&
+           (flags & (1U << 4)) == 0;
 }
 
 static void test_acpi_cpu_names(UINTN Index, UINT8 Processor[4],
@@ -2718,8 +2714,8 @@ EFI_STATUS ia64_services_main(EFI_HANDLE ImageHandle,
                         EFI_DEVICE_ERROR, "hcdp-dbgp-uart");
         ia64_test_check(&context, "acpi-aml-crs",
                         tables_initialized && test_dsdt_crs(&tables) &&
-                            test_ssdt_uart_crs(&tables),
-                        EFI_DEVICE_ERROR, "pci-uart-resource-windows");
+                            test_ssdt_legacy_crs(&tables),
+                        EFI_DEVICE_ERROR, "pci-window-legacy-input-policy");
         ia64_test_check(&context, "acpi-pci-routing",
                         tables_initialized && test_dsdt_prt(&tables),
                         EFI_DEVICE_ERROR, "prt-intx-gsi-swizzle");
@@ -2746,11 +2742,11 @@ EFI_STATUS ia64_services_main(EFI_HANDLE ImageHandle,
                         "allocate-map-free");
         ia64_test_check(&context, "event-services",
                         test_event_services(SystemTable), EFI_DEVICE_ERROR,
-                        "event-contract");
+                        "event-behavior");
         ia64_test_check(
             &context, "protocol-services",
             test_protocol_services(ImageHandle, SystemTable, &loaded),
-            EFI_DEVICE_ERROR, "protocol-contract");
+            EFI_DEVICE_ERROR, "protocol-behavior");
         ia64_test_check(&context, "multiple-protocol-services",
                         test_multiple_protocol_services(SystemTable),
                         EFI_DEVICE_ERROR,
@@ -2758,11 +2754,11 @@ EFI_STATUS ia64_services_main(EFI_HANDLE ImageHandle,
         ia64_test_check(&context, "controller-services",
                         test_controller_services(SystemTable),
                         EFI_DEVICE_ERROR,
-                        "driver-precedence-disconnect-contract");
+                        "driver-precedence-disconnect");
         ia64_test_check(&context, "image-services",
                         test_image_services(ImageHandle, SystemTable),
                         EFI_DEVICE_ERROR,
-                        "load-file-fallback-parameter-contract");
+                        "load-file-fallback-parameter");
         {
             BOOLEAN start_connect_ok =
                 test_start_image_connect(ImageHandle, SystemTable);
@@ -2780,7 +2776,7 @@ EFI_STATUS ia64_services_main(EFI_HANDLE ImageHandle,
                         "time-wakeup");
         ia64_test_check(&context, "variable-services",
                         test_variable_services(SystemTable), EFI_DEVICE_ERROR,
-                        "variable-contract");
+                        "variable-services");
         ia64_test_check(&context, "block-disk-protocols",
                         test_block_disk_protocols(SystemTable, loaded),
                         EFI_DEVICE_ERROR, "block-disk-io");
@@ -2798,7 +2794,7 @@ EFI_STATUS ia64_services_main(EFI_HANDLE ImageHandle,
                         "tcg-status-hash");
         ia64_test_check(&context, "sal-state-info-no-log",
                         test_sal_state_info_no_log(SystemTable),
-                        EFI_DEVICE_ERROR, "size-empty-clear-contract");
+                        EFI_DEVICE_ERROR, "size-empty-clear");
     }
     ia64_test_done(&context);
     return context.Failed == 0 ? EFI_SUCCESS : EFI_DEVICE_ERROR;

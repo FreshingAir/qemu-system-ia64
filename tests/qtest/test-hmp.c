@@ -19,6 +19,21 @@
 
 static int verbose;
 
+static const char *ia64_nvram_option(const char *machine)
+{
+    if (!g_str_equal(qtest_get_arch(), "ia64")) {
+        return "";
+    }
+    if (g_str_equal(machine, "ia64-vpc") ||
+        g_str_equal(machine, "itanium-vpc") ||
+        g_str_equal(machine, "itanium2-vpc") ||
+        g_str_equal(machine, "hp-i2000") ||
+        g_str_equal(machine, "hp-zx6000")) {
+        return ",nvram=none";
+    }
+    return "";
+}
+
 static const char *hmp_cmds[] = {
     "announce_self",
     "boot_set ndc",
@@ -127,7 +142,8 @@ static void test_machine(gconstpointer data)
     char *args;
     QTestState *qts;
 
-    args = g_strdup_printf("-S -M %s", machine);
+    args = g_strdup_printf("-S -M %s%s",
+                           machine, ia64_nvram_option(machine));
     qts = qtest_init(args);
 
     test_info_commands(qts);

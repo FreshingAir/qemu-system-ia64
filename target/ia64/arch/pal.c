@@ -91,8 +91,6 @@
 #define IA64_L0_CACHE_LINE_SIZE    64ULL
 #define IA64_L1_CACHE_LINE_SIZE    128ULL
 #define IA64_L2_CACHE_LINE_SIZE    128ULL
-#define IA64_MONTECITO_L3_SIZE     (12ULL * MiB)
-#define IA64_MONTECITO_PACKAGE_CACHE_SIZE (24ULL * MiB)
 #define IA64_MONTECITO_FREQUENCY   1600000000ULL
 #define IA64_MONTECITO_BUS_FREQUENCY 533333333ULL
 
@@ -573,13 +571,13 @@ static bool pal_cache_info_for_model(CPUIA64State *env, uint64_t level,
         }
         info->unified = true;
         info->attribute = 1;
-        info->associativity = 12;
+        info->associativity = icc->pal_l3_associativity;
         info->line_shift = 7;
         info->stride_shift = 7;
         info->store_latency = 1;
-        info->load_latency = montecito ? 14 : 12;
-        info->tag_lsb = montecito ? 20 : 18;
-        info->size = montecito ? IA64_MONTECITO_L3_SIZE : 3 * MiB;
+        info->load_latency = icc->pal_l3_load_latency;
+        info->tag_lsb = icc->pal_l3_tag_lsb;
+        info->size = icc->pal_l3_cache_size;
         return true;
     default:
         g_assert_not_reached();
@@ -685,16 +683,12 @@ static void pal_copy_pal(CPUIA64State *env)
 
 static void pal_brand_info(CPUIA64State *env, uintptr_t ra)
 {
-    static const char montecito_brand[] =
-        "QEMU Montecito-compatible IA-64 CPU 1.60GHz 24MB";
-    static const char madison_brand[] =
-        "QEMU Madison-compatible IA-64 CPU";
     IA64CPUClass *icc = ia64_env_cpu_class(env);
     bool montecito = icc->is_montecito;
     uint64_t request = pal_stacked_arg(env, 0);
     uint64_t address = pal_stacked_arg(env, 1);
     uint64_t reserved = pal_stacked_arg(env, 2);
-    const char *brand = montecito ? montecito_brand : madison_brand;
+    const char *brand = icc->pal_brand;
     size_t length;
     size_t i;
 
@@ -733,8 +727,7 @@ static void pal_brand_info(CPUIA64State *env, uintptr_t ra)
         break;
     case 17:
         env->gr[IA64_PAL_GR_STATUS] = PAL_STATUS_SUCCESS;
-        env->gr[IA64_PAL_GR_RESULT1] =
-            montecito ? IA64_MONTECITO_PACKAGE_CACHE_SIZE : 3 * MiB;
+        env->gr[IA64_PAL_GR_RESULT1] = icc->pal_package_cache_size;
         break;
     case 18:
         env->gr[IA64_PAL_GR_STATUS] = montecito ? PAL_STATUS_SUCCESS :

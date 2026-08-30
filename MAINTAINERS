@@ -276,6 +276,15 @@ F: target/hppa/
 F: disas/hppa.c
 F: tests/tcg/hppa/
 
+IA-64 TCG CPUs
+S: Orphan
+F: target/ia64/
+F: configs/targets/ia64-softmmu.mak
+F: docs/devel/ia64-*.rst
+F: docs/devel/testing/ia64.rst
+F: tests/unit/ia64/
+F: tests/unit/test-ia64*
+
 LoongArch TCG CPUs
 M: Song Gao <gaosong@loongson.cn>
 S: Maintained
@@ -1349,6 +1358,32 @@ F: include/hw/pci-host/dino.h
 F: pc-bios/hppa-firmware.img
 F: roms/seabios-hppa/
 F: tests/functional/hppa/
+F: tests/qtest/hppa-astro-test.c
+
+IA-64 Machines
+--------------
+HP i2000, HP zx6000 and IA-64 virtual PC
+S: Orphan
+F: configs/devices/ia64-softmmu/
+F: docs/system/target-ia64.rst
+F: hw/ia64/
+F: hw/ide/intel_82468gx.c
+F: hw/isa/intel_82468gx.c
+F: hw/isa/lpc47b27*
+F: hw/pci-host/hp-*
+F: include/hw/ia64/
+F: include/hw/isa/lpc47b27*
+F: include/hw/pci-host/hp-*
+F: include/hw/southbridge/intel_82468gx.h
+F: roms/ia64-firmware/
+F: tests/functional/ia64/
+F: tests/qtest/*ia64*.c
+F: tests/qtest/hp-i2000-test.c
+F: tests/qtest/hp-zx6000-test.c
+F: tests/unit/test-hp-*.c
+F: tests/unit/test-intel-460gx-*.c
+F: tests/unit/test-isa-i8259-multi-instance.c
+F: tests/unit/test-lpc47b27-config.c
 
 LoongArch Machines
 ------------------
@@ -2296,6 +2331,8 @@ F: tests/qtest/virtio-scsi-test.c
 F: tests/qtest/fuzz-virtio-scsi-test.c
 F: tests/qtest/am53c974-test.c
 F: tests/qtest/fuzz-lsi53c895a-test.c
+F: tests/qtest/lsi53c1030-test.c
+F: tests/unit/test-isp12160-*.c
 T: git https://github.com/bonzini/qemu.git scsi-next
 
 SSI
@@ -2790,6 +2827,15 @@ F: hw/display/bochs-display.c
 F: include/hw/display/vga.h
 F: include/hw/display/bochs-vbe.h
 F: docs/specs/standard-vga.rst
+
+ATI VGA
+S: Orphan
+F: hw/display/ati*
+
+NVIDIA Quadro2 VGA
+S: Orphan
+F: hw/display/nvidia_quadro2.c
+F: include/hw/display/nvidia_quadro2.h
 
 ramfb
 M: Gerd Hoffmann <kraxel@redhat.com>

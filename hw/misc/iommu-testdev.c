@@ -18,7 +18,6 @@
 #include "qom/object.h"
 #include "hw/misc/iommu-testdev.h"
 
-#define TYPE_IOMMU_TESTDEV "iommu-testdev"
 OBJECT_DECLARE_SIMPLE_TYPE(IOMMUTestDevState, IOMMU_TESTDEV)
 
 struct IOMMUTestDevState {
@@ -28,6 +27,7 @@ struct IOMMUTestDevState {
     uint64_t dma_paddr;
     uint32_t dma_len;
     uint32_t dma_result;
+    MemTxResult dma_memtx_result;
     bool dma_armed; /* armed until a trigger consumes the request */
 
     AddressSpace *dma_as;   /* IOMMU-mediated DMA AS for this device */
@@ -106,6 +106,7 @@ static void iommu_testdev_maybe_run_dma(IOMMUTestDevState *s)
     }
     write_res = dma_memory_write(as, s->dma_vaddr, write_buf,
                                  s->dma_len, attrs);
+    s->dma_memtx_result = write_res;
 
     if (write_res != MEMTX_OK) {
         s->dma_result = ITD_DMA_ERR_TX_FAIL;
@@ -186,6 +187,9 @@ static uint64_t iommu_testdev_mmio_read(void *opaque, hwaddr addr,
     case ITD_REG_DMA_ATTRS:
         value = s->dma_attrs_cfg;
         break;
+    case ITD_REG_DMA_MEMTX_RESULT:
+        value = s->dma_memtx_result;
+        break;
     default:
         value = 0;
         break;
@@ -229,6 +233,7 @@ static void iommu_testdev_mmio_write(void *opaque, hwaddr addr, uint64_t val,
             /* Arm the DMA operation; repeated arm is idempotent. */
             s->dma_armed = true;
             s->dma_result = ITD_DMA_RESULT_BUSY;
+            s->dma_memtx_result = ITD_DMA_MEMTX_NOT_RUN;
             trace_iommu_testdev_dma_armed(true);
         } else {
             /* Disarm the DMA operation */
@@ -263,6 +268,7 @@ static void iommu_testdev_realize(PCIDevice *pdev, Error **errp)
     s->dma_paddr = 0;
     s->dma_len = 0;
     s->dma_result = ITD_DMA_RESULT_IDLE;
+    s->dma_memtx_result = ITD_DMA_MEMTX_NOT_RUN;
     s->dma_armed = false;
     s->dma_attrs_cfg = ITD_ATTRS_SET_SPACE(0, ITD_ATTRS_SPACE_NONSECURE);
     s->dma_as = pci_device_iommu_address_space(pdev);
@@ -280,6 +286,7 @@ static void iommu_testdev_reset(DeviceState *dev)
     s->dma_paddr = 0;
     s->dma_len = 0;
     s->dma_result = ITD_DMA_RESULT_IDLE;
+    s->dma_memtx_result = ITD_DMA_MEMTX_NOT_RUN;
     s->dma_armed = false;
     s->dma_attrs_cfg = ITD_ATTRS_SET_SPACE(0, ITD_ATTRS_SPACE_NONSECURE);
 }

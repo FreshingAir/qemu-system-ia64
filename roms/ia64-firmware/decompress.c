@@ -3,10 +3,7 @@
  *
  * EFI 1.10 decompression protocol.
  *
- * This decoder is an original implementation of the format described in
- * sections 17.2 through 17.5 of the EFI 1.10 specification.  It deliberately
- * uses canonical-code ranges and a bounded bit cursor rather than a lookup
- * table implementation derived from other firmware.
+ * The decoder uses canonical-code ranges and a bounded bit cursor.
  */
 
 #include "fw-decompress.h"

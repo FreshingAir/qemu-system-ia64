@@ -88,6 +88,15 @@ void ia64_gen_atomic_xchg_i64(DisasContext *ctx, TCGv_i64 result,
     tcg_gen_atomic_xchg_i64(result, addr, value, mmu_idx, memop);
 }
 
+void ia64_gen_atomic_cmpxchg_i64(DisasContext *ctx, TCGv_i64 result,
+                                 TCGv_i64 addr, TCGv_i64 cmp,
+                                 TCGv_i64 value, int mmu_idx, MemOp memop)
+{
+    ia64_gen_merced_dtlb1_touch(ctx, addr, mmu_idx, memop);
+    gen_helper_cmpxchg(result, tcg_env, addr, cmp, value,
+                       tcg_constant_i32(ia64_memop_size(memop)));
+}
+
 void ia64_gen_atomic_fetch_add_i64(DisasContext *ctx, TCGv_i64 result,
                                    TCGv_i64 addr, TCGv_i64 value, int mmu_idx,
                                    MemOp memop)

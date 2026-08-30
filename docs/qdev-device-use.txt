@@ -396,7 +396,7 @@ some DEVNAMEs:
     serial              isa-serial
     VGA                 VGA, cirrus-vga, isa-vga, isa-cirrus-vga,
                         vmware-svga, qxl-vga, virtio-vga, ati-vga,
-                        vhost-user-vga
+                        nvidia-quadro2, vhost-user-vga
 
 The default NIC is connected to a default part created along with it.
 It is *not* suppressed by configuring a NIC with -device (you may call

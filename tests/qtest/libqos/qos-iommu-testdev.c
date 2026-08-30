@@ -45,6 +45,11 @@ uint32_t qos_iommu_testdev_trigger_dma(QPCIDevice *dev, QPCIBar bar,
     return result;
 }
 
+uint32_t qos_iommu_testdev_get_memtx_result(QPCIDevice *dev, QPCIBar bar)
+{
+    return qpci_io_readl(dev, bar, ITD_REG_DMA_MEMTX_RESULT);
+}
+
 void qos_iommu_testdev_single_translation(const QOSIOMMUTestdevDmaCfg *dma,
                                           void *opaque,
                                           QOSIOMMUTestdevSetupFn setup_fn,

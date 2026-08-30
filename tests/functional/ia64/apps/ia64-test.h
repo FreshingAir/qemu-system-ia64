@@ -47,6 +47,7 @@ typedef UINTN EFI_TPL;
 #define EFI_RUNTIME_SERVICES_SIGNATURE 0x56524553544e5552ULL
 #define EFI_PAGE_SIZE                 4096U
 #define EFI_MEMORY_UC                 0x0000000000000001ULL
+#define EFI_MEMORY_WB                 0x0000000000000008ULL
 #define EFI_MEMORY_RUNTIME            0x8000000000000000ULL
 #define EFI_OPTIONAL_PTR              0x0000000000000001ULL
 
@@ -86,6 +87,10 @@ typedef UINTN EFI_TPL;
 #define EFI_OPEN_PROTOCOL_BY_CHILD_CONTROLLER 0x00000008U
 #define EFI_OPEN_PROTOCOL_BY_DRIVER   0x00000010U
 #define EFI_LOCATE_BY_PROTOCOL         2U
+#define EFI_PCI_IO_PASS_THROUGH_BAR   0xffU
+#define EFI_PCI_ATTRIBUTE_IO          0x0100ULL
+#define EFI_PCI_ATTRIBUTE_MEMORY      0x0200ULL
+#define EFI_PCI_ATTRIBUTE_BUS_MASTER  0x0400ULL
 #define EFI_FILE_MODE_READ             0x0000000000000001ULL
 #define EFI_FILE_MODE_WRITE            0x0000000000000002ULL
 #define EFI_FILE_READ_ONLY             0x0000000000000001ULL
@@ -153,12 +158,24 @@ typedef UINTN EFI_TPL;
 #define IA64_GUID_TEXT_INPUT_EX \
     { 0x34, 0x75, 0x9e, 0xdd, 0x62, 0x77, 0x98, 0x46, \
       0x8c, 0x14, 0xf5, 0x85, 0x17, 0xa6, 0x25, 0xaa }
+#define IA64_GUID_TEXT_OUTPUT \
+    { 0xc2, 0x77, 0x74, 0x38, 0xc7, 0x69, 0xd2, 0x11, \
+      0x8e, 0x39, 0x00, 0xa0, 0xc9, 0x69, 0x72, 0x3b }
 #define IA64_GUID_GOP \
     { 0xde, 0xa9, 0x42, 0x90, 0xdc, 0x23, 0x38, 0x4a, \
       0x96, 0xfb, 0x7a, 0xde, 0xd0, 0x80, 0x51, 0x6a }
+#define IA64_GUID_UGA_DRAW \
+    { 0x8b, 0x29, 0x2c, 0x98, 0xfa, 0xf4, 0xcb, 0x41, \
+      0xb8, 0x38, 0x77, 0xaa, 0x68, 0x8f, 0xb8, 0x39 }
+#define IA64_GUID_UGA_IO \
+    { 0x9e, 0xd4, 0xa4, 0x61, 0x68, 0x6f, 0x1b, 0x4f, \
+      0xb9, 0x22, 0xa8, 0x6e, 0xed, 0x0b, 0x07, 0xa2 }
 #define IA64_GUID_PCI_ROOT_IO \
     { 0xbb, 0x7e, 0x70, 0x2f, 0x1a, 0x4a, 0xd4, 0x11, \
       0x9a, 0x38, 0x00, 0x90, 0x27, 0x3f, 0xc1, 0x4d }
+#define IA64_GUID_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION \
+    { 0xbe, 0x34, 0x80, 0xcf, 0x68, 0x67, 0x8b, 0x4d, \
+      0xb7, 0x39, 0x7c, 0xce, 0x68, 0x3a, 0x9f, 0xbe }
 #define IA64_GUID_PCI_IO \
     { 0x00, 0xb2, 0xf5, 0x4c, 0xb8, 0x68, 0xa5, 0x4c, \
       0x9e, 0xec, 0xb2, 0x3e, 0x3f, 0x50, 0x02, 0x9a }
@@ -268,6 +285,7 @@ struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL {
 typedef struct _EFI_BOOT_SERVICES EFI_BOOT_SERVICES;
 typedef struct _EFI_RUNTIME_SERVICES EFI_RUNTIME_SERVICES;
 typedef struct _EFI_SYSTEM_TABLE EFI_SYSTEM_TABLE;
+typedef EFI_STATUS (*EFI_PROTOCOLS_PER_HANDLE)(EFI_HANDLE, VOID ***, UINTN *);
 typedef struct _EFI_FILE_PROTOCOL EFI_FILE_PROTOCOL;
 typedef struct _EFI_SIMPLE_FILE_SYSTEM_PROTOCOL
     EFI_SIMPLE_FILE_SYSTEM_PROTOCOL;
@@ -345,7 +363,7 @@ struct _EFI_BOOT_SERVICES {
                                EFI_HANDLE, UINT32);
     EFI_STATUS (*CloseProtocol)(EFI_HANDLE, VOID *, EFI_HANDLE, EFI_HANDLE);
     VOID *OpenProtocolInformation;
-    VOID *ProtocolsPerHandle;
+    EFI_PROTOCOLS_PER_HANDLE ProtocolsPerHandle;
     EFI_STATUS (*LocateHandleBuffer)(UINTN, VOID *, VOID *, UINTN *,
                                      EFI_HANDLE **);
     EFI_STATUS (*LocateProtocol)(VOID *, VOID *, VOID **);
@@ -491,13 +509,49 @@ typedef struct {
     UINT32 PixelInformation[4];
     UINT32 PixelsPerScanLine;
 } EFI_GRAPHICS_OUTPUT_MODE_INFORMATION;
+typedef struct {
+    UINT32 MaxMode;
+    UINT32 Mode;
+    EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *Info;
+    UINTN SizeOfInfo;
+    EFI_PHYSICAL_ADDRESS FrameBufferBase;
+    UINTN FrameBufferSize;
+} EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE;
+typedef struct {
+    UINT8 Blue;
+    UINT8 Green;
+    UINT8 Red;
+    UINT8 Reserved;
+} EFI_GRAPHICS_OUTPUT_BLT_PIXEL;
+typedef enum {
+    EfiBltVideoFill,
+    EfiBltVideoToBltBuffer,
+    EfiBltBufferToVideo,
+    EfiBltVideoToVideo,
+    EfiGraphicsOutputBltOperationMax,
+} EFI_GRAPHICS_OUTPUT_BLT_OPERATION;
 typedef struct _EFI_GRAPHICS_OUTPUT_PROTOCOL EFI_GRAPHICS_OUTPUT_PROTOCOL;
 struct _EFI_GRAPHICS_OUTPUT_PROTOCOL {
     EFI_STATUS (*QueryMode)(EFI_GRAPHICS_OUTPUT_PROTOCOL *, UINT32, UINTN *,
                             EFI_GRAPHICS_OUTPUT_MODE_INFORMATION **);
     EFI_STATUS (*SetMode)(EFI_GRAPHICS_OUTPUT_PROTOCOL *, UINT32);
-    VOID *Blt;
-    VOID *Mode;
+    EFI_STATUS (*Blt)(EFI_GRAPHICS_OUTPUT_PROTOCOL *,
+                      EFI_GRAPHICS_OUTPUT_BLT_PIXEL *,
+                      EFI_GRAPHICS_OUTPUT_BLT_OPERATION, UINTN, UINTN,
+                      UINTN, UINTN, UINTN, UINTN, UINTN);
+    EFI_GRAPHICS_OUTPUT_PROTOCOL_MODE *Mode;
+};
+
+typedef struct _EFI_UGA_DRAW_PROTOCOL EFI_UGA_DRAW_PROTOCOL;
+struct _EFI_UGA_DRAW_PROTOCOL {
+    EFI_STATUS (*GetMode)(EFI_UGA_DRAW_PROTOCOL *, UINT32 *, UINT32 *,
+                          UINT32 *, UINT32 *);
+    EFI_STATUS (*SetMode)(EFI_UGA_DRAW_PROTOCOL *, UINT32, UINT32,
+                          UINT32, UINT32);
+    EFI_STATUS (*Blt)(EFI_UGA_DRAW_PROTOCOL *,
+                      EFI_GRAPHICS_OUTPUT_BLT_PIXEL *,
+                      EFI_GRAPHICS_OUTPUT_BLT_OPERATION, UINTN, UINTN,
+                      UINTN, UINTN, UINTN, UINTN, UINTN);
 };
 
 typedef struct _EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL
@@ -519,6 +573,21 @@ typedef enum {
     EfiPciWidthMaximum,
 } EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH;
 
+typedef enum {
+    EfiPciOperationBusMasterRead,
+    EfiPciOperationBusMasterWrite,
+    EfiPciOperationBusMasterCommonBuffer,
+    EfiPciOperationBusMasterRead64,
+    EfiPciOperationBusMasterWrite64,
+    EfiPciOperationBusMasterCommonBuffer64,
+    EfiPciOperationMaximum,
+} EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_OPERATION;
+
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_POLL_IO_MEM(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self,
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH width, UINT64 address,
+    UINT64 mask, UINT64 value, UINT64 delay, UINT64 *result);
+
 typedef EFI_STATUS (*EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_IO_MEM)(
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *,
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH, UINT64, UINTN, VOID *);
@@ -528,23 +597,115 @@ typedef struct {
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_IO_MEM Write;
 } EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ACCESS;
 
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_COPY_MEM(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self,
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH width, UINT64 dest_address,
+    UINT64 src_address, UINTN count);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_MAP(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self,
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_OPERATION operation, VOID *host_address,
+    UINTN *number_of_bytes, EFI_PHYSICAL_ADDRESS *device_address,
+    VOID **mapping);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_UNMAP(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self, VOID *mapping);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ALLOCATE_BUFFER(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self, UINT32 type, UINT32 memory_type,
+    UINTN pages, VOID **host_address, UINT64 attributes);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_FREE_BUFFER(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self, UINTN pages, VOID *host_address);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_FLUSH(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_GET_ATTRIBUTES(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self, UINT64 *supports,
+    UINT64 *attributes);
+typedef EFI_STATUS EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_SET_ATTRIBUTES(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *self, UINT64 attributes,
+    UINT64 *resource_base, UINT64 *resource_length);
+
 struct _EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL {
     EFI_HANDLE ParentHandle;
-    VOID *PollMem;
-    VOID *PollIo;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_POLL_IO_MEM *PollMem;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_POLL_IO_MEM *PollIo;
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ACCESS Mem;
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ACCESS Io;
     EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ACCESS Pci;
-    VOID *CopyMem;
-    VOID *Map;
-    VOID *Unmap;
-    VOID *AllocateBuffer;
-    VOID *FreeBuffer;
-    VOID *Flush;
-    VOID *GetAttributes;
-    VOID *SetAttributes;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_COPY_MEM *CopyMem;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_MAP *Map;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_UNMAP *Unmap;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_ALLOCATE_BUFFER *AllocateBuffer;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_FREE_BUFFER *FreeBuffer;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_FLUSH *Flush;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_GET_ATTRIBUTES *GetAttributes;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_SET_ATTRIBUTES *SetAttributes;
     EFI_STATUS (*Configuration)(EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *, VOID **);
     UINT32 SegmentNumber;
+};
+
+typedef struct _EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL;
+
+typedef enum {
+    EfiPciHostBridgeBeginEnumeration,
+    EfiPciHostBridgeBeginBusAllocation,
+    EfiPciHostBridgeEndBusAllocation,
+    EfiPciHostBridgeBeginResourceAllocation,
+    EfiPciHostBridgeAllocateResources,
+    EfiPciHostBridgeSetResources,
+    EfiPciHostBridgeFreeResources,
+    EfiPciHostBridgeEndResourceAllocation,
+    EfiPciHostBridgeEndEnumeration,
+    EfiMaxPciHostBridgeEnumerationPhase,
+} EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PHASE;
+
+typedef enum {
+    EfiPciBeforeChildBusEnumeration,
+    EfiPciBeforeResourceCollection,
+} EFI_PCI_CONTROLLER_RESOURCE_ALLOCATION_PHASE;
+
+typedef struct {
+    UINT8 Register;
+    UINT8 Function;
+    UINT8 Device;
+    UINT8 Bus;
+    UINT32 ExtendedRegister;
+} EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI_ADDRESS;
+
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_NOTIFY_PHASE(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PHASE phase);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_GET_NEXT_ROOT_BRIDGE(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE *root_bridge_handle);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_GET_ATTRIBUTES(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle, UINT64 *attributes);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_START_BUS_ENUMERATION(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle, VOID **configuration);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_SET_BUS_NUMBERS(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle, VOID *configuration);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_SUBMIT_RESOURCES(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle, VOID *configuration);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_GET_PROPOSED_RESOURCES(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle, VOID **configuration);
+typedef EFI_STATUS EFI_PCI_HOST_BRIDGE_PREPROCESS_CONTROLLER(
+    EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL *self,
+    EFI_HANDLE root_bridge_handle,
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_PCI_ADDRESS pci_address,
+    EFI_PCI_CONTROLLER_RESOURCE_ALLOCATION_PHASE phase);
+
+struct _EFI_PCI_HOST_BRIDGE_RESOURCE_ALLOCATION_PROTOCOL {
+    EFI_PCI_HOST_BRIDGE_NOTIFY_PHASE *NotifyPhase;
+    EFI_PCI_HOST_BRIDGE_GET_NEXT_ROOT_BRIDGE *GetNextRootBridge;
+    EFI_PCI_HOST_BRIDGE_GET_ATTRIBUTES *GetAllocAttributes;
+    EFI_PCI_HOST_BRIDGE_START_BUS_ENUMERATION *StartBusEnumeration;
+    EFI_PCI_HOST_BRIDGE_SET_BUS_NUMBERS *SetBusNumbers;
+    EFI_PCI_HOST_BRIDGE_SUBMIT_RESOURCES *SubmitResources;
+    EFI_PCI_HOST_BRIDGE_GET_PROPOSED_RESOURCES *GetProposedResources;
+    EFI_PCI_HOST_BRIDGE_PREPROCESS_CONTROLLER *PreprocessController;
 };
 
 typedef struct _EFI_PCI_IO_PROTOCOL EFI_PCI_IO_PROTOCOL;
@@ -558,22 +719,57 @@ typedef struct {
     EFI_PCI_IO_PROTOCOL_CONFIG Write;
 } EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS;
 
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_IO_MEM)(
+    EFI_PCI_IO_PROTOCOL *, EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH,
+    UINT8, UINT64, UINTN, VOID *);
+
+typedef struct {
+    EFI_PCI_IO_PROTOCOL_IO_MEM Read;
+    EFI_PCI_IO_PROTOCOL_IO_MEM Write;
+} EFI_PCI_IO_PROTOCOL_IO_MEM_ACCESS;
+
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_MAP)(
+    EFI_PCI_IO_PROTOCOL *, EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_OPERATION,
+    VOID *, UINTN *, EFI_PHYSICAL_ADDRESS *, VOID **);
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_UNMAP)(
+    EFI_PCI_IO_PROTOCOL *, VOID *);
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_ALLOCATE_BUFFER)(
+    EFI_PCI_IO_PROTOCOL *, UINT32, UINT32, UINTN, VOID **, UINT64);
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_FREE_BUFFER)(
+    EFI_PCI_IO_PROTOCOL *, UINTN, VOID *);
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_FLUSH)(EFI_PCI_IO_PROTOCOL *);
+
+typedef enum {
+    EfiPciIoAttributeOperationGet,
+    EfiPciIoAttributeOperationSet,
+    EfiPciIoAttributeOperationEnable,
+    EfiPciIoAttributeOperationDisable,
+    EfiPciIoAttributeOperationSupported,
+    EfiPciIoAttributeOperationMaximum,
+} EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION;
+
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_ATTRIBUTES)(
+    EFI_PCI_IO_PROTOCOL *, EFI_PCI_IO_PROTOCOL_ATTRIBUTE_OPERATION,
+    UINT64, UINT64 *);
+typedef EFI_STATUS (*EFI_PCI_IO_PROTOCOL_GET_BAR_ATTRIBUTES)(
+    EFI_PCI_IO_PROTOCOL *, UINT8, UINT64 *, VOID **);
+
 struct _EFI_PCI_IO_PROTOCOL {
     VOID *PollMem;
     VOID *PollIo;
-    VOID *Mem[2];
-    VOID *Io[2];
+    EFI_PCI_IO_PROTOCOL_IO_MEM_ACCESS Mem;
+    EFI_PCI_IO_PROTOCOL_IO_MEM_ACCESS Io;
     EFI_PCI_IO_PROTOCOL_CONFIG_ACCESS Pci;
     VOID *CopyMem;
-    VOID *Map;
-    VOID *Unmap;
-    VOID *AllocateBuffer;
-    VOID *FreeBuffer;
-    VOID *Flush;
+    EFI_PCI_IO_PROTOCOL_MAP Map;
+    EFI_PCI_IO_PROTOCOL_UNMAP Unmap;
+    EFI_PCI_IO_PROTOCOL_ALLOCATE_BUFFER AllocateBuffer;
+    EFI_PCI_IO_PROTOCOL_FREE_BUFFER FreeBuffer;
+    EFI_PCI_IO_PROTOCOL_FLUSH Flush;
     EFI_STATUS (*GetLocation)(EFI_PCI_IO_PROTOCOL *, UINTN *, UINTN *,
                               UINTN *, UINTN *);
-    VOID *Attributes;
-    VOID *GetBarAttributes;
+    EFI_PCI_IO_PROTOCOL_ATTRIBUTES Attributes;
+    EFI_PCI_IO_PROTOCOL_GET_BAR_ATTRIBUTES GetBarAttributes;
     VOID *SetBarAttributes;
     UINT64 RomSize;
     VOID *RomImage;

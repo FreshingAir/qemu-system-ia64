@@ -32,6 +32,22 @@ pci_ss.add(when: 'CONFIG_MV64361', if_true: files('mv64361.c'))
 pci_ss.add(when: 'CONFIG_PCI_EXPRESS_FSL_IMX8M_PHY', if_true: files('fsl_imx8m_phy.c'))
 pci_ss.add(when: 'CONFIG_VERSATILE_PCI', if_true: files('versatile.c'))
 
+# HP system bus adapters
+system_ss.add(when: 'CONFIG_HP_LBA_CONFIG',
+              if_true: files('hp-lba-config.c'))
+system_ss.add(when: 'CONFIG_HP_IO_SAPIC',
+              if_true: files('hp-io-sapic.c'))
+system_ss.add(when: 'CONFIG_HP_SBA_IOMMU',
+              if_true: files('hp-sba-iommu.c'))
+system_ss.add(when: 'CONFIG_HP_SBA_ROUTING',
+              if_true: files('hp-sba-routing.c'))
+system_ss.add(when: 'CONFIG_HP_ZX1_IOMMU',
+              if_true: files('hp-zx1-iommu.c'))
+system_ss.add(when: 'CONFIG_HP_ZX1_MIO',
+              if_true: files('hp-zx1-mio-regs.c', 'hp-zx1-mio.c'))
+system_ss.add(when: 'CONFIG_HP_ZX1_IOA',
+              if_true: files('hp-zx1-ioa-regs.c', 'hp-zx1-ioa.c'))
+
 # HPPA devices
 specific_ss.add(when: 'CONFIG_ASTRO', if_true: files('astro.c'))
 pci_ss.add(when: 'CONFIG_DINO', if_true: files('dino.c'))

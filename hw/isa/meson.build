@@ -3,6 +3,11 @@ system_ss.add(when: 'CONFIG_FDC37M81X', if_true: files('fdc37m81x-superio.c'))
 system_ss.add(when: 'CONFIG_I82378', if_true: files('i82378.c'))
 system_ss.add(when: 'CONFIG_ISA_BUS', if_true: files('isa-bus.c'))
 system_ss.add(when: 'CONFIG_ISA_SUPERIO', if_true: files('isa-superio.c'))
+system_ss.add(when: 'CONFIG_LPC47B27_CONFIG',
+              if_true: files('lpc47b27_config.c'))
+system_ss.add(when: 'CONFIG_LPC47B27_ISA', if_true: files('lpc47b27.c'))
+system_ss.add(when: 'CONFIG_INTEL_82468GX_IFB',
+              if_true: files('intel_82468gx.c'))
 system_ss.add(when: 'CONFIG_PC87312', if_true: files('pc87312.c'))
 system_ss.add(when: 'CONFIG_PIIX', if_true: files('piix.c'))
 system_ss.add(when: 'CONFIG_SMC37C669', if_true: files('smc37c669-superio.c'))

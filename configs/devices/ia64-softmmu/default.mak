@@ -1,3 +1,5 @@
 # Default configuration for ia64-softmmu
 
 CONFIG_IA64_VPC=y
+CONFIG_HP_I2000=y
+CONFIG_HP_ZX6000=y

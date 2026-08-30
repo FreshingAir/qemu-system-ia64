@@ -1,4 +1,4 @@
-"""Paths and explicit developer build support for IA-64 EFI test apps."""
+"""Build paths for IA-64 EFI test applications."""
 
 # SPDX-License-Identifier: GPL-2.0-or-later
 
@@ -9,7 +9,9 @@ import subprocess
 
 
 APP_NAMES = ("smoke", "services", "tables", "exitbs", "storage", "input",
-             "smp", "smp-merced", "start-image-child")
+             "graphics", "smp", "smp-merced", "pci-bridge",
+             "i2000-pci-root", "i2000-runtime", "i2000-loader",
+             "start-image-child")
 SOURCE_DIR = Path(__file__).resolve().parent
 APPS_SOURCE_DIR = SOURCE_DIR / "apps"
 
@@ -61,9 +63,11 @@ def build_app(name: str, output: str | Path) -> Path:
         raise RuntimeError("IA-64 cross compiler is not available")
     output = Path(output).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+    linker_script = ("i2000-loader-app.lds" if name == "i2000-loader"
+                     else "ia64-test-app.lds")
     subprocess.run([
         str(APPS_SOURCE_DIR / "build-test-app.sh"), str(output),
         str(APPS_SOURCE_DIR / f"{name}-app.c"),
-        str(APPS_SOURCE_DIR / "ia64-test-app.lds"),
+        str(APPS_SOURCE_DIR / linker_script),
     ], check=True)
     return output

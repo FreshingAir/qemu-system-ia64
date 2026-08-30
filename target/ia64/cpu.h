@@ -9,7 +9,7 @@
 #include "qemu/timer.h"
 
 #ifdef CONFIG_USER_ONLY
-#error "IA-64 target currently supports system mode only"
+#error "IA-64 target supports system mode only"
 #endif
 
 #define CPU_RESOLVING_TYPE TYPE_IA64_CPU
@@ -1439,7 +1439,15 @@ typedef struct IA64BootInfo {
     uint64_t stack_pointer;
     uint64_t rsc;
     uint64_t low_ram_size;
+    /* Optional QEMU-owned firmware entry arguments in r8-r10. */
+    uint64_t firmware_arg0;
+    uint64_t firmware_arg1;
+    uint64_t firmware_arg2;
+    uint64_t io_port_base;
+    uint64_t interrupt_block_base;
     bool powered_off;
+    bool firmware_args_valid;
+    bool platform_addresses_valid;
 } IA64BootInfo;
 
 struct ArchCPU {
@@ -1475,6 +1483,7 @@ struct IA64CPUClass {
     CPUClass parent_class;
 
     DeviceRealize parent_realize;
+    DeviceUnrealize parent_unrealize;
     ResettablePhases parent_phases;
 
     /* Guest-visible processor-model data. */
@@ -1482,8 +1491,11 @@ struct IA64CPUClass {
     uint64_t cpuid_version;
     uint64_t cpuid_features;
     uint64_t pal_version;
+    const char *pal_brand;
     uint32_t frequency_base_hz;
     uint32_t itc_frequency_hz;
+    uint32_t pal_l3_cache_size;
+    uint32_t pal_package_cache_size;
     uint64_t processor_frequency_ratio;
     uint64_t bus_frequency_ratio;
     uint64_t itc_frequency_ratio;
@@ -1504,6 +1516,9 @@ struct IA64CPUClass {
     uint8_t tc_levels;
     uint8_t perf_counter_width;
     uint8_t memory_attribute_mask;
+    uint8_t pal_l3_associativity;
+    uint8_t pal_l3_load_latency;
+    uint8_t pal_l3_tag_lsb;
     uint16_t fc_line_size;
     uint64_t implemented_pmc_mask;
     uint64_t implemented_pmd_mask;

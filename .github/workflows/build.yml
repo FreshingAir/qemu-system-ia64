@@ -273,6 +273,7 @@ jobs:
 
   linux-aarch64:
     name: Linux AArch64 (GCC, native)
+    needs: firmware
     runs-on: ubuntu-24.04-arm
 
     steps:
@@ -285,6 +286,27 @@ jobs:
 
       - name: Check out the source tree
         uses: actions/checkout@v6
+
+      - name: Download the firmware artifact
+        uses: actions/download-artifact@v8
+        with:
+          name: qemu-system-ia64-firmware.tar.gz
+          path: firmware-artifact
+
+      - name: Extract and validate the firmware artifact
+        run: |
+          set -euo pipefail
+
+          archive="firmware-artifact/qemu-system-ia64-firmware.tar.gz"
+          firmware_dir="firmware-artifact/extracted"
+
+          test -s "$archive"
+          mkdir -p "$firmware_dir"
+          tar -xzf "$archive" -C "$firmware_dir" --strip-components=1
+
+          for output in bin elf map sections; do
+            test -s "$firmware_dir/ia64-firmware.$output"
+          done
 
       - name: Install build dependencies
         run: |
@@ -334,6 +356,17 @@ jobs:
               --disable-docs \
               --disable-werror
           )
+
+          firmware_source="firmware-artifact/extracted"
+          firmware_stage="build-linux-aarch64/roms/ia64-firmware"
+          mkdir -p "$firmware_stage"
+
+          for output in bin elf map sections; do
+            install -m 0644 \
+              "$firmware_source/ia64-firmware.$output" \
+              "$firmware_stage/"
+            test -s "$firmware_stage/ia64-firmware.$output"
+          done
 
           ninja -C build-linux-aarch64 -j"$(nproc)" \
             qemu-img \

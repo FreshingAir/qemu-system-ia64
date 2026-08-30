@@ -1086,9 +1086,12 @@ extern const VMStateInfo vmstate_info_qlist;
 
 #endif
 
-#define VMSTATE_UINT8_EQUAL(_f, _s)                                   \
-    VMSTATE_SINGLE_FULL(_f, _s, 0, 0,                                 \
+#define VMSTATE_UINT8_EQUAL_V(_f, _s, _v)                             \
+    VMSTATE_SINGLE_FULL(_f, _s, 0, _v,                                \
                         vmstate_info_uint8_equal, uint8_t)
+
+#define VMSTATE_UINT8_EQUAL(_f, _s)                                   \
+    VMSTATE_UINT8_EQUAL_V(_f, _s, 0)
 
 #define VMSTATE_UINT16_EQUAL(_f, _s)                                  \
     VMSTATE_SINGLE_FULL(_f, _s, 0, 0,                                 \

@@ -1,6 +1,7 @@
 entry.S
 ../../ui/vgafont.c
 firmware.c
+fw-acpi-aml.c
 decompress.c
 debug_protocols.c
 pointer_protocol.c

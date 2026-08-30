@@ -36,8 +36,8 @@
 #define TEST_TRANSLATION_GLOBAL_HIGH_COMMAND 2U
 #define TEST_GLOBAL_PURGE_ROUND (TEST_RENDEZVOUS_ROUNDS + 1U)
 #define TEST_GLOBAL_HIGH_PURGE_ROUND (TEST_RENDEZVOUS_ROUNDS + 2U)
-#define TEST_TRANSLATION_RID_A 0x00ffffeULL
-#define TEST_TRANSLATION_RID_B 0x00ffffdULL
+#define TEST_TRANSLATION_RID_A 0x0003fffeULL
+#define TEST_TRANSLATION_RID_B 0x0003fffdULL
 #define TEST_RID_SWITCH_ROUNDS 4096U
 #define TEST_TLB_CHURN_BASE 0xe000020001000000ULL
 #define TEST_TLB_CHURN_ENTRIES 192U
@@ -60,6 +60,8 @@
 #define TEST_SEQUENTIAL_ASSIST_OFFSET 4U
 #define TEST_TRANSLATION_PTE_FLAGS_UC  0x671ULL
 #define TEST_TRANSLATION_PTE_FLAGS_UCE 0x675ULL
+#define TEST_CPUID_FEATURES_REGISTER 4ULL
+#define TEST_CPUID4_AO (1ULL << 2)
 
 typedef struct {
     UINT64 Status;
@@ -901,8 +903,9 @@ static VOID high_translated_lock_increment_one(VOID)
     UINT64 value;
 
     /*
-     * Match the dump's physical address, 16 MiB mapping, 8-byte interlock,
-     * and checked 16-bit page-table accounting update in one contended path.
+     * Exercise a high physical address, 16 MiB mapping, 8-byte
+     * interlock, and checked 16-bit page-table accounting update in one
+     * contended path.
      */
     __asm__ volatile (
         "ssm psr.dt;;\n\t"
@@ -1152,8 +1155,8 @@ static VOID cmpxchg_increment_batch(VOID)
     }
 }
 
-static UINT64 cmp8xchg16(volatile UINT64 *Address, UINT64 Compare,
-                         UINT64 Low, UINT64 High)
+static UINT64 __attribute__((noinline))
+cmp8xchg16(volatile UINT64 *Address, UINT64 Compare, UINT64 Low, UINT64 High)
 {
     UINT64 old;
 
@@ -1167,8 +1170,9 @@ static UINT64 cmp8xchg16(volatile UINT64 *Address, UINT64 Compare,
     return old;
 }
 
-static UINT64 cmp8xchg16_big_endian(volatile UINT64 *Address, UINT64 Compare,
-                                    UINT64 Low, UINT64 High)
+static UINT64 __attribute__((noinline))
+cmp8xchg16_big_endian(volatile UINT64 *Address, UINT64 Compare,
+                      UINT64 Low, UINT64 High)
 {
     UINT64 old;
 
@@ -1313,6 +1317,17 @@ static UINT64 read_lid(void)
 
     __asm__ volatile ("mov %0 = cr.lid;;" : "=r"(lid) : : "memory");
     return lid;
+}
+
+static BOOLEAN supports_16_byte_atomics(VOID)
+{
+    UINT64 index = TEST_CPUID_FEATURES_REGISTER;
+    UINT64 features;
+
+    __asm__ volatile ("mov %0 = cpuid[%1];;"
+                      : "=r"(features)
+                      : "r"(index));
+    return (features & TEST_CPUID4_AO) != 0;
 }
 
 static UINT64 read_itc(void)
@@ -1524,7 +1539,9 @@ static VOID ap_rendezvous(void)
                 !translation_remap_word_store_check(id)) {
                 translation_write_mismatch[id]++;
             }
-            atomic_increment_batch();
+            if (supports_16_byte_atomics()) {
+                atomic_increment_batch();
+            }
             fetchadd_increment_batch();
             cmpxchg_increment_batch();
             packed_pfn_update_batch(id);
@@ -1658,6 +1675,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     BOOLEAN uc_assisted_sequential;
     BOOLEAN uce_assisted_sequential;
     BOOLEAN big_endian_atomic;
+    BOOLEAN atomic_16_supported = supports_16_byte_atomics();
 
     (void)ImageHandle;
     atomic_pair.Low = 0;
@@ -1720,7 +1738,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             if (!translation_remap_word_store_check(0)) {
                 translation_write_mismatch[0]++;
             }
-            atomic_increment_batch();
+            if (atomic_16_supported) {
+                atomic_increment_batch();
+            }
             fetchadd_increment_batch();
             cmpxchg_increment_batch();
             packed_pfn_update_batch(0);
@@ -1741,7 +1761,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                         send_wake_ipi(id, wake_vector);
                     }
                     translation_round_check(0);
-                    atomic_increment_batch();
+                    if (atomic_16_supported) {
+                        atomic_increment_batch();
+                    }
                     fetchadd_increment_batch();
                     cmpxchg_increment_batch();
                     packed_pfn_update_batch(0);
@@ -1923,12 +1945,16 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     ia64_test_check(&context, "translation-remap-word-store",
                     translation_semantics, EFI_DEVICE_ERROR,
                     "remap-stored-to-old-physical-page");
-    atomic_semantics = repeat_rounds &&
-        atomic_pair.Low == TEST_RENDEZVOUS_ROUNDS * TEST_PROCESSOR_COUNT *
-                           TEST_ATOMIC_INCREMENTS &&
-        atomic_pair.High == TEST_ATOMIC_HIGH;
-    ia64_test_check(&context, "atomic-16-byte-semaphore", atomic_semantics,
-                    EFI_DEVICE_ERROR, "semaphore-contention-failed");
+    if (atomic_16_supported) {
+        atomic_semantics = repeat_rounds &&
+            atomic_pair.Low == TEST_RENDEZVOUS_ROUNDS *
+                               TEST_PROCESSOR_COUNT *
+                               TEST_ATOMIC_INCREMENTS &&
+            atomic_pair.High == TEST_ATOMIC_HIGH;
+        ia64_test_check(&context, "atomic-16-byte-semaphore",
+                        atomic_semantics, EFI_DEVICE_ERROR,
+                        "semaphore-contention-failed");
+    }
     fetchadd_semantics = repeat_rounds &&
         fetchadd4_counter == TEST_RENDEZVOUS_ROUNDS *
                              TEST_PROCESSOR_COUNT *
@@ -2017,20 +2043,22 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     ia64_test_check(&context, "high-large-page-translated-guarded-word",
                     high_translated_lock_semantics, EFI_DEVICE_ERROR,
                     "high-large-page-lock-contention-failed");
-    atomic_pair.Low = __builtin_bswap64(0x0123456789abcdefULL);
-    atomic_pair.High = __builtin_bswap64(0xfedcba9876543210ULL);
-    __asm__ volatile ("mf;;" : : : "memory");
-    big_endian_atomic =
-        cmp8xchg16_big_endian(&atomic_pair.High,
-                              0xfedcba9876543210ULL,
-                              0x1111222233334444ULL,
-                              0x5555666677778888ULL) ==
-                              0xfedcba9876543210ULL &&
-        atomic_pair.Low == __builtin_bswap64(0x1111222233334444ULL) &&
-        atomic_pair.High == __builtin_bswap64(0x5555666677778888ULL);
-    ia64_test_check(&context, "big-endian-16-byte-semaphore",
-                    big_endian_atomic, EFI_DEVICE_ERROR,
-                    "big-endian-semaphore-failed");
+    if (atomic_16_supported) {
+        atomic_pair.Low = __builtin_bswap64(0x0123456789abcdefULL);
+        atomic_pair.High = __builtin_bswap64(0xfedcba9876543210ULL);
+        __asm__ volatile ("mf;;" : : : "memory");
+        big_endian_atomic =
+            cmp8xchg16_big_endian(&atomic_pair.High,
+                                  0xfedcba9876543210ULL,
+                                  0x1111222233334444ULL,
+                                  0x5555666677778888ULL) ==
+                                  0xfedcba9876543210ULL &&
+            atomic_pair.Low == __builtin_bswap64(0x1111222233334444ULL) &&
+            atomic_pair.High == __builtin_bswap64(0x5555666677778888ULL);
+        ia64_test_check(&context, "big-endian-16-byte-semaphore",
+                        big_endian_atomic, EFI_DEVICE_ERROR,
+                        "big-endian-semaphore-failed");
+    }
     ia64_test_done(&context);
     return context.Failed == 0 ? EFI_SUCCESS : EFI_DEVICE_ERROR;
 }

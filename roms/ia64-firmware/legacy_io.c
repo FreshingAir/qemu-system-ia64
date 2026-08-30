@@ -292,7 +292,7 @@ static UINT8 mSerialLoopback[256];
 static UINTN mSerialLoopbackRead;
 static UINTN mSerialLoopbackWrite;
 static UINTN mSerialLoopbackCount;
-static FW_SERIAL_DEVICE_PATH mSerialDevicePath = {
+static FW_SERIAL_DEVICE_PATH mAcpiSerialDevicePath = {
     .Acpi = {
         .Header = { 0x02, 0x01, sizeof(FW_ACPI_HID_DEVICE_PATH_NODE) },
         .Hid = FW_UART_DEVICE_PATH_HID_PNP0501,
@@ -308,6 +308,82 @@ static FW_SERIAL_DEVICE_PATH mSerialDevicePath = {
     },
     .End = { 0x7f, 0xff, sizeof(FW_DEVICE_PATH_NODE) },
 };
+static FW_MMIO_SERIAL_DEVICE_PATH mMmioSerialDevicePath;
+static VOID *mActiveSerialDevicePath;
+static UINTN mActiveSerialDevicePathSize;
+static FW_UART_DEVICE_PATH_NODE *mActiveSerialUartDevicePath;
+
+static void serial_device_path_init(void)
+{
+    const FW_UART_POLICY *policy = fw_i2000_uart_policy();
+    UINT64 base;
+    UINT64 last;
+    UINT64 legacy_base;
+    UINT64 legacy_size;
+
+    if (mActiveSerialDevicePath != NULL) {
+        return;
+    }
+    if (fw_vpc_devices_enabled() ||
+        (policy != NULL &&
+         policy->DevicePathKind == FW_UART_DEVICE_PATH_ACPI_PNP0501)) {
+        if (policy != NULL) {
+            mAcpiSerialDevicePath.Acpi.Hid = policy->DevicePathHid;
+            mAcpiSerialDevicePath.Acpi.Uid = policy->DevicePathUid;
+        }
+        mAcpiSerialDevicePath.Uart.BaudRate =
+            fw_platform_console_default_baud();
+        mActiveSerialDevicePath = &mAcpiSerialDevicePath;
+        mActiveSerialDevicePathSize = sizeof(mAcpiSerialDevicePath);
+        mActiveSerialUartDevicePath = &mAcpiSerialDevicePath.Uart;
+        return;
+    }
+
+    base = fw_platform_console_base();
+    last = base + (UART_REGISTER_COUNT - 1U) *
+        fw_platform_console_stride();
+    legacy_base = fw_platform_legacy_io_base();
+    legacy_size = fw_platform_legacy_io_size();
+    fw_set_mem(&mMmioSerialDevicePath, sizeof(mMmioSerialDevicePath), 0);
+    mMmioSerialDevicePath.Memory.Header.Type = 0x01;
+    mMmioSerialDevicePath.Memory.Header.SubType = 0x03;
+    mMmioSerialDevicePath.Memory.Header.Length =
+        sizeof(mMmioSerialDevicePath.Memory);
+    mMmioSerialDevicePath.Memory.MemoryType =
+        base >= legacy_base &&
+        last < legacy_base + legacy_size ?
+        EfiMemoryMappedIOPortSpace : EfiMemoryMappedIO;
+    mMmioSerialDevicePath.Memory.StartingAddress = base;
+    mMmioSerialDevicePath.Memory.EndingAddress = last;
+    mMmioSerialDevicePath.Uart.Header.Type = 0x03;
+    mMmioSerialDevicePath.Uart.Header.SubType = 0x0e;
+    mMmioSerialDevicePath.Uart.Header.Length =
+        sizeof(mMmioSerialDevicePath.Uart);
+    mMmioSerialDevicePath.Uart.BaudRate =
+        fw_platform_console_default_baud();
+    mMmioSerialDevicePath.Uart.DataBits = 8;
+    mMmioSerialDevicePath.Uart.Parity = NoParity;
+    mMmioSerialDevicePath.Uart.StopBits = OneStopBit;
+    mMmioSerialDevicePath.End.Type = 0x7f;
+    mMmioSerialDevicePath.End.SubType = 0xff;
+    mMmioSerialDevicePath.End.Length = sizeof(FW_DEVICE_PATH_NODE);
+
+    mActiveSerialDevicePath = &mMmioSerialDevicePath;
+    mActiveSerialDevicePathSize = sizeof(mMmioSerialDevicePath);
+    mActiveSerialUartDevicePath = &mMmioSerialDevicePath.Uart;
+}
+
+VOID *fw_serial_device_path(VOID)
+{
+    serial_device_path_init();
+    return mActiveSerialDevicePath;
+}
+
+UINTN fw_serial_device_path_size(VOID)
+{
+    serial_device_path_init();
+    return mActiveSerialDevicePathSize;
+}
 
 static BOOLEAN serial_protocol_valid(EFI_SERIAL_IO_PROTOCOL *This)
 {
@@ -347,6 +423,8 @@ static EFI_STATUS serial_set_attributes(EFI_SERIAL_IO_PROTOCOL *This,
                                         UINT8 DataBits,
                                         EFI_STOP_BITS_TYPE StopBits)
 {
+    UINT64 input_clock;
+    UINT64 baud_base;
     UINT64 divisor;
     UINT64 actual_baud;
     UINT8 lcr;
@@ -362,14 +440,20 @@ static EFI_STATUS serial_set_attributes(EFI_SERIAL_IO_PROTOCOL *This,
     Parity = Parity == DefaultParity ? NoParity : Parity;
     DataBits = DataBits == 0 ? 8U : DataBits;
     StopBits = StopBits == DefaultStopBits ? OneStopBit : StopBits;
-    if (BaudRate < 2U || DataBits < 5U || DataBits > 8U ||
+    if (BaudRate < IA64_PLATFORM_UART_MIN_BAUD ||
+        DataBits < 5U || DataBits > 8U ||
         (StopBits == OneFiveStopBits && DataBits != 5U) ||
         (StopBits == TwoStopBits && DataBits == 5U)) {
         return EFI_INVALID_PARAMETER;
     }
 
-    divisor = 115200U / BaudRate;
-    if (115200U % BaudRate != 0) {
+    input_clock = fw_platform_console_clock_hz();
+    baud_base = input_clock / IA64_PLATFORM_UART_OVERSAMPLING;
+    if (baud_base < IA64_PLATFORM_UART_MIN_BAUD) {
+        return EFI_UNSUPPORTED;
+    }
+    divisor = baud_base / BaudRate;
+    if (baud_base % BaudRate != 0) {
         divisor++;
     }
     if (divisor == 0) {
@@ -378,7 +462,7 @@ static EFI_STATUS serial_set_attributes(EFI_SERIAL_IO_PROTOCOL *This,
     if (divisor > 0xffffU) {
         return EFI_INVALID_PARAMETER;
     }
-    actual_baud = 115200U / divisor;
+    actual_baud = baud_base / divisor;
     fifo = ReceiveFifoDepth >= 16U ? 16U : 1U;
 
     lcr = (UINT8)(DataBits - 5U);
@@ -416,10 +500,11 @@ static EFI_STATUS serial_set_attributes(EFI_SERIAL_IO_PROTOCOL *This,
     mSerialIoMode.DataBits = DataBits;
     mSerialIoMode.Parity = Parity;
     mSerialIoMode.StopBits = StopBits;
-    mSerialDevicePath.Uart.BaudRate = actual_baud;
-    mSerialDevicePath.Uart.DataBits = DataBits;
-    mSerialDevicePath.Uart.Parity = (UINT8)Parity;
-    mSerialDevicePath.Uart.StopBits = (UINT8)StopBits;
+    serial_device_path_init();
+    mActiveSerialUartDevicePath->BaudRate = actual_baud;
+    mActiveSerialUartDevicePath->DataBits = DataBits;
+    mActiveSerialUartDevicePath->Parity = (UINT8)Parity;
+    mActiveSerialUartDevicePath->StopBits = (UINT8)StopBits;
     return EFI_SUCCESS;
 }
 
@@ -604,7 +689,7 @@ static BOOLEAN serial_io_install(VOID)
         return 0;
     }
     st = bs_install_protocol(&mSerialHandle, (VOID *)mDevicePathProtocolGuid,
-                             0, &mSerialDevicePath);
+                             0, fw_serial_device_path());
     if (st != EFI_SUCCESS) {
         (void)bs_uninstall_protocol(mSerialHandle,
                                     (VOID *)mSerialIoProtocolGuid,
@@ -930,19 +1015,23 @@ static BOOLEAN scsi_pass_thru_install(VOID)
 
 BOOLEAN fw_legacy_io_protocols_install(VOID)
 {
-    if (!device_io_install()) {
+    BOOLEAN vpc_devices = fw_vpc_devices_enabled();
+
+    if (vpc_devices && !device_io_install()) {
         return 0;
     }
     if (!serial_io_install()) {
-        (void)bs_uninstall_protocol(fw_pci_root_handle(),
-                                    (VOID *)mDeviceIoProtocolGuid,
-                                    &mDeviceIoProtocol);
+        if (vpc_devices) {
+            (void)bs_uninstall_protocol(fw_pci_root_handle(),
+                                        (VOID *)mDeviceIoProtocolGuid,
+                                        &mDeviceIoProtocol);
+        }
         return 0;
     }
-    if (!scsi_pass_thru_install()) {
+    if (vpc_devices && !scsi_pass_thru_install()) {
         (void)bs_uninstall_protocol(mSerialHandle,
                                     (VOID *)mDevicePathProtocolGuid,
-                                    &mSerialDevicePath);
+                                    fw_serial_device_path());
         (void)bs_uninstall_protocol(mSerialHandle,
                                     (VOID *)mSerialIoProtocolGuid,
                                     &mSerialIoProtocol);
