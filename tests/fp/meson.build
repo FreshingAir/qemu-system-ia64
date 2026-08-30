@@ -6,6 +6,14 @@ endif
 if host_os == 'windows'
   subdir_done()
 endif
+# Android/bionic build: the berkeley softfloat/testfloat reference stubs are
+# built here with the global -Ofast (fast-math) flags, and clang rejects their
+# '#pragma STDC FENV_ACCESS ON' as illegal when precise FP is disabled. These
+# subprojects only feed the on-host fp-test unit tests, never the emulator;
+# skip them for the Android cross build.
+if cc.get_define('__ANDROID__') != ''
+  subdir_done()
+endif
 
 # By default tests run with the usual 30s timeout; particularly
 # slow tests can have that overridden here. The keys here are

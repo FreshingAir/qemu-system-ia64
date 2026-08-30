@@ -1375,7 +1375,14 @@ rt = not_found
 if host_os != 'windows'
   have_shm_open = cc.has_function('shm_open')
   if not have_shm_open
-    rt = cc.find_library('rt', required: true)
+    # Android/bionic has no librt to link against and declares neither
+    # shm_open() at the toolchain's default API level; limbo provides it via
+    # the compat stubs (limbo_compat_stubs.c) at link time. Skip the librt
+    # fallback entirely so the Android cross configure does not fail.
+    androide = cc.get_define('__ANDROID__')
+    if androide == ''
+      rt = cc.find_library('rt', required: true)
+    endif
   endif
 endif
 
@@ -2676,7 +2683,15 @@ config_host_data.set('CONFIG_SYNC_FILE_RANGE', cc.has_function('sync_file_range'
 config_host_data.set('CONFIG_TIMERFD', cc.has_function('timerfd_create'))
 config_host_data.set('CONFIG_GETLOADAVG', cc.has_function('getloadavg'))
 config_host_data.set('CONFIG_ARPA_INET_64', cc.has_function('htonll'))
-config_host_data.set('HAVE_COPY_FILE_RANGE', cc.has_function('copy_file_range'))
+# Android/bionic does not declare copy_file_range() below API 30 (and has no
+# librt equivalent), but the NDK sysroot headers let cc.has_function() think it
+# exists. Forcing it off makes block/file-posix.c compile its own static
+# syscall-based fallback, otherwise it would call an undeclared function.
+have_copy_file_range = cc.has_function('copy_file_range')
+if cc.get_define('__ANDROID__') != ''
+  have_copy_file_range = false
+endif
+config_host_data.set('HAVE_COPY_FILE_RANGE', have_copy_file_range)
 config_host_data.set('HAVE_GETIFADDRS', cc.has_function('getifaddrs'))
 config_host_data.set('HAVE_GLIB_WITH_SLICE_ALLOCATOR', glib_has_gslice)
 config_host_data.set('HAVE_OPENPTY', cc.has_function('openpty', dependencies: util))
