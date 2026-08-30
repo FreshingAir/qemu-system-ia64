@@ -69,6 +69,7 @@ void surface_gl_create_texture(QemuGLShader *gls,
 {
     GLenum glformat;
     GLenum gltype;
+    bool mapped;
 
     assert(gls);
     assert(QEMU_IS_ALIGNED(surface_stride(surface), surface_bytes_per_pixel(surface)));
@@ -77,7 +78,11 @@ void surface_gl_create_texture(QemuGLShader *gls,
         return;
     }
 
-    assert(map_format(surface_format(surface), &glformat, &gltype));
+    mapped = map_format(surface_format(surface), &glformat, &gltype);
+    assert(mapped);
+    if (!mapped) {
+        return;
+    }
     glGenTextures(1, &surface->texture);
     glEnable(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, surface->texture);
@@ -152,9 +157,14 @@ void surface_gl_update_texture(QemuGLShader *gls,
     uint8_t *data = (void *)surface_data(surface);
     GLenum glformat;
     GLenum gltype;
+    bool mapped;
 
     assert(gls);
-    assert(map_format(surface_format(surface), &glformat, &gltype));
+    mapped = map_format(surface_format(surface), &glformat, &gltype);
+    assert(mapped);
+    if (!mapped) {
+        return;
+    }
 
     if (surface->texture) {
         glBindTexture(GL_TEXTURE_2D, surface->texture);

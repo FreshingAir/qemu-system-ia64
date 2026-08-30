@@ -939,6 +939,7 @@ static IA64BootInfo hp_zx6000_boot_info(unsigned int cpu_index,
     HPIA64MachineState *hp = HP_IA64_MACHINE(s);
     uint64_t low_ram_end = hp->descriptor_low_ram_end;
     uint64_t assist_base = low_ram_end - IA64_FW_BOOT_STACK_SIZE;
+    bool applied;
     IA64BootInfo info = {
         .firmware_base = IA64_PLATFORM_FIRMWARE_BASE,
         .firmware_entry = entry,
@@ -957,7 +958,8 @@ static IA64BootInfo hp_zx6000_boot_info(unsigned int cpu_index,
         .platform_addresses_valid = true,
     };
 
-    g_assert(hp_ia64_machine_apply_platform_firmware_args(hp, &info));
+    applied = hp_ia64_machine_apply_platform_firmware_args(hp, &info);
+    g_assert(applied);
     return info;
 }
 

@@ -1459,9 +1459,12 @@ static int aspeed_i2c_bus_slave_event(I2CSlave *slave, enum i2c_event event)
 
 static void aspeed_i2c_bus_new_slave_send_async(AspeedI2CBus *bus, uint8_t data)
 {
-    assert(address_space_write(&bus->controller->dram_as,
-                               bus->dma_dram_offset,
-                               MEMTXATTRS_UNSPECIFIED, &data, 1) == MEMTX_OK);
+    MemTxResult result;
+
+    result = address_space_write(&bus->controller->dram_as,
+                                 bus->dma_dram_offset,
+                                 MEMTXATTRS_UNSPECIFIED, &data, 1);
+    assert(result == MEMTX_OK);
 
     bus->dma_dram_offset++;
     bus->regs[R_I2CC_DMA_LEN]--;

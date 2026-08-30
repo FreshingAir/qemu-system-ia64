@@ -416,10 +416,9 @@ void ia64_itm_update(CPUIA64State *env, uint64_t itm_value)
     itc = env->ar_itc;
     delta_ticks = (int64_t)(itm_value - itc);
 
-    timer_del(cpu->itm_timer);
-    env->interrupt.itm_armed = false;
-
     if (ia64_itm_update_pending(env, itc, itm_value, was_armed)) {
+        timer_del(cpu->itm_timer);
+        env->interrupt.itm_armed = false;
         ia64_itc_advance_pending_itm(env);
         return;
     }

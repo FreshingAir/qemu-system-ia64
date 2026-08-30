@@ -583,13 +583,15 @@ static void hp_zx1_mio_reset_hold(Object *obj, ResetType type)
 {
     HPZX1MIOState *s = HP_ZX1_MIO(obj);
     HPZX1IOMMUResetConfig config;
+    bool reset;
     bool notify = false;
 
     qemu_rec_mutex_lock(&s->iommu_lock);
     hp_zx1_mio_regs_reset(&s->regs);
     if (s->iommu_configured) {
         config = hp_zx1_mio_iommu_reset_config(s);
-        g_assert(hp_zx1_iommu_frontend_reset(&s->iommu, &config));
+        reset = hp_zx1_iommu_frontend_reset(&s->iommu, &config);
+        g_assert(reset);
         notify = true;
     }
     qemu_rec_mutex_unlock(&s->iommu_lock);
@@ -760,6 +762,7 @@ static void hp_zx1_mio_realize(DeviceState *dev, Error **errp)
 {
     HPZX1MIOState *s = HP_ZX1_MIO(dev);
     HPZX1IOMMUResetConfig config;
+    bool reset;
 
     if (!s->iommu_configured) {
         error_setg(errp,
@@ -770,7 +773,8 @@ static void hp_zx1_mio_realize(DeviceState *dev, Error **errp)
     config = hp_zx1_mio_iommu_reset_config(s);
     qemu_rec_mutex_lock(&s->iommu_lock);
     hp_zx1_mio_regs_reset(&s->regs);
-    g_assert(hp_zx1_iommu_frontend_reset(&s->iommu, &config));
+    reset = hp_zx1_iommu_frontend_reset(&s->iommu, &config);
+    g_assert(reset);
     qemu_rec_mutex_unlock(&s->iommu_lock);
 }
 

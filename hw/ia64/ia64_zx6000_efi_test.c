@@ -449,6 +449,7 @@ static IA64BootInfo zx6000_efi_machine_boot_info(
     IA64ZX6000ZX1TestLayout layout;
     const uint64_t low_ram_end = hp->descriptor_low_ram_end;
     const uint64_t cpu_assist_base = low_ram_end - IA64_FW_BOOT_STACK_SIZE;
+    bool applied;
     IA64BootInfo info;
 
     ia64_zx6000_zx1_test_layout_init(&layout);
@@ -469,7 +470,8 @@ static IA64BootInfo zx6000_efi_machine_boot_info(
         .powered_off = cpu_index != 0,
         .platform_addresses_valid = true,
     };
-    g_assert(hp_ia64_machine_apply_platform_firmware_args(hp, &info));
+    applied = hp_ia64_machine_apply_platform_firmware_args(hp, &info);
+    g_assert(applied);
     return info;
 }
 

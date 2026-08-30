@@ -479,10 +479,12 @@ static void fixture_destroy_spaces(IA64I2000460GXTestState *s)
 static void fixture_cleanup(IA64I2000460GXTestState *s)
 {
     DeviceState *child;
+    bool destroyed;
     int i;
 
     /* Remove PCI children before this device. */
-    g_assert(fixture_destroy_dma(s));
+    destroyed = fixture_destroy_dma(s);
+    g_assert(destroyed);
     drain_call_rcu();
     fixture_unmap_system(s);
     fixture_destroy_spaces(s);

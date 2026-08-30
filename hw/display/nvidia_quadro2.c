@@ -1339,8 +1339,18 @@ static bool nv15_ramin_range_valid(uint32_t offset, uint32_t size)
 
 static uint32_t nv15_ramin_read32(NVIDIAQuadro2State *s, uint32_t offset)
 {
+    hwaddr vram;
+
     if (!nv15_ramin_range_valid(offset, sizeof(uint32_t))) {
         return 0;
+    }
+    /*
+     * An aligned 32-bit access cannot cross one of RAMIN's reversed 16-byte
+     * blocks.  Bytes within a block retain ascending order in VRAM.
+     */
+    if (QEMU_IS_ALIGNED(offset, sizeof(uint32_t))) {
+        vram = nv15_pramin_to_vram(s, NV15_PRAMIN_BASE + offset);
+        return ldl_le_p(s->vga.vram_ptr + vram);
     }
     return nv15_pramin_read(s, NV15_PRAMIN_BASE + offset,
                             sizeof(uint32_t));
@@ -1349,9 +1359,18 @@ static uint32_t nv15_ramin_read32(NVIDIAQuadro2State *s, uint32_t offset)
 static void nv15_ramin_write32(NVIDIAQuadro2State *s, uint32_t offset,
                                uint32_t value)
 {
-    if (nv15_ramin_range_valid(offset, sizeof(uint32_t))) {
+    hwaddr vram;
+
+    if (!nv15_ramin_range_valid(offset, sizeof(uint32_t))) {
+        return;
+    }
+    if (QEMU_IS_ALIGNED(offset, sizeof(uint32_t))) {
+        vram = nv15_pramin_to_vram(s, NV15_PRAMIN_BASE + offset);
+        stl_le_p(s->vga.vram_ptr + vram, value);
+        memory_region_set_dirty(&s->vga.vram, vram, sizeof(value));
+    } else {
         nv15_pramin_write(s, NV15_PRAMIN_BASE + offset, value,
-                          sizeof(uint32_t));
+                          sizeof(value));
     }
 }
 
@@ -4425,7 +4444,6 @@ static void nv15_fifo_run_pusher(NVIDIAQuadro2State *s)
         !(*dma_push & NV15_PFIFO_DMA_PUSH_STATUS)) {
         nv15_fifo_pusher_fault(s, NV15_PFIFO_DMA_ERROR_MEMORY);
     }
-    nv15_ramfc_save(s, channel);
 }
 
 static uint32_t nv15_user_read(NVIDIAQuadro2State *s, hwaddr addr)

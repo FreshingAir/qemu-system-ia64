@@ -111,6 +111,7 @@ from .encoding import (
     cmp4_eq_unc_imm,
     cmp_eq_imm,
     cmp_eq_and,
+    cmp_ltu_unc,
     cover_b,
     dep,
     depz_reg,
@@ -1524,6 +1525,74 @@ test_future_itm_rearm_preserves_pended_timer_irr = require_registers(
         "exception": IA64_EXCP_NONE,
         "r31": 0x66,
     }, entry=0x10)
+
+
+def test_future_itm_rearm_uses_latest_deadline(qemu):
+    result = run_program(qemu, [
+        (0x10, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
+        (0x20, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
+        (0x30, 0x02, mov_m_ar_gr(3, 44), nop_i(), nop_i()),
+        (0x40, 0x00, addl(4, IA64_ITC_ADDL_DELAY_TICKS, 3),
+         nop_i(), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(4, IA64_CR_ITM), nop_i(), nop_i()),
+        (0x60, *movl_mlx(6, IA64_ITC_ADDL_DELAY_TICKS)),
+        (0x70, 0x00, nop_m(), add(5, 4, 6), nop_i()),
+        (0x80, 0x00, mov_m_gr_cr(5, IA64_CR_ITM), nop_i(), nop_i()),
+        (0x90, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_I)),
+        (0xa0, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
+        (0xb0, 0x10, nop_m(), nop_i(), br_cond(0xb0, 0xb0)),
+        (0x3000, 0x00, mov_m_cr_gr(6, IA64_CR_SAPIC_IVR),
+         nop_i(), nop_i()),
+        (0x3010, 0x02, mov_m_ar_gr(8, 44), nop_i(), nop_i()),
+        (0x3020, 0x00, mov_m_cr_gr(9, IA64_CR_ITM), nop_i(), nop_i()),
+        (0x3030, 0x10, nop_m(), nop_i(), br_cond(0x3030, 0x3030)),
+    ], entry=0x10, terminal_ip=0x3030)
+    state = result.state
+    if (state.exception != IA64_EXCP_NONE or
+        state.gr[6] != 0xef or
+        state.gr[8] < state.gr[5] or
+        state.gr[9] != state.gr[5]):
+        raise RuntimeError(
+            "future_itm_rearm_uses_latest_deadline failed: "
+            f"exception={state.exception!r} vector={state.gr[6]!r} "
+            f"old_itm={state.gr[4]!r} "
+            f"new_itm={state.gr[5]!r} fired_itc={state.gr[8]!r} "
+            f"fired_itm={state.gr[9]!r}\n{result.register_output}")
+
+
+def test_past_itm_reprogram_cancels_future_deadline(qemu):
+    result = run_program(qemu, [
+        (0x10, 0x00, adds(3, 0xef, 0), nop_i(), nop_i()),
+        (0x20, 0x00, mov_m_gr_cr(3, IA64_CR_ITV), nop_i(), nop_i()),
+        (0x30, 0x02, mov_m_ar_gr(3, 44), nop_i(), nop_i()),
+        (0x40, 0x00, addl(4, IA64_ITC_ADDL_DELAY_TICKS, 3),
+         nop_i(), nop_i()),
+        (0x50, 0x00, mov_m_gr_cr(4, IA64_CR_ITM), nop_i(), nop_i()),
+        (0x60, 0x00, adds(5, -1, 3), nop_i(), nop_i()),
+        (0x70, 0x00, mov_m_gr_cr(5, IA64_CR_ITM), nop_i(), nop_i()),
+        (0x80, *movl_mlx(7, IA64_ITC_ADDL_DELAY_TICKS)),
+        (0x90, 0x00, nop_m(), add(7, 4, 7), nop_i()),
+        (0xa0, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_I)),
+        (0xb0, 0x08, mov_gr_psr_full(19), srlz_d(), nop_i()),
+        (0xc0, 0x02, mov_m_ar_gr(6, 44), nop_i(), nop_i()),
+        (0xd0, 0x00, nop_m(), cmp_ltu_unc(6, 7, 6, 7), nop_i()),
+        (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xc0, qp=6)),
+        (0xf0, 0x10, nop_m(), nop_i(), br_cond(0xf0, 0xf0)),
+        (0x3000, 0x00, mov_m_cr_gr(9, IA64_CR_SAPIC_IVR),
+         nop_i(), nop_i()),
+        (0x3010, 0x00, nop_m(), adds(8, 1, 8), nop_i()),
+        (0x3020, 0x10, mov_m_gr_cr(0, IA64_CR_SAPIC_EOI), nop_i(), rfi_b()),
+    ], entry=0x10, terminal_ip=0xf0)
+    state = result.state
+    if (state.exception != IA64_EXCP_NONE or
+        state.gr[6] < state.gr[7] or state.gr[8] != 0):
+        raise RuntimeError(
+            "past_itm_reprogram_cancels_future_deadline failed: "
+            f"exception={state.exception!r} old_itm={state.gr[4]!r} "
+            f"cancel_itm={state.gr[5]!r} "
+            f"wait_itc={state.gr[7]!r} final_itc={state.gr[6]!r} "
+            f"interrupts={state.gr[8]!r}\n"
+            f"{result.register_output}")
 
 test_masking_itv_preserves_pended_timer_irr = require_registers(
     "masking_itv_preserves_pended_timer_irr", [
@@ -5807,6 +5876,7 @@ CASE_NAMES = (
     'exception_unaligned_sets_ifa_isr',
     'exception_unaligned_slot1_uses_psr_ri',
     'future_itm_rearm_preserves_pended_timer_irr',
+    'future_itm_rearm_uses_latest_deadline',
     'iipa_preserved_for_rfi_to_fault',
     'iipa_reports_current_bundle_after_prior_slot_success',
     'iipa_reports_previous_successful_bundle_for_slot0_fault',
@@ -5922,6 +5992,7 @@ CASE_NAMES = (
     'nested_exception_keeps_handler_interruption_state',
     'nested_exception_keeps_handler_return_state',
     'past_itm_does_not_fire',
+    'past_itm_reprogram_cancels_future_deadline',
     'past_rearmed_itm_does_not_interrupt',
     'rfi_ignores_iip_low_bits',
     'rfi_restores_interrupted_bsp_after_cover',

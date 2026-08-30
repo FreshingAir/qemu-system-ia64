@@ -115,7 +115,10 @@ static void sint_route_set_sint(HypervTestDev *dev,
 static void msg_retry(void *opaque)
 {
     TestMsgConn *conn = opaque;
-    assert(!hyperv_post_msg(conn->sint_route, &conn->msg));
+    int ret;
+
+    ret = hyperv_post_msg(conn->sint_route, &conn->msg);
+    assert(ret == 0);
 }
 
 static void msg_cb(void *data, int status)
@@ -159,6 +162,7 @@ static void msg_conn_create(HypervTestDev *dev, uint8_t vp_index,
                             uint8_t sint, uint8_t conn_id)
 {
     TestMsgConn *conn;
+    int ret;
 
     conn = g_new0(TestMsgConn, 1);
     assert(conn);
@@ -168,7 +172,8 @@ static void msg_conn_create(HypervTestDev *dev, uint8_t vp_index,
     conn->sint_route = hyperv_sint_route_new(vp_index, sint, msg_cb, conn);
     assert(conn->sint_route);
 
-    assert(!hyperv_set_msg_handler(conn->conn_id, msg_handler, conn));
+    ret = hyperv_set_msg_handler(conn->conn_id, msg_handler, conn);
+    assert(ret == 0);
 
     QLIST_INSERT_HEAD(&dev->msg_conns, conn, le);
 }
@@ -192,17 +197,20 @@ static void msg_conn_destroy(HypervTestDev *dev, uint8_t conn_id)
 static void evt_conn_handler(EventNotifier *notifier)
 {
     TestEvtConn *conn = container_of(notifier, TestEvtConn, notifier);
+    int ret;
 
     event_notifier_test_and_clear(notifier);
 
     /* signal the same event flag we've got */
-    assert(!hyperv_set_event_flag(conn->sint_route, conn->conn_id));
+    ret = hyperv_set_event_flag(conn->sint_route, conn->conn_id);
+    assert(ret == 0);
 }
 
 static void evt_conn_create(HypervTestDev *dev, uint8_t vp_index,
                             uint8_t sint, uint8_t conn_id)
 {
     TestEvtConn *conn;
+    int ret;
 
     conn = g_new0(TestEvtConn, 1);
     assert(conn);
@@ -212,11 +220,13 @@ static void evt_conn_create(HypervTestDev *dev, uint8_t vp_index,
     conn->sint_route = hyperv_sint_route_new(vp_index, sint, NULL, NULL);
     assert(conn->sint_route);
 
-    assert(!event_notifier_init(&conn->notifier, false));
+    ret = event_notifier_init(&conn->notifier, false);
+    assert(ret == 0);
 
     event_notifier_set_handler(&conn->notifier, evt_conn_handler);
 
-    assert(!hyperv_set_event_flag_handler(conn_id, &conn->notifier));
+    ret = hyperv_set_event_flag_handler(conn_id, &conn->notifier);
+    assert(ret == 0);
 
     QLIST_INSERT_HEAD(&dev->evt_conns, conn, le);
 }

@@ -10,6 +10,7 @@
 #include "qemu/osdep.h"
 #include "ati_int.h"
 #include "ati_regs.h"
+#include "exec/target_page.h"
 #include "qemu/log.h"
 #include "ui/console.h"
 #include "ui/rect.h"
@@ -168,18 +169,41 @@ static void ati_2d_mark_direct_dirty(const ATI2DCtx *ctx,
 {
     VGACommonState *vga = ctx->vga;
     unsigned int bypp = ctx->bpp / 8;
+    uint64_t page_size = qemu_target_page_size();
+    uint64_t page_mask = page_size - 1;
     uint64_t row_bytes;
+    uint64_t run_start = 0;
+    uint64_t run_end = 0;
     unsigned int y;
 
     g_assert(ctx->dst_bits);
     row_bytes = (uint64_t)dirty->width * bypp;
+    if (!dirty->height || !row_bytes) {
+        return;
+    }
+
+    /* Dirty logging is page-based, so coalesce only contiguous page runs. */
     for (y = 0; y < dirty->height; y++) {
         uint64_t offset = ctx->dst_vram_offset +
                           (uint64_t)(dirty->y + y) * ctx->dst_stride +
                           (uint64_t)dirty->x * bypp;
+        uint64_t start = offset & ~page_mask;
+        uint64_t end = MIN((offset + row_bytes + page_mask) & ~page_mask,
+                           vga->vram_size);
 
-        memory_region_set_dirty(&vga->vram, offset, row_bytes);
+        if (!y) {
+            run_start = start;
+            run_end = end;
+        } else if (start <= run_end) {
+            run_end = MAX(run_end, end);
+        } else {
+            memory_region_set_dirty(&vga->vram, run_start,
+                                    run_end - run_start);
+            run_start = start;
+            run_end = end;
+        }
     }
+    memory_region_set_dirty(&vga->vram, run_start, run_end - run_start);
 }
 
 static void setup_2d_blt_ctx(ATIVGAState *s, ATI2DCtx *ctx)
@@ -420,17 +444,29 @@ static void ati_store_pixel(const ATI2DCtx *ctx, uint8_t *dst,
 {
     unsigned int bypp = ctx->bpp / 8;
 
-    if (bypp == 3) {
+    if (bypp != 3 && ctx->need_swap) {
+        bswap32s(&value);
+    }
+
+    switch (bypp) {
+    case 1:
+        stb_p(dst, value);
+        break;
+    case 2:
+        stw_he_p(dst, value);
+        break;
+    case 3:
         if (ctx->vga->big_endian_fb) {
             st24_be_p(dst, value);
         } else {
             st24_le_p(dst, value);
         }
-    } else {
-        if (ctx->need_swap) {
-            bswap32s(&value);
-        }
-        stn_he_p(dst, bypp, value);
+        break;
+    case 4:
+        stl_he_p(dst, value);
+        break;
+    default:
+        g_assert_not_reached();
     }
 }
 
@@ -787,6 +823,7 @@ static bool ati_2d_do_blt_direct(const ATI2DCtx *ctx, QemuRect vis_src,
     {
         bool fallback = false;
         bool overlap;
+        size_t row_bytes = (size_t)vis_dst.width * bypp;
 
         overlap = !ctx->host_data_active &&
                   ati_2d_rects_overlap_in_vram(ctx, &vis_src, &vis_dst);
@@ -826,12 +863,18 @@ static bool ati_2d_do_blt_direct(const ATI2DCtx *ctx, QemuRect vis_src,
                     j += (vis_src.y + vis_dst.height - 1 - y)
                          * ctx->src_stride;
                 }
-                if (overlap &&
-                    ctx->src_vram_offset + j <
-                    ctx->dst_vram_offset + i + vis_dst.width * bypp &&
-                    ctx->dst_vram_offset + i <
-                    ctx->src_vram_offset + j + vis_dst.width * bypp) {
-                    if (ctx->left_to_right) {
+                if (overlap) {
+                    uint64_t src = ctx->src_vram_offset + j;
+                    uint64_t dst = ctx->dst_vram_offset + i;
+                    bool row_overlap = src < dst + row_bytes &&
+                                       dst < src + row_bytes;
+                    bool bulk_safe = (ctx->left_to_right && dst <= src) ||
+                                     (!ctx->left_to_right && dst >= src);
+
+                    if (!row_overlap || bulk_safe) {
+                        memmove(&ctx->dst_bits[i], &ctx->src_bits[j],
+                                row_bytes);
+                    } else if (ctx->left_to_right) {
                         for (x = 0; x < vis_dst.width; x++) {
                             memmove(&ctx->dst_bits[i + x * bypp],
                                     &ctx->src_bits[j + x * bypp], bypp);
@@ -844,7 +887,7 @@ static bool ati_2d_do_blt_direct(const ATI2DCtx *ctx, QemuRect vis_src,
                     }
                 } else {
                     memmove(&ctx->dst_bits[i], &ctx->src_bits[j],
-                            vis_dst.width * bypp);
+                            row_bytes);
                 }
             }
         }
@@ -1183,7 +1226,7 @@ static bool ati_host_data_blit_pixels(ATIVGAState *s, const ATI2DCtx *ctx,
 {
     ATI2DCtx chunk = *ctx;
     QemuRect visible;
-    uint8_t stack_buf[128 * sizeof(uint32_t)] = { 0 };
+    QEMU_UNINITIALIZED uint8_t stack_buf[128 * sizeof(uint32_t)];
     g_autofree uint8_t *heap_buf = NULL;
     uint8_t *pix_buf = stack_buf;
     unsigned int bypp = ctx->bpp / 8;
@@ -1201,13 +1244,17 @@ static bool ati_host_data_blit_pixels(ATIVGAState *s, const ATI2DCtx *ctx,
               ctx->dst.height - 1 - s->host_data.row;
     stride = QEMU_ALIGN_UP(count * bypp, sizeof(uint32_t));
     if (stride > sizeof(stack_buf)) {
-        heap_buf = g_malloc0(stride);
+        heap_buf = g_malloc(stride);
         pix_buf = heap_buf;
     }
     for (unsigned int i = 0; i < count; i++) {
         unsigned int buf_col = ctx->left_to_right ? i : count - 1 - i;
 
         ati_store_pixel(ctx, &pix_buf[buf_col * bypp], pixels[i]);
+    }
+    /* Pixel stores initialize the payload; pixman may also read its padding. */
+    for (unsigned int i = count * bypp; i < stride; i++) {
+        pix_buf[i] = 0;
     }
 
     chunk.src_bits = pix_buf;

@@ -27,6 +27,16 @@
 #ifndef QEMU_OSDEP_H
 #define QEMU_OSDEP_H
 
+/* Keep these definitions before the libc and GLib headers below. */
+#ifdef QEMU_DISABLE_DEBUG_ASSERTS
+#ifndef NDEBUG
+#define NDEBUG 1
+#endif
+#ifndef G_DISABLE_ASSERT
+#define G_DISABLE_ASSERT 1
+#endif
+#endif
+
 #if !defined _FORTIFY_SOURCE && defined __OPTIMIZE__ && __OPTIMIZE__ && defined __linux__
 # define _FORTIFY_SOURCE 2
 #endif
@@ -299,19 +309,14 @@ void QEMU_ERROR("code path is reachable")
 #define WCOREDUMP(status) 0
 #endif
 /*
- * We have a lot of unaudited code that may fail in strange ways, or
- * even be a security risk during migration, if you disable assertions
- * at compile-time.  You may comment out these safety checks if you
- * absolutely want to disable assertion overhead, but it is not
- * supported upstream so the risk is all yours.  Meanwhile, please
- * submit patches to remove any side-effects inside an assertion, or
- * fixing error handling that should use Error instead of assert.
+ * Some QEMU code has not been audited for dependencies on assertions.
+ * QEMU_DISABLE_DEBUG_ASSERTS explicitly opts in despite that risk.
  */
-#ifdef NDEBUG
-#error building with NDEBUG is not supported
+#if defined(NDEBUG) && !defined(QEMU_DISABLE_DEBUG_ASSERTS)
+#error NDEBUG is only supported with QEMU_DISABLE_DEBUG_ASSERTS
 #endif
-#ifdef G_DISABLE_ASSERT
-#error building with G_DISABLE_ASSERT is not supported
+#if defined(G_DISABLE_ASSERT) && !defined(QEMU_DISABLE_DEBUG_ASSERTS)
+#error G_DISABLE_ASSERT is only supported with QEMU_DISABLE_DEBUG_ASSERTS
 #endif
 
 #ifndef OFF_MAX

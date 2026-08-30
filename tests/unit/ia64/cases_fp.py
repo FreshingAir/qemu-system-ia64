@@ -5488,6 +5488,26 @@ test_frcpa_double_normal_reciprocal = require_registers(
     "exception": IA64_EXCP_NONE,
 }, entry=0x10)
 
+test_fmov_preserves_integer_register_format = require_registers(
+    "fmov_preserves_integer_register_format", [
+        (0x10, *movl_mlx(2, 3)),
+        (0x20, *movl_mlx(3, 5)),
+        (0x30, 0x09, setf_sig(6, 2), setf_sig(7, 3), nop_i()),
+        (0x40, 0x0d, nop_m(), fmov(8, 6), nop_i()),
+        (0x50, 0x1d, nop_m(), xma_l(9, 0, 6, 7), nop_b()),
+        (0x60, 0x0d, nop_m(), fmov(10, 9), nop_i()),
+        (0x70, 0x09, getf_sig(4, 8), getf_sig(5, 10), nop_i()),
+        (0x80, 0x10, nop_m(), nop_i(), br_cond(0x80, 0x80)),
+    ], {
+        "ip": 0x80,
+        "r4": 3,
+        "r5": 15,
+        "f8": ExpectedFP(3, 0x1003e),
+        "f10": ExpectedFP(15, 0x1003e),
+        "ar_fpsr": DEFAULT_FPSR,
+        "exception": IA64_EXCP_NONE,
+    }, entry=0x10)
+
 test_frcpa_wre1_uses_raw_exponents = require_registers(
     "frcpa_wre1_uses_raw_exponents", [
         (0x10, 0x01, addl(3, 0x200, 0), addl(4, 0x208, 0),
@@ -6187,6 +6207,7 @@ CASE_NAMES = (
     'fminmax_scalar_tie_uses_f3',
     'fminmax_unnormal_sets_d',
     'fminmax_wre1_selects_raw_operand',
+    'fmov_preserves_integer_register_format',
     'fmpy_masked_invalid_negative_qnan',
     'fmpy_dynamic_wre0_enabled_exact_underflow_wraps',
     'fmpy_dynamic_wre0_extended_precision_rounds_once',
