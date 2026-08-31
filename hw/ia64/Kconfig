@@ -125,6 +125,7 @@ config IA64_VPC_GRAPHICS
     depends on IA64_VPC
     select ATI_VGA
     select VGA_PCI
+    imply QXL
 
 config IA64_VPC_NETWORK
     bool
