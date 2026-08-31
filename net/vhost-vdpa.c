@@ -259,6 +259,7 @@ static bool vhost_vdpa_get_vnet_hash_supported_types(NetClientState *nc,
     VhostVDPAState *s = DO_UPCAST(VhostVDPAState, nc, nc);
     uint64_t features = s->vhost_vdpa.dev->features;
     int fd = s->vhost_vdpa.shared->device_fd;
+    int ret;
     struct {
         struct vhost_vdpa_config hdr;
         uint32_t supported_hash_types;
@@ -272,7 +273,11 @@ static bool vhost_vdpa_get_vnet_hash_supported_types(NetClientState *nc,
     config.hdr.off = offsetof(struct virtio_net_config, supported_hash_types);
     config.hdr.len = sizeof(config.supported_hash_types);
 
-    assert(!ioctl(fd, VHOST_VDPA_GET_CONFIG, &config));
+    ret = ioctl(fd, VHOST_VDPA_GET_CONFIG, &config);
+    assert(ret == 0);
+    if (ret != 0) {
+        return false;
+    }
     *types = le32_to_cpu(config.supported_hash_types);
 
     return true;

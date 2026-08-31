@@ -158,14 +158,10 @@ Use ``qemu-system-ia64w.exe`` to run without a separate console window.
 Performance build
 -----------------
 
-For guest-performance measurements, use a dedicated IA-64-only build without
-compiler and linker hardening passes that add overhead to TCG helper calls.
-This example requires an x86-64-v2 host (SSE4.2 and POPCNT), retains QEMU's
-runtime dispatch to newer AVX implementations, and disables debug information,
-QOM cast checks, and tracing.  QEMU intentionally rejects ``NDEBUG`` builds,
-so its regular assertions remain enabled.  ``--disable-hardening`` also
-reverses linker defaults: it disables ELF RELRO or the Windows PE ASLR, DEP,
-and NO_SEH opt-in bits, as applicable.
+The following IA-64-only configuration uses ``-O3`` and LTO, targets
+x86-64-v2, and disables assertions.  ``QEMU_DISABLE_DEBUG_ASSERTS`` propagates
+``NDEBUG`` and ``G_DISABLE_ASSERT`` to C, C++, and Objective-C sources and
+disables assertion-dependent debug options.
 
 .. code-block:: sh
 
@@ -182,7 +178,7 @@ and NO_SEH opt-in bits, as applicable.
        --disable-hardening \
        --disable-pie \
        --enable-trace-backends=nop \
-       --extra-cflags='-fomit-frame-pointer -ffunction-sections -fdata-sections' \
+       --extra-cflags='-DQEMU_DISABLE_DEBUG_ASSERTS -fomit-frame-pointer -ffunction-sections -fdata-sections' \
        --extra-cxxflags='-fomit-frame-pointer -ffunction-sections -fdata-sections' \
        --extra-ldflags='-Wl,-O2 -Wl,--gc-sections -no-pie' \
        -Doptimization=3 \
@@ -193,9 +189,7 @@ and NO_SEH opt-in bits, as applicable.
 
 Meson's ``--enable-strip`` applies when installing targets rather than when
 copying them directly from the build directory, hence the explicit ``strip``
-above.  Keep a separate hardened or debug build for untrusted guests and
-correctness testing.  For a comparison build that will run only on x86-64-v3
-hosts, use ``--x86-version=3`` instead.
+above.
 
 Profile-guided optimization
 ---------------------------

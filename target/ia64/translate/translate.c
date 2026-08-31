@@ -1252,6 +1252,35 @@ TCGv_i64 ia64_gen_fr_special_read(uint8_t reg)
     return tags;
 }
 
+/*
+ * Plain fmov can copy both the compact binary representation and a tagged
+ * integer significand directly.  NaTVal and extended-register values still
+ * need the architectural helper.  Route a lone integer-origin tag through the
+ * helper as well because it is not a valid compact representation.  The
+ * paired significand and integer-origin tags produced by setf.sig/xma are
+ * deliberately accepted.
+ */
+TCGv_i64 ia64_gen_fr_fmov_slow_read(uint8_t reg)
+{
+    TCGv_i64 tags;
+    TCGv_i64 orphan_origin;
+
+    if (reg <= 1) {
+        return tcg_constant_i64(0);
+    }
+
+    tags = tcg_temp_new_i64();
+    orphan_origin = tcg_temp_new_i64();
+    tcg_gen_andc_i64(orphan_origin, cpu_fr_int_origin[reg / 64],
+                     cpu_fr_sig[reg / 64]);
+    tcg_gen_or_i64(tags, cpu_fr_nat[reg / 64],
+                   cpu_fr_ext_valid[reg / 64]);
+    tcg_gen_or_i64(tags, tags, orphan_origin);
+    tcg_gen_shri_i64(tags, tags, reg % 64);
+    tcg_gen_andi_i64(tags, tags, 1);
+    return tags;
+}
+
 static void ia64_gen_fr_ext_clear(uint8_t reg)
 {
     if (reg <= 1) {

@@ -335,6 +335,7 @@ static IA64BootInfo i2000_machine_boot_info(
     HPIA64MachineState *hp = HP_IA64_MACHINE(machine);
     const uint64_t low_ram_end = hp->descriptor_low_ram_end;
     const uint64_t cpu_assist_base = low_ram_end - IA64_FW_BOOT_STACK_SIZE;
+    bool applied;
     IA64BootInfo info = {
         .firmware_base = IA64_I2000_460GX_TEST_FIRMWARE_BASE,
         .firmware_entry = entry,
@@ -354,7 +355,8 @@ static IA64BootInfo i2000_machine_boot_info(
         .platform_addresses_valid = true,
     };
 
-    g_assert(hp_ia64_machine_apply_platform_firmware_args(hp, &info));
+    applied = hp_ia64_machine_apply_platform_firmware_args(hp, &info);
+    g_assert(applied);
     return info;
 }
 

@@ -58,14 +58,23 @@ bool cpr_exec_persist_state(QEMUFile *f, Error **errp)
     return true;
 }
 
-static int cpr_exec_find_state(void)
+static int cpr_exec_find_state(Error **errp)
 {
-    const char *val = g_getenv(CPR_EXEC_STATE_NAME);
+    g_autofree char *val = g_strdup(g_getenv(CPR_EXEC_STATE_NAME));
     int mfd;
+    int ret;
 
-    assert(val);
     g_unsetenv(CPR_EXEC_STATE_NAME);
-    assert(!qemu_strtoi(val, NULL, 10, &mfd));
+    if (!val) {
+        error_setg(errp, "%s is not set", CPR_EXEC_STATE_NAME);
+        return -1;
+    }
+    ret = qemu_strtoi(val, NULL, 10, &mfd);
+    if (ret < 0 || mfd < 0) {
+        error_setg(errp, "%s does not contain a valid file descriptor",
+                   CPR_EXEC_STATE_NAME);
+        return -1;
+    }
     return mfd;
 }
 
@@ -76,12 +85,13 @@ bool cpr_exec_has_state(void)
 
 void cpr_exec_unpersist_state(void)
 {
-    int mfd;
-    const char *val = g_getenv(CPR_EXEC_STATE_NAME);
+    Error *err = NULL;
+    int mfd = cpr_exec_find_state(&err);
 
-    g_unsetenv(CPR_EXEC_STATE_NAME);
-    assert(val);
-    assert(!qemu_strtoi(val, NULL, 10, &mfd));
+    if (mfd < 0) {
+        error_report_err(err);
+        return;
+    }
     close(mfd);
 }
 
@@ -104,7 +114,11 @@ QEMUFile *cpr_exec_output(Error **errp)
 
 QEMUFile *cpr_exec_input(Error **errp)
 {
-    int mfd = cpr_exec_find_state();
+    int mfd = cpr_exec_find_state(errp);
+
+    if (mfd < 0) {
+        return NULL;
+    }
 
     lseek(mfd, 0, SEEK_SET);
     return qemu_file_new_fd_input(mfd, CPR_EXEC_STATE_NAME);

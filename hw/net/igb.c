@@ -421,7 +421,8 @@ static void igb_pci_realize(PCIDevice *pci_dev, Error **errp)
     macaddr = s->conf.macaddr.a;
 
     /* Add PCI capabilities in reverse order */
-    assert(pcie_endpoint_cap_init(pci_dev, 0xa0) > 0);
+    ret = pcie_endpoint_cap_init(pci_dev, 0xa0);
+    assert(ret > 0);
 
     igb_init_msix(s);
 

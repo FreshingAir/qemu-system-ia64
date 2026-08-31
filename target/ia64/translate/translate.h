@@ -148,6 +148,7 @@ TCGv_i64 ia64_gen_fr_sig_mask_read(uint32_t word, uint64_t mask);
 TCGv_i64 ia64_fr_significand_src(uint8_t reg);
 TCGv_i64 ia64_gen_fr_nat_read(uint8_t reg);
 TCGv_i64 ia64_gen_fr_special_read(uint8_t reg);
+TCGv_i64 ia64_gen_fr_fmov_slow_read(uint8_t reg);
 TCGv_i64 ia64_fr_binary_src(uint8_t reg);
 TCGv_i64 ia64_gen_gr_nat_read(uint8_t reg);
 bool ia64_gr_nat_is_known_clear(const Ia64Instruction *insn, uint8_t reg);

@@ -41,6 +41,7 @@
 #define HP_QUADRO2_PRAMIN       UINT64_C(0x00700000)
 #define HP_QUADRO2_PFIFO_INTR_0 UINT64_C(0x00002100)
 #define HP_QUADRO2_PFIFO_RAMHT  UINT64_C(0x00002210)
+#define HP_QUADRO2_PFIFO_RAMFC  UINT64_C(0x00002214)
 #define HP_QUADRO2_PFIFO_MODE   UINT64_C(0x00002504)
 #define HP_QUADRO2_PFIFO_PUSH1  UINT64_C(0x00003204)
 #define HP_QUADRO2_PFIFO_DMA_PUSH UINT64_C(0x00003220)
@@ -2410,64 +2411,116 @@ static void ati_blit_visible_intersection(void)
 
 static void ati_reverse_overlap_blit(void)
 {
-    const unsigned pitch = 64;
+    enum { PITCH = 64 };
+    static const struct {
+        const char *args;
+        uint64_t fb;
+        uint64_t mmio;
+        unsigned int pitch_value;
+        bool inclusive_scissor;
+    } devices[] = {
+        {
+            "-machine ia64-vpc,nvram=none -m 256M -S "
+            "-vga ati -global ati-vga.model=rage128p",
+            IA64_ATI_FB_BASE, IA64_ATI_MMIO_BASE, PITCH / 8, true,
+        }, {
+            "-machine ia64-vpc,nvram=none -m 256M -S "
+            "-vga ati -global ati-vga.model=rv100",
+            IA64_RV100_FB_BASE, IA64_RV100_MMIO_BASE, PITCH, false,
+        }, {
+            "-machine ia64-vpc,nvram=none -m 256M -S "
+            "-vga ati -global ati-vga.model=es1000",
+            IA64_RV100_FB_BASE, IA64_RV100_MMIO_BASE, PITCH, false,
+        },
+    };
     uint8_t initial[32];
     uint8_t expected[32];
     uint8_t actual[32];
-    QTestState *qts;
-    unsigned i;
+    size_t device;
+    size_t i;
 
     for (i = 0; i < sizeof(initial); i++) {
         initial[i] = i;
     }
-    memcpy(expected, initial, sizeof(expected));
-    memmove(&expected[4], &expected[0], 16);
 
-    qts = qtest_init("-machine ia64-vpc,nvram=none -m 256M -S "
-                     "-vga ati -global ati-vga.model=rage128p");
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DEFAULT_SC_BOTTOM_RIGHT,
-                 0x1fff1fff);
-    qtest_memwrite(qts, IA64_ATI_FB_BASE, initial, sizeof(initial));
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_OFFSET, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_PITCH, pitch / 8);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SRC_OFFSET, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SRC_PITCH, pitch / 8);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SC_TOP_LEFT, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SC_BOTTOM_RIGHT,
-                 (1U << 16) | (pitch - 1));
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DP_CNTL, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DP_GUI_MASTER_CNTL,
-                 ATI_GMC_WR_MSK_DIS | ATI_GMC_SRC_PITCH |
-                 ATI_GMC_DST_PITCH |
-                 ATI_GMC_DST_CLIPPING | ATI_GMC_DST_8BPP |
-                 ATI_GMC_SRC_COLOR | ATI_GMC_ROP3_SRCCOPY |
-                 ATI_GMC_DP_SRC_RECT);
-    g_assert_cmphex(qtest_readl(qts, IA64_ATI_MMIO_BASE + ATI_DP_CNTL), ==,
-                    ATI_DST_LTR_TTB);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DP_CNTL, ATI_DST_RTL_TTB);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SRC_X, 15);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SRC_Y, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_X, 19);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_Y, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_HEIGHT, 1);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_WIDTH, 16);
+    for (device = 0; device < ARRAY_SIZE(devices); device++) {
+        const uint64_t fb = devices[device].fb;
+        const uint64_t mmio = devices[device].mmio;
+        uint32_t scissor_right = devices[device].inclusive_scissor ?
+                                 PITCH - 1 : PITCH;
+        QTestState *qts = qtest_init(devices[device].args);
 
-    qtest_memread(qts, IA64_ATI_FB_BASE, actual, sizeof(actual));
-    g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+        qtest_writel(qts, mmio + ATI_DEFAULT_SC_BOTTOM_RIGHT, 0x1fff1fff);
+        qtest_writel(qts, mmio + ATI_DST_OFFSET, 0);
+        qtest_writel(qts, mmio + ATI_DST_PITCH, devices[device].pitch_value);
+        qtest_writel(qts, mmio + ATI_SRC_OFFSET, 0);
+        qtest_writel(qts, mmio + ATI_SRC_PITCH, devices[device].pitch_value);
+        qtest_writel(qts, mmio + ATI_SC_TOP_LEFT, 0);
+        qtest_writel(qts, mmio + ATI_SC_BOTTOM_RIGHT,
+                     (1U << 16) | scissor_right);
+        qtest_writel(qts, mmio + ATI_DP_CNTL, 0);
+        qtest_writel(qts, mmio + ATI_DP_GUI_MASTER_CNTL,
+                     ATI_GMC_WR_MSK_DIS | ATI_GMC_SRC_PITCH |
+                     ATI_GMC_DST_PITCH |
+                     ATI_GMC_DST_CLIPPING | ATI_GMC_DST_8BPP |
+                     ATI_GMC_SRC_COLOR | ATI_GMC_ROP3_SRCCOPY |
+                     ATI_GMC_DP_SRC_RECT);
+        g_assert_cmphex(qtest_readl(qts, mmio + ATI_DP_CNTL), ==,
+                        devices[device].inclusive_scissor ?
+                        ATI_DST_LTR_TTB : ATI_DST_RTL_TTB);
 
-    /* A deliberately wrong X direction propagates overwritten source data. */
-    memcpy(expected, initial, sizeof(expected));
-    for (i = 0; i < 16; i++) {
-        expected[4 + i] = expected[i];
+        /* Rightward overlap is safe only when pixels are visited RTL. */
+        memcpy(expected, initial, sizeof(expected));
+        memmove(&expected[4], &expected[0], 16);
+        qtest_memwrite(qts, fb, initial, sizeof(initial));
+        qtest_writel(qts, mmio + ATI_DP_CNTL, ATI_DST_RTL_TTB);
+        qtest_writel(qts, mmio + ATI_SRC_X, 15);
+        qtest_writel(qts, mmio + ATI_SRC_Y, 0);
+        qtest_writel(qts, mmio + ATI_DST_X, 19);
+        qtest_writel(qts, mmio + ATI_DST_Y, 0);
+        qtest_writel(qts, mmio + ATI_DST_HEIGHT, 1);
+        qtest_writel(qts, mmio + ATI_DST_WIDTH, 16);
+        qtest_memread(qts, fb, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+
+        /* A deliberately wrong LTR direction propagates overwritten data. */
+        memcpy(expected, initial, sizeof(expected));
+        for (i = 0; i < 16; i++) {
+            expected[4 + i] = expected[i];
+        }
+        qtest_memwrite(qts, fb, initial, sizeof(initial));
+        qtest_writel(qts, mmio + ATI_DP_CNTL, ATI_DST_LTR_TTB);
+        qtest_writel(qts, mmio + ATI_SRC_X, 0);
+        qtest_writel(qts, mmio + ATI_DST_X, 4);
+        qtest_writel(qts, mmio + ATI_DST_WIDTH, 16);
+        qtest_memread(qts, fb, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+
+        /* Leftward overlap is safe only when pixels are visited LTR. */
+        memcpy(expected, initial, sizeof(expected));
+        memmove(&expected[0], &expected[4], 16);
+        qtest_memwrite(qts, fb, initial, sizeof(initial));
+        qtest_writel(qts, mmio + ATI_DP_CNTL, ATI_DST_LTR_TTB);
+        qtest_writel(qts, mmio + ATI_SRC_X, 4);
+        qtest_writel(qts, mmio + ATI_DST_X, 0);
+        qtest_writel(qts, mmio + ATI_DST_WIDTH, 16);
+        qtest_memread(qts, fb, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+
+        /* A deliberately wrong RTL direction propagates overwritten data. */
+        memcpy(expected, initial, sizeof(expected));
+        for (i = 16; i-- > 0;) {
+            expected[i] = expected[4 + i];
+        }
+        qtest_memwrite(qts, fb, initial, sizeof(initial));
+        qtest_writel(qts, mmio + ATI_DP_CNTL, ATI_DST_RTL_TTB);
+        qtest_writel(qts, mmio + ATI_SRC_X, 19);
+        qtest_writel(qts, mmio + ATI_DST_X, 15);
+        qtest_writel(qts, mmio + ATI_DST_WIDTH, 16);
+        qtest_memread(qts, fb, actual, sizeof(actual));
+        g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+        qtest_quit(qts);
     }
-    qtest_memwrite(qts, IA64_ATI_FB_BASE, initial, sizeof(initial));
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DP_CNTL, ATI_DST_LTR_TTB);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_SRC_X, 0);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_X, 4);
-    qtest_writel(qts, IA64_ATI_MMIO_BASE + ATI_DST_WIDTH, 16);
-    qtest_memread(qts, IA64_ATI_FB_BASE, actual, sizeof(actual));
-    g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
-    qtest_quit(qts);
 }
 
 static void ati_source_scissor(void)
@@ -8879,6 +8932,8 @@ static void nvidia_quadro2_pgraph_trap(void)
         DMA_INSTANCE = 0x1b000,
         OBJECT_INSTANCE = 0x1b010,
         PUSH_OFFSET = 0x380000,
+        RAMFC_BASE = 0x18000,
+        RAMFC_OFFSET = RAMFC_BASE + CHANNEL * 32,
     };
     const uint32_t object_handle = 0x82000001;
     const uint32_t trapped_data = 0x51a7c0de;
@@ -8897,6 +8952,7 @@ static void nvidia_quadro2_pgraph_trap(void)
         push[i] = cpu_to_le32(push[i]);
     }
     qtest_memset(qts, ramin + 0x10000, 0, 4096);
+    qtest_memset(qts, ramin + RAMFC_BASE, 0, 32 * 32);
     qtest_writel(qts, ramin + DMA_INSTANCE, 0x0000303d);
     qtest_writel(qts, ramin + DMA_INSTANCE + 4, sizeof(push) - 1);
     qtest_writel(qts, ramin + DMA_INSTANCE + 8, PUSH_OFFSET);
@@ -8907,6 +8963,7 @@ static void nvidia_quadro2_pgraph_trap(void)
                    push, sizeof(push));
 
     qtest_writel(qts, mmio + HP_QUADRO2_PFIFO_RAMHT, 0x03000100);
+    qtest_writel(qts, mmio + HP_QUADRO2_PFIFO_RAMFC, RAMFC_BASE >> 8);
     qtest_writel(qts, mmio + HP_QUADRO2_PFIFO_MODE, 1U << CHANNEL);
     qtest_writel(qts, mmio + HP_QUADRO2_PFIFO_PUSH1,
                  CHANNEL | (1U << 8));
@@ -8938,6 +8995,13 @@ static void nvidia_quadro2_pgraph_trap(void)
                      4 * sizeof(uint32_t));
     g_assert_cmphex(qtest_readl(qts, mmio + HP_QUADRO2_PFIFO_REF_CNT), ==,
                     0);
+    g_assert_cmpuint(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x00), ==,
+                     sizeof(push));
+    g_assert_cmpuint(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x04), ==,
+                     4 * sizeof(uint32_t));
+    g_assert_cmphex(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x08), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x0c), ==,
+                    (2U << 16) | (DMA_INSTANCE >> 4));
 
     /* PIO methods cannot replace the latched trap while PGRAPH is stopped. */
     quadro2_user_write(qts, CHANNEL, SUBCHANNEL, 0x110, 0xdeadbeef);
@@ -8959,6 +9023,12 @@ static void nvidia_quadro2_pgraph_trap(void)
                      sizeof(push));
     g_assert_cmphex(qtest_readl(qts, mmio + HP_QUADRO2_PFIFO_REF_CNT), ==,
                     ref_marker);
+    g_assert_cmpuint(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x04), ==,
+                     sizeof(push));
+    g_assert_cmphex(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x08), ==,
+                    ref_marker);
+    g_assert_cmphex(qtest_readl(qts, ramin + RAMFC_OFFSET + 0x0c), ==,
+                    (3U << 16) | (DMA_INSTANCE >> 4));
     qtest_system_reset(qts);
     g_assert_cmphex(qtest_readl(qts,
                                 mmio + HP_QUADRO2_PGRAPH_FIFO_ACCESS), ==,

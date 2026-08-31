@@ -145,8 +145,14 @@ qcow2_crypto_hdr_init_func(QCryptoBlock *block, size_t headerlen, void *opaque,
      * header (eg only 1 out of 8 key slots will be initialized)
      */
     clusterlen = size_to_clusters(s, headerlen) * s->cluster_size;
-    assert(qcow2_pre_write_overlap_check(bs, 0, ret, clusterlen, false) == 0);
-    ret = bdrv_co_pwrite_zeroes(bs->file, ret, clusterlen, 0);
+    ret = qcow2_pre_write_overlap_check(bs, 0, s->crypto_header.offset,
+                                        clusterlen, false);
+    if (ret < 0) {
+        error_setg_errno(errp, -ret, "Qcow2 overlap check failed");
+        return ret;
+    }
+    ret = bdrv_co_pwrite_zeroes(bs->file, s->crypto_header.offset,
+                                clusterlen, 0);
     if (ret < 0) {
         error_setg_errno(errp, -ret, "Could not zero fill encryption header");
         return -1;

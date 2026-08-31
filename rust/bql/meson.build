@@ -2,7 +2,7 @@ _bql_cfg = run_command(rustc_args,
   '--config-headers', config_host_h, '--features', files('Cargo.toml'),
   capture: true, check: true).stdout().strip().splitlines()
 
-if get_option('debug_mutex')
+if debug_mutex
   _bql_cfg += ['--cfg', 'feature="debug_cell"']
 endif
 

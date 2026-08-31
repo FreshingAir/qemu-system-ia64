@@ -33,6 +33,7 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
     TCGv_i64 value;
     TCGv_i64 exponent;
     TCGLabel *slow = NULL;
+    TCGLabel *significand = NULL;
     TCGLabel *done = NULL;
 
     if (op->destination <= 1) {
@@ -42,8 +43,19 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
     if (op->source1 > 1) {
         slow = gen_new_label();
         done = gen_new_label();
-        tcg_gen_brcondi_i64(TCG_COND_NE,
-                            ia64_gen_fr_special_read(op->source1), 0, slow);
+        if (mode == IA64_FP_COPY) {
+            significand = gen_new_label();
+            tcg_gen_brcondi_i64(TCG_COND_NE,
+                                ia64_gen_fr_fmov_slow_read(op->source1),
+                                0, slow);
+            tcg_gen_brcondi_i64(TCG_COND_NE,
+                                ia64_gen_fr_sig_read(op->source1),
+                                0, significand);
+        } else {
+            tcg_gen_brcondi_i64(TCG_COND_NE,
+                                ia64_gen_fr_special_read(op->source1),
+                                0, slow);
+        }
     }
 
     value = tcg_temp_new_i64();
@@ -97,6 +109,13 @@ static void ia64_gen_fp_copy(const Ia64Instruction *insn,
         return;
     }
     tcg_gen_br(done);
+
+    if (significand) {
+        gen_set_label(significand);
+        ia64_gen_fr_mov_sig(op->destination,
+                            ia64_fr_significand_src(op->source1));
+        tcg_gen_br(done);
+    }
 
     gen_set_label(slow);
     switch (mode) {

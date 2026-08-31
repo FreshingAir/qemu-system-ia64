@@ -392,12 +392,15 @@ static void zx1_test_detach_roots(IA64ZX6000ZX1TestState *s)
 
     for (root = IA64_ZX6000_ZX1_TEST_ROOT_COUNT - 1;
          root >= 0; root--) {
+        bool detached;
+
         if (!s->roots_attached[root]) {
             continue;
         }
         /* PCI children are removed before fixture teardown. */
-        g_assert(hp_zx1_mio_detach_pci_root(
-            s->mio, hp_zx1_ioa_bus(s->ioas[root]), &error_abort));
+        detached = hp_zx1_mio_detach_pci_root(
+            s->mio, hp_zx1_ioa_bus(s->ioas[root]), &error_abort);
+        g_assert(detached);
         s->roots_attached[root] = false;
     }
 }

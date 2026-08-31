@@ -2188,6 +2188,62 @@ static bool mmu_lookup(CPUState *cpu, vaddr addr, MemOpIdx oi,
 }
 
 /*
+ * Return the host address for a load served by the victim entry pinned for a
+ * sustained two-page conflict.  The successful case follows a miss in the
+ * generated direct-mapped TLB and avoids rebuilding the full MMULookupLocals
+ * state for clean RAM already validated by victim_tlb_pingpong_direct().
+ *
+ * Keep all cases that can require architectural side effects on the normal
+ * lookup path: instruction fetches, plugin callbacks, cross-page accesses,
+ * alignment faults, MMIO, watchpoints, dirty handling, and forced slow paths.
+ */
+static bool victim_tlb_pingpong_load_haddr(CPUState *cpu, vaddr addr,
+                                           MemOpIdx oi, int size,
+                                           MMUAccessType access_type,
+                                           void **haddr)
+{
+    int mmu_idx;
+    MemOp memop;
+    int a_bits;
+    vaddr page;
+    uintptr_t index;
+    CPUTLBDesc *desc;
+    CPUTLBEntry *entry;
+    CPUTLBEntryFull *full;
+
+    if (access_type != MMU_DATA_LOAD || cpu_plugin_mem_cbs_enabled(cpu)) {
+        return false;
+    }
+
+    mmu_idx = get_mmuidx(oi);
+    memop = get_memop(oi);
+    tcg_debug_assert(mmu_idx < NB_MMU_MODES);
+    tcg_debug_assert(memop_size(memop) == size);
+    page = addr & TARGET_PAGE_MASK;
+    desc = &cpu->neg.tlb.d[mmu_idx];
+
+    if (!desc->victim_tlb_pingpong_pinned ||
+        desc->victim_tlb_pingpong_peer_page != page ||
+        size > TARGET_PAGE_SIZE - (addr & ~TARGET_PAGE_MASK)) {
+        return false;
+    }
+
+    a_bits = memop_tlb_alignment_bits(memop, false);
+    if (addr & ((1 << a_bits) - 1)) {
+        return false;
+    }
+
+    index = tlb_index(cpu, mmu_idx, addr);
+    if (!victim_tlb_pingpong_direct(cpu, mmu_idx, index, access_type,
+                                    page, &entry, &full)) {
+        return false;
+    }
+
+    *haddr = (void *)((uintptr_t)addr + entry->addend);
+    return true;
+}
+
+/*
  * Probe for an atomic operation.  Do not allow unaligned operations,
  * or io operations to proceed.  Return the host address.
  */
@@ -2693,9 +2749,14 @@ static uint8_t do_ld1_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                           uintptr_t ra, MMUAccessType access_type)
 {
     MMULookupLocals l;
+    void *haddr;
     bool crosspage;
 
     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (victim_tlb_pingpong_load_haddr(cpu, addr, oi, 1, access_type,
+                                       &haddr)) {
+        return *(uint8_t *)haddr;
+    }
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     tcg_debug_assert(!crosspage);
 
@@ -2706,11 +2767,19 @@ static uint16_t do_ld2_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                            uintptr_t ra, MMUAccessType access_type)
 {
     MMULookupLocals l;
+    void *haddr;
     bool crosspage;
     uint16_t ret;
     uint8_t a, b;
 
     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (victim_tlb_pingpong_load_haddr(cpu, addr, oi, 2, access_type,
+                                       &haddr)) {
+        MemOp memop = get_memop(oi);
+
+        ret = load_atom_2(cpu, ra, haddr, memop);
+        return memop & MO_BSWAP ? bswap16(ret) : ret;
+    }
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     if (likely(!crosspage)) {
         return do_ld_2(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
@@ -2731,10 +2800,18 @@ static uint32_t do_ld4_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                            uintptr_t ra, MMUAccessType access_type)
 {
     MMULookupLocals l;
+    void *haddr;
     bool crosspage;
     uint32_t ret;
 
     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (victim_tlb_pingpong_load_haddr(cpu, addr, oi, 4, access_type,
+                                       &haddr)) {
+        MemOp memop = get_memop(oi);
+
+        ret = load_atom_4(cpu, ra, haddr, memop);
+        return memop & MO_BSWAP ? bswap32(ret) : ret;
+    }
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     if (likely(!crosspage)) {
         return do_ld_4(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);
@@ -2752,10 +2829,18 @@ static uint64_t do_ld8_mmu(CPUState *cpu, vaddr addr, MemOpIdx oi,
                            uintptr_t ra, MMUAccessType access_type)
 {
     MMULookupLocals l;
+    void *haddr;
     bool crosspage;
     uint64_t ret;
 
     cpu_req_mo(cpu, TCG_MO_LD_LD | TCG_MO_ST_LD);
+    if (victim_tlb_pingpong_load_haddr(cpu, addr, oi, 8, access_type,
+                                       &haddr)) {
+        MemOp memop = get_memop(oi);
+
+        ret = load_atom_8(cpu, ra, haddr, memop);
+        return memop & MO_BSWAP ? bswap64(ret) : ret;
+    }
     crosspage = mmu_lookup(cpu, addr, oi, ra, access_type, &l);
     if (likely(!crosspage)) {
         return do_ld_8(cpu, &l.page[0], l.mmu_idx, access_type, l.memop, ra);

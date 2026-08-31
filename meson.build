@@ -92,6 +92,50 @@ if host_os == 'darwin' and \
   objc = meson.get_compiler('objc')
 endif
 
+# Propagate the assertion macros to QEMU and bundled host code.
+debug_asserts_disabled = cc.has_define('QEMU_DISABLE_DEBUG_ASSERTS')
+if debug_asserts_disabled
+  # Removing assert expressions can leave symbols referenced only by them.
+  assert_disabled_warning_flags = [
+    '-Wno-error=unused-but-set-variable',
+    '-Wno-error=unused-variable',
+    '-Wno-error=unused-function',
+  ]
+  assert_disabled_cflags = \
+    cc.get_supported_arguments(assert_disabled_warning_flags)
+  add_global_arguments('-DQEMU_DISABLE_DEBUG_ASSERTS',
+                       '-DNDEBUG', '-DG_DISABLE_ASSERT',
+                       assert_disabled_cflags,
+                       native: false, language: 'c')
+  if 'cpp' in all_languages
+    assert_disabled_cxxflags = \
+      cxx.get_supported_arguments(assert_disabled_warning_flags +
+                                  ['-U_GLIBCXX_ASSERTIONS'])
+    add_global_arguments('-DQEMU_DISABLE_DEBUG_ASSERTS',
+                         '-DNDEBUG', '-DG_DISABLE_ASSERT',
+                         assert_disabled_cxxflags,
+                         native: false, language: 'cpp')
+  endif
+  if 'objc' in all_languages
+    assert_disabled_objcflags = \
+      objc.get_supported_arguments(assert_disabled_warning_flags)
+    add_global_arguments('-DQEMU_DISABLE_DEBUG_ASSERTS',
+                         '-DNDEBUG', '-DG_DISABLE_ASSERT',
+                         assert_disabled_objcflags,
+                         native: false, language: 'objc')
+  endif
+endif
+
+debug_graph_lock = get_option('debug_graph_lock') and \
+                   not debug_asserts_disabled
+debug_mutex = get_option('debug_mutex') and not debug_asserts_disabled
+debug_stack_usage = get_option('debug_stack_usage') and \
+                    not debug_asserts_disabled
+debug_tcg = get_option('debug_tcg') and not debug_asserts_disabled
+debug_remap = get_option('debug_remap') and not debug_asserts_disabled
+qom_cast_debug = get_option('qom_cast_debug') and \
+                 not debug_asserts_disabled
+
 have_rust = add_languages('rust', native: false,
     required: get_option('rust').disable_auto_if(not have_system))
 have_rust = have_rust and add_languages('rust', native: true,
@@ -2620,17 +2664,17 @@ config_host_data.set_quoted('CONFIG_HOST_DSOSUF', host_dsosuf)
 config_host_data.set('HAVE_HOST_BLOCK_DEVICE', have_host_block_device)
 
 have_coroutine_pool = get_option('coroutine_pool')
-if get_option('debug_stack_usage') and have_coroutine_pool
+if debug_stack_usage and have_coroutine_pool
   message('Disabling coroutine pool to measure stack usage')
   have_coroutine_pool = false
 endif
 config_host_data.set('CONFIG_COROUTINE_POOL', have_coroutine_pool)
-config_host_data.set('CONFIG_DEBUG_GRAPH_LOCK', get_option('debug_graph_lock'))
-config_host_data.set('CONFIG_DEBUG_MUTEX', get_option('debug_mutex'))
-config_host_data.set('CONFIG_DEBUG_STACK_USAGE', get_option('debug_stack_usage'))
-config_host_data.set('CONFIG_DEBUG_TCG', get_option('debug_tcg'))
-config_host_data.set('CONFIG_DEBUG_REMAP', get_option('debug_remap'))
-config_host_data.set('CONFIG_QOM_CAST_DEBUG', get_option('qom_cast_debug'))
+config_host_data.set('CONFIG_DEBUG_GRAPH_LOCK', debug_graph_lock)
+config_host_data.set('CONFIG_DEBUG_MUTEX', debug_mutex)
+config_host_data.set('CONFIG_DEBUG_STACK_USAGE', debug_stack_usage)
+config_host_data.set('CONFIG_DEBUG_TCG', debug_tcg)
+config_host_data.set('CONFIG_DEBUG_REMAP', debug_remap)
+config_host_data.set('CONFIG_QOM_CAST_DEBUG', qom_cast_debug)
 config_host_data.set('CONFIG_REPLICATION', get_option('replication').allowed())
 config_host_data.set('CONFIG_FSFREEZE', qga_fsfreeze)
 config_host_data.set('CONFIG_FSTRIM', qga_fstrim)
@@ -4766,7 +4810,7 @@ summary_info += {'Trace backends':    ','.join(get_option('trace_backends'))}
 if 'simple' in get_option('trace_backends')
   summary_info += {'Trace output file': get_option('trace_file') + '-<pid>'}
 endif
-summary_info += {'QOM debugging':     get_option('qom_cast_debug')}
+summary_info += {'QOM debugging':     qom_cast_debug}
 summary_info += {'Compiler/linker hardening': get_option('hardening')}
 summary_info += {'Relocatable install': get_option('relocatable')}
 summary_info += {'vhost-kernel support': have_vhost_kernel}
@@ -4827,13 +4871,14 @@ if 'objc' in all_languages
 endif
 summary_info += {'QEMU_LDFLAGS':      ' '.join(qemu_ldflags)}
 summary_info += {'link-time optimization (LTO)': get_option('b_lto')}
+summary_info += {'assertions disabled': debug_asserts_disabled}
 summary_info += {'PIE':               get_option('b_pie')}
 summary_info += {'static build':      get_option('prefer_static')}
 summary_info += {'malloc trim support': has_malloc_trim}
 summary_info += {'membarrier':        have_membarrier}
-summary_info += {'debug graph lock':  get_option('debug_graph_lock')}
-summary_info += {'debug stack usage': get_option('debug_stack_usage')}
-summary_info += {'mutex debugging':   get_option('debug_mutex')}
+summary_info += {'debug graph lock':  debug_graph_lock}
+summary_info += {'debug stack usage': debug_stack_usage}
+summary_info += {'mutex debugging':   debug_mutex}
 summary_info += {'memory allocator':  get_option('malloc')}
 summary_info += {'avx2 optimization': config_host_data.get('CONFIG_AVX2_OPT')}
 summary_info += {'avx512bw optimization': config_host_data.get('CONFIG_AVX512BW_OPT')}
@@ -4888,9 +4933,9 @@ if config_all_accel.has_key('CONFIG_TCG')
     summary_info += {'TCG backend':   'native (@0@)'.format(cpu)}
   endif
   summary_info += {'TCG plugins':       get_option('plugins')}
-  summary_info += {'TCG debug enabled': get_option('debug_tcg')}
+  summary_info += {'TCG debug enabled': debug_tcg}
   if have_linux_user or have_bsd_user
-    summary_info += {'syscall buffer debugging support': get_option('debug_remap')}
+    summary_info += {'syscall buffer debugging support': debug_remap}
   endif
 endif
 summary_info += {'target list':       ' '.join(target_dirs)}
