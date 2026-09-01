@@ -80,6 +80,7 @@ struct HPZX1IOAState {
     HPIOSAPICDeliver deliver;
     void *delivery_opaque;
     bool setup_done;
+    char root_bus_name[8];
     char root_bus_path[8];
 };
 
@@ -688,7 +689,9 @@ static void hp_zx1_ioa_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    bus = pci_register_root_bus(dev, "pci", hp_zx1_ioa_set_irq,
+    snprintf(s->root_bus_name, sizeof(s->root_bus_name), "pci.%x",
+             s->baseline.secondary_bus);
+    bus = pci_register_root_bus(dev, s->root_bus_name, hp_zx1_ioa_set_irq,
                                 hp_zx1_ioa_map_irq, s, &s->pci_mem,
                                 &s->pci_io, PCI_DEVFN(0, 0),
                                 hp_zx1_ioa_external_inputs(s),

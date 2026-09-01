@@ -224,8 +224,6 @@ void ia64_gen_check_alignment_only(const Ia64Instruction *insn,
 void ia64_gen_check_alignment(DisasContext *ctx,
                               const Ia64Instruction *insn, TCGv_i64 addr,
                               uint32_t size, bool always_fault, bool is_write);
-void ia64_gen_invalidate_alat_store(DisasContext *ctx, TCGv_i64 addr,
-                                    uint32_t size);
 void ia64_gen_check_fr_nat_consumption(const Ia64Instruction *insn,
                                        uint8_t reg, uint64_t isr_access);
 void ia64_gen_memory_acquire(const Ia64Instruction *insn);

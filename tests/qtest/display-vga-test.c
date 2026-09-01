@@ -35,8 +35,8 @@
 #define PCI_COMMAND_IO_MEMORY_MASTER 0x0007
 #define IA64_VGA_LEGACY_BASE   0x00000000000a0000ULL
 #define HP_QUADRO2_LEGACY_IO_BASE UINT64_C(0x0000000ffc000000)
-#define HP_QUADRO2_FB_BASE      UINT64_C(0x90000000)
-#define HP_QUADRO2_MMIO_BASE    UINT64_C(0x98000000)
+#define HP_QUADRO2_FB_BASE      UINT64_C(0xe8000000)
+#define HP_QUADRO2_MMIO_BASE    UINT64_C(0xe7000000)
 #define HP_QUADRO2_VRAM_SIZE    (64U * 1024U * 1024U)
 #define HP_QUADRO2_PRAMIN       UINT64_C(0x00700000)
 #define HP_QUADRO2_PFIFO_INTR_0 UINT64_C(0x00002100)
@@ -82,6 +82,8 @@
 #define HP_QUADRO2_RAMHT_GRAPHICS (1U << 16)
 #define HP_QUADRO2_CHANNEL_SIZE 0x10000U
 #define HP_QUADRO2_SUBCHANNEL_SIZE 0x2000U
+#define ATI_MM_INDEX           0x0000
+#define ATI_MM_DATA            0x0004
 #define ATI_GEN_INT_STATUS     0x0044
 #define ATI_CLOCK_CNTL_INDEX   0x0008
 #define ATI_CLOCK_CNTL_DATA    0x000c
@@ -510,6 +512,50 @@ static void ati_es1000_realize(void)
 
     qts = qtest_initf("%s-vga none -device ati-vga,model=es1000",
                       machine_args());
+    qtest_quit(qts);
+}
+
+static void ati_rv100_mm_aper(void)
+{
+    QTestState *qts;
+
+    qts = qtest_init("-machine ia64-vpc,nvram=none -m 256M -S "
+                     "-vga ati -global ati-vga.model=rv100");
+    ati_pci_enable(qts);
+
+    qtest_writel(qts, IA64_RV100_MMIO_BASE + ATI_MM_INDEX, 0x80000004);
+    qtest_writel(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA, 0x11223344);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_FB_BASE + 4), ==,
+                    0x11223344);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA),
+                    ==, 0x11223344);
+
+    qtest_writel(qts, IA64_RV100_MMIO_BASE + ATI_MM_INDEX, UINT32_MAX);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_MMIO_BASE + ATI_MM_INDEX),
+                    ==, 0xfffffffc);
+    qtest_writel(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA, 0xaabbccdd);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_FB_BASE +
+                                    ATI_TEST_VRAM_SIZE - 4), ==,
+                    0xaabbccdd);
+    qtest_writel(qts, IA64_RV100_FB_BASE + ATI_TEST_VRAM_SIZE - 4,
+                 0x55667788);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA),
+                    ==, 0x55667788);
+
+    qtest_writel(qts, IA64_RV100_MMIO_BASE + ATI_MM_INDEX, 0x81000007);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_MMIO_BASE + ATI_MM_INDEX),
+                    ==, 0x81000004);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA),
+                    ==, 0x11223344);
+    qtest_writeb(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA + 1, 0x5a);
+    qtest_writew(qts, IA64_RV100_MMIO_BASE + ATI_MM_DATA + 2, 0xc3d4);
+    g_assert_cmphex(qtest_readb(qts, IA64_RV100_MMIO_BASE +
+                                    ATI_MM_DATA + 1), ==, 0x5a);
+    g_assert_cmphex(qtest_readw(qts, IA64_RV100_MMIO_BASE +
+                                    ATI_MM_DATA + 2), ==, 0xc3d4);
+    g_assert_cmphex(qtest_readl(qts, IA64_RV100_FB_BASE + 4), ==,
+                    0xc3d45a44);
+
     qtest_quit(qts);
 }
 
@@ -9069,6 +9115,8 @@ int main(int argc, char **argv)
         qtest_has_device("ati-vga")) {
         qtest_add_func("/display/pci/ati-es1000-realize",
                        ati_es1000_realize);
+        qtest_add_func("/display/pci/ati-rv100-mm-aper",
+                       ati_rv100_mm_aper);
         qtest_add_func("/display/pci/ati-es1000-crtc-2d",
                        ati_es1000_crtc_2d);
         qtest_add_func("/display/pci/ati-rage128-host-data-migration",

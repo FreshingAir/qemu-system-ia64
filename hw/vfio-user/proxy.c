@@ -22,6 +22,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/thread.h"
 #include "system/iothread.h"
+#include "system/physmem.h"
 
 static IOThread *vfio_user_iothread;
 
@@ -1014,6 +1015,11 @@ void vfio_user_disconnect(VFIOUserProxy *proxy)
 
     while (proxy->state != VFIO_PROXY_CLOSED) {
         qemu_cond_wait(&proxy->close_cv, &proxy->lock);
+    }
+
+    if (proxy->external_writer) {
+        proxy->external_writer = false;
+        physical_memory_write_external_end();
     }
 
     /* we now hold the only ref to proxy */

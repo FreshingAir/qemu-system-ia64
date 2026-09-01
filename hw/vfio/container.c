@@ -29,6 +29,53 @@
 static QLIST_HEAD(, VFIOAddressSpace) vfio_address_spaces =
     QLIST_HEAD_INITIALIZER(vfio_address_spaces);
 
+typedef struct VFIOWritableDMAMapping {
+    IntervalTreeNode interval;
+} VFIOWritableDMAMapping;
+
+static bool vfio_dma_range_last(hwaddr iova, uint64_t size, hwaddr *last)
+{
+    if (!size || size - 1 > UINT64_MAX - iova) {
+        return false;
+    }
+
+    *last = iova + size - 1;
+    return true;
+}
+
+static void vfio_writable_dma_mapping_remove(VFIOContainer *bcontainer,
+                                             hwaddr iova, uint64_t size,
+                                             bool unmap_all)
+{
+    IntervalTreeNode *node, *next;
+    hwaddr last;
+
+    if (unmap_all) {
+        iova = 0;
+        last = UINT64_MAX;
+        bcontainer->writable_dma_untrackable = false;
+    } else if (!vfio_dma_range_last(iova, size, &last)) {
+        return;
+    }
+
+    for (node = interval_tree_iter_first(&bcontainer->writable_dma_mappings,
+                                         iova, last);
+         node; node = next) {
+        next = interval_tree_iter_next(node, iova, last);
+        if (unmap_all || (node->start >= iova && node->last <= last)) {
+            interval_tree_remove(node, &bcontainer->writable_dma_mappings);
+            g_free(container_of(node, VFIOWritableDMAMapping, interval));
+        }
+    }
+
+    if (bcontainer->writable_dma_external_writer &&
+        interval_tree_is_empty(&bcontainer->writable_dma_mappings) &&
+        !bcontainer->writable_dma_untrackable) {
+        bcontainer->writable_dma_external_writer = false;
+        physical_memory_write_external_end();
+    }
+}
+
 VFIOAddressSpace *vfio_address_space_get(AddressSpace *as)
 {
     VFIOAddressSpace *space;
@@ -81,16 +128,58 @@ int vfio_container_dma_map(VFIOContainer *bcontainer,
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
     RAMBlock *rb = mr->ram_block;
     int mfd = rb ? qemu_ram_get_fd(rb) : -1;
+    VFIOWritableDMAMapping *mapping = NULL;
+    bool start_external_writer = false;
+    bool untrackable = false;
+    hwaddr last;
+    int ret;
+
+    g_assert(!vioc->dma_mapping_deferred || vioc->release_external_writer);
+    qemu_mutex_lock(&bcontainer->dma_map_lock);
+
+    if (!readonly && vfio_dma_range_last(iova, size, &last)) {
+        mapping = g_new(VFIOWritableDMAMapping, 1);
+        mapping->interval.start = iova;
+        mapping->interval.last = last;
+    } else if (!readonly) {
+        untrackable = true;
+    }
+
+    if (!readonly && !bcontainer->writable_dma_external_writer) {
+        physical_memory_write_external_begin();
+        start_external_writer = true;
+    }
 
     if (mfd >= 0 && vioc->dma_map_file) {
         unsigned long start = vaddr - qemu_ram_get_host_addr(rb);
         unsigned long offset = qemu_ram_get_fd_offset(rb);
 
-        return vioc->dma_map_file(bcontainer, iova, size, mfd, start + offset,
-                                  readonly);
+        ret = vioc->dma_map_file(bcontainer, iova, size, mfd, start + offset,
+                                 readonly);
+    } else {
+        g_assert(vioc->dma_map);
+        ret = vioc->dma_map(bcontainer, iova, size, vaddr, readonly, mr);
     }
-    g_assert(vioc->dma_map);
-    return vioc->dma_map(bcontainer, iova, size, vaddr, readonly, mr);
+
+    if (ret && !vioc->dma_mapping_deferred) {
+        if (start_external_writer) {
+            physical_memory_write_external_cancel();
+        }
+        g_free(mapping);
+    } else if (!readonly) {
+        if (mapping) {
+            interval_tree_insert(&mapping->interval,
+                                 &bcontainer->writable_dma_mappings);
+        } else if (untrackable) {
+            bcontainer->writable_dma_untrackable = true;
+        }
+        if (start_external_writer) {
+            bcontainer->writable_dma_external_writer = true;
+        }
+    }
+
+    qemu_mutex_unlock(&bcontainer->dma_map_lock);
+    return ret;
 }
 
 int vfio_container_dma_unmap(VFIOContainer *bcontainer,
@@ -98,9 +187,18 @@ int vfio_container_dma_unmap(VFIOContainer *bcontainer,
                              IOMMUTLBEntry *iotlb, bool unmap_all)
 {
     VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
+    VFIODMAUnmapResult result = { 0 };
+    int ret;
 
     g_assert(vioc->dma_unmap);
-    return vioc->dma_unmap(bcontainer, iova, size, iotlb, unmap_all);
+    qemu_mutex_lock(&bcontainer->dma_map_lock);
+    ret = vioc->dma_unmap(bcontainer, iova, size, iotlb, unmap_all, &result);
+    if (!ret && !vioc->dma_mapping_deferred && result.executed &&
+        result.complete) {
+        vfio_writable_dma_mapping_remove(bcontainer, iova, size, unmap_all);
+    }
+    qemu_mutex_unlock(&bcontainer->dma_map_lock);
+    return ret;
 }
 
 bool vfio_container_add_section_window(VFIOContainer *bcontainer,
@@ -312,6 +410,7 @@ static void vfio_container_instance_finalize(Object *obj)
 {
     VFIOContainer *bcontainer = VFIO_IOMMU(obj);
     VFIOGuestIOMMU *giommu, *tmp;
+    IntervalTreeNode *node;
 
     QLIST_SAFE_REMOVE(bcontainer, next);
 
@@ -322,6 +421,21 @@ static void vfio_container_instance_finalize(Object *obj)
         g_free(giommu);
     }
 
+    while ((node = interval_tree_iter_first(
+                &bcontainer->writable_dma_mappings, 0, UINT64_MAX))) {
+        interval_tree_remove(node, &bcontainer->writable_dma_mappings);
+        g_free(container_of(node, VFIOWritableDMAMapping, interval));
+    }
+    if (bcontainer->writable_dma_external_writer) {
+        VFIOIOMMUClass *vioc = VFIO_IOMMU_GET_CLASS(bcontainer);
+
+        if (vioc->release_external_writer) {
+            vioc->release_external_writer(bcontainer);
+        } else {
+            physical_memory_write_external_end();
+        }
+    }
+    qemu_mutex_destroy(&bcontainer->dma_map_lock);
     g_list_free_full(bcontainer->iova_ranges, g_free);
 }
 
@@ -333,6 +447,7 @@ static void vfio_container_instance_init(Object *obj)
     bcontainer->dirty_pages_supported = false;
     bcontainer->dma_max_mappings = 0;
     bcontainer->iova_ranges = NULL;
+    qemu_mutex_init(&bcontainer->dma_map_lock);
     QLIST_INIT(&bcontainer->giommu_list);
     QLIST_INIT(&bcontainer->vrdl_list);
 }

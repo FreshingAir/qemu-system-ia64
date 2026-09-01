@@ -1117,16 +1117,7 @@ static int64_t pal_proc_feature_set_status(CPUIA64State *env,
     }
 
     if (model == IA64_CPU_MODEL_MADISON) {
-        /*
-         * The second-generation reference manual documents configurable
-         * early deferral, and operating systems query the Madison family
-         * through implementation-specific feature set 16.  Public product
-         * documentation does not provide the complete set-16 bitmap, while
-         * TCG has no speculative-load timing or RSB microarchitecture to
-         * back such controls.  Recognize the documented set boundary but
-         * advertise no features rather than inventing bits or promising
-         * behavior that the emulator cannot provide.
-         */
+        /* Madison recognizes feature set 16 and exposes no feature bits. */
         return feature_set == 16 ?
             PAL_STATUS_SUCCESS : PAL_STATUS_BEYOND_MAX;
     }
@@ -1140,6 +1131,7 @@ static int64_t pal_proc_feature_set_status(CPUIA64State *env,
 
 static void pal_proc_get_features(CPUIA64State *env)
 {
+    IA64CPUClass *icc = ia64_env_cpu_class(env);
     uint64_t feature_set = env->gr[IA64_PAL_GR_ARG2];
 
     env->gr[IA64_PAL_GR_RESULT1] = 0;
@@ -1156,23 +1148,15 @@ static void pal_proc_get_features(CPUIA64State *env)
     if (env->gr[IA64_PAL_GR_STATUS] == PAL_STATUS_SUCCESS &&
         feature_set == 18) {
         /*
-         * Montecito documents bit 5 (instruction-cache coherence
-         * filtering), bit 7 (enhanced ld.bias/lfetch.excl), and bit 18
-         * (Hyper-Threading) in feature set 18.  It also documents an L2D
-         * victimization control without publishing its bit number; omit
-         * that control instead of assigning a guessed ABI value.
-         *
-         * TCG has no cycle-accurate cache allocation or coherence-filtering
-         * model, so bits 5 and 7 are PAL-visible configuration state only.
-         * Keeping them stateful gives firmware and operating systems the
-         * required GET/SET round trip without falsely changing
-         * architectural instruction behavior.
+         * Feature set 18 contains instruction-cache coherence filtering,
+         * enhanced exclusive prefetch, and optional Hyper-Threading bits.
          */
-        env->gr[IA64_PAL_GR_RESULT1] = PAL_PROC_MONTECITO_AVAILABLE;
+        env->gr[IA64_PAL_GR_RESULT1] =
+            icc->pal_proc_feature_available;
         env->gr[IA64_PAL_GR_RESULT2] =
             env->pal.pal_proc_feature_status;
         env->gr[IA64_PAL_GR_RESULT3] =
-            PAL_PROC_MONTECITO_CONTROLLABLE;
+            icc->pal_proc_feature_controllable;
     }
 }
 
@@ -1447,6 +1431,7 @@ static void pal_bus_set_features(CPUIA64State *env)
 
 static void pal_proc_set_features(CPUIA64State *env)
 {
+    IA64CPUClass *icc = ia64_env_cpu_class(env);
     uint64_t requested = env->gr[IA64_PAL_GR_ARG1];
     uint64_t feature_set = env->gr[IA64_PAL_GR_ARG2];
 
@@ -1457,15 +1442,11 @@ static void pal_proc_set_features(CPUIA64State *env)
             pal_proc_feature_set_status(env, feature_set);
         if (env->gr[IA64_PAL_GR_STATUS] == PAL_STATUS_SUCCESS &&
             feature_set == 18) {
-            /*
-             * PAL requires unavailable and uncontrollable selections to be
-             * ignored.  Preserve the read-only HT status while updating the
-             * two documented Montecito controls.
-             */
+            /* Unavailable and uncontrollable feature selections are ignored. */
             env->pal.pal_proc_feature_status =
                 (env->pal.pal_proc_feature_status &
-                 ~PAL_PROC_MONTECITO_CONTROLLABLE) |
-                (requested & PAL_PROC_MONTECITO_CONTROLLABLE);
+                 ~icc->pal_proc_feature_controllable) |
+                (requested & icc->pal_proc_feature_controllable);
         }
     }
     env->gr[IA64_PAL_GR_RESULT1] = 0;

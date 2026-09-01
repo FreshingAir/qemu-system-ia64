@@ -31,6 +31,7 @@ from .encoding import (
     IA64_ISR_ED,
     IA64_ISR_EI_SHIFT,
     IA64_ISR_NA,
+    IA64_ISR_NI,
     IA64_ISR_R,
     IA64_ISR_SP,
     IA64_ISR_W,
@@ -96,15 +97,14 @@ from .encoding import (
     ld1_reg_postinc,
     ld1_sa_postinc,
     ld2,
-    ld2_c_clr,
     ld2_c_clr_reg_update,
-    ld2_sa,
     ld4,
     ld4_a,
     ld4_bias,
     ld4_c_clr,
     ld4_c_clr_acq,
     ld4_c_nc,
+    ld4_sa,
     ld8,
     ld8_a,
     ld8_c_clr,
@@ -352,6 +352,17 @@ test_zero_alat_check_load_always_reloads = require_registers(
         (0x100, 0x00, 0x123456789abcdef0, 0,
          0),
     ], {"ip": 0x50, "r4": CHECK_LOAD_DATA}, entry=0x10, alat=None)
+
+test_smp_full_alat_request_uses_zero_model = require_registers(
+    "smp_full_alat_request_uses_zero_model", [
+        (0x10, 0x00, addl(3, 0x100, 0), nop_i(), nop_i()),
+        (0x20, 0x00, ld8_a(4, 3), nop_i(), nop_i()),
+        (0x30, *movl_mlx(4, 0x55)),
+        (0x40, 0x00, ld8_c_nc(4, 3), nop_i(), nop_i()),
+        (0x50, 0x10, nop_m(), nop_i(), br_cond(0x50, 0x50)),
+        (0x100, 0x00, 0x123456789abcdef0, 0, 0),
+    ], {"ip": 0x50, "r4": CHECK_LOAD_DATA}, entry=0x10,
+    alat="full", smp="2")
 
 test_zero_alat_chk_a_always_branches = require_registers(
     "zero_alat_chk_a_always_branches", [
@@ -926,6 +937,51 @@ test_store_invalidates_advanced_load = require_registers(
          0),
     ], {"ip": 0x70, "r4": 0xfeedfacecafebeef}, entry=0x10)
 
+
+def test_store_fault_longjmp_closes_alat_writer(qemu):
+    """Verify that a faulting store closes its active-writer scope."""
+    data_addr = 0x300
+    value = 0x123456789abcdef0
+
+    run_program(qemu, [
+        (0x10, *movl_mlx(3, 0x400000)),
+        (0x20, *movl_mlx(4, 0x55)),
+        # The handler retries the store; the ALAT hit checks the active count.
+        (0x30, 0x00, adds(5, 0, 0), adds(6, 0x50, 0), nop_i()),
+        (0x40, 0x00, ssm(IA64_PSR_IC | IA64_PSR_DT), nop_i(), nop_i()),
+        (0x50, 0x00, st8(3, 4), nop_i(), nop_i()),
+        (0x60, 0x00, addl(7, data_addr, 0), nop_i(), nop_i()),
+        (0x70, 0x00, ld8_a(8, 7), nop_i(), nop_i()),
+        (0x80, *movl_mlx(8, 0xaa)),
+        (0x90, 0x00, ld8_c_nc(8, 7), nop_i(), nop_i()),
+        (0xa0, 0x10, nop_m(), nop_i(), br_cond(0xa0, 0xa0)),
+        (IA64_ALT_DTLB_VECTOR, 0x09,
+         mov_m_gr_cr(5, 16), mov_m_gr_cr(6, 19), nop_i()),
+        (IA64_ALT_DTLB_VECTOR + 0x10, 0x11,
+         nop_m(), nop_i(), rfi_b()),
+        raw_bundle(data_addr, value, 0),
+    ], entry=0x10, terminal_ip=0xa0, expected={
+        "exception": IA64_EXCP_NONE,
+        "r8": 0xaa,
+    }, name="store_fault_longjmp_closes_alat_writer",
+       smp="1", memory="4G")
+
+
+test_rse_spill_preserves_static_alat_entry = require_registers(
+    "rse_spill_preserves_static_alat_entry", [
+        (0x10, *movl_mlx(2, 0x100000)),
+        (0x20, 0x00, mov_m_gr_ar(2, 18), addl(3, 0x200, 0),
+         nop_i()),
+        (0x30, 0x00, ld8_a(4, 3), nop_i(), nop_i()),
+        (0x40, *movl_mlx(4, 0x55)),
+        (0x50, 0x00, alloc_m(35, 96, 0, 0, 0), nop_i(), nop_i()),
+        (0x60, *movl_mlx(127, 0x123456789abcdef0)),
+        (0x70, 0x00, flushrs_enc(), nop_i(), nop_i()),
+        (0x80, 0x00, ld8_c_nc(4, 3), nop_i(), nop_i()),
+        (0x90, 0x10, nop_m(), nop_i(), br_cond(0x90, 0x90)),
+        (0x200, 0x00, 0xfeedfacecafebeef, 0, 0),
+    ], {"ip": 0x90, "r4": 0x55}, entry=0x10)
+
 test_semaphore_ops_invalidate_advanced_loads = require_registers(
     "semaphore_ops_invalidate_advanced_loads", [
         (0x10, 0x00, addl(3, 0x200, 0), addl(4, 0x10, 0),
@@ -1400,6 +1456,12 @@ test_nat_consumption_sets_ifa_isr = require_registers(
     ], {"ip": 0x5620, "exception": IA64_EXCP_NONE, "r14": 0,
         "r15": IA64_ISR_CODE_REG_NAT | IA64_ISR_R},
     entry=0x10)
+
+test_nat_consumption_ic0_preserves_ifa = register_nat_consumption_test(
+    "nat_consumption_ic0_preserves_ifa",
+    (0x00, mov_m_gr_ar(16, 65), nop_i(), nop_i()),
+    IA64_ISR_NI | (1 << IA64_ISR_EI_SHIFT), enable_ic=False,
+    initial_ifa=0x1122334455667788)
 
 test_nat_store_data_consumption_is_access = require_registers(
     "nat_store_data_consumption_is_access", [
@@ -1902,7 +1964,7 @@ test_ld8_sa_instruction_ed_survives_data_soft_tlb_warmup = \
 test_unaligned_check_load_sets_isr_ed = require_registers(
     "unaligned_check_load_sets_isr_ed", [
         (0x10, *movl_mlx(18, LOW_VECTOR_TR_PTE | PTE_ED)),
-        (0x20, 0x00, nop_m(), addl(3, 0x101, 0),
+        (0x20, 0x00, nop_m(), addl(3, 0x102, 0),
          nop_i()),
         (0x30, *movl_mlx(19, IA64_PSR_IC | IA64_PSR_IT | IA64_PSR_AC)),
         (0x40, 0x00, adds(7, 16 << 2, 0), adds(5, 5, 0),
@@ -1914,9 +1976,9 @@ test_unaligned_check_load_sets_isr_ed = require_registers(
         (0x70, 0x00, srlz_i(), adds(31, 0x430, 0),
          nop_i()),
         *rfi_to_gr(0x80, 19, 31),
-        (0x4000430, 0x00, ld2_sa(30, 3), nop_i(),
+        (0x4000430, 0x00, ld4_sa(30, 3), nop_i(),
          nop_i()),
-        (0x4000440, 0x00, ld2_c_clr(30, 3), nop_i(),
+        (0x4000440, 0x00, ld4_c_clr(30, 3), nop_i(),
          nop_i()),
         (0x4000000 + IA64_UNALIGNED_VECTOR, 0x00,
          mov_m_cr_gr(14, 20),
@@ -1934,9 +1996,29 @@ test_unaligned_check_load_sets_isr_ed = require_registers(
     ], {
         "ip": IA64_UNALIGNED_VECTOR + 0x30,
         "exception": IA64_EXCP_NONE,
-        "r14": 0x101,
+        "r14": 0x102,
         "r15": IA64_ISR_R | IA64_ISR_ED,
         "r16": 0x430,
+    }, entry=0x10)
+
+test_unaligned_check_load_full_alat_hit_skips_access = require_registers(
+    "unaligned_check_load_full_alat_hit_skips_access", [
+        *dtr_setup_bundles(0x10, HIGH_TR_BASE + 0x102, 0x400102),
+        (0x70, *movl_mlx(3, HIGH_TR_BASE + 0x102)),
+        (0x80, 0x00, ssm(IA64_PSR_DT), nop_i(), nop_i()),
+        (0x90, 0x00, srlz_d(), nop_i(), nop_i()),
+        # Allocate while AC is clear, then enable alignment checking before
+        # the check load.  An ALAT hit performs no misaligned memory access.
+        (0xa0, 0x00, ld4_sa(22, 3), nop_i(), nop_i()),
+        (0xb0, *movl_mlx(22, 0x55)),
+        (0xc0, 0x00, sum_um(IA64_PSR_AC), nop_i(), nop_i()),
+        (0xd0, 0x00, ld4_c_clr(22, 3), nop_i(), nop_i()),
+        (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xe0)),
+        (0x400100, 0x00, 0x1122334455667788, 0, 0),
+    ], {
+        "ip": 0xe0,
+        "exception": IA64_EXCP_NONE,
+        "r22": 0x55,
     }, entry=0x10)
 
 test_ld8_s_d2_hint_decode = require_registers("ld8_s_d2_hint_decode", [
@@ -3647,6 +3729,7 @@ CASE_NAMES = (
     'montecito_uc_fp_store_crossing_8byte_window_faults',
     'nat_clear_tb_speculative_exit_rechecks_flags',
     'nat_clear_self_loop_prefix_rechecks_facts',
+    'nat_consumption_ic0_preserves_ifa',
     'nat_consumption_sets_ifa_isr',
     'nat_store_base_consumption_is_access',
     'nat_store_data_consumption_is_access',
@@ -3660,9 +3743,11 @@ CASE_NAMES = (
     'non_speculative_attribute_returns_failure_values',
     'pshl_nat_propagates',
     'pshr_nat_propagates',
+    'rse_spill_preserves_static_alat_entry',
     'semaphore_ops_clear_result_nat',
     'semaphore_ops_invalidate_advanced_loads',
     'simd_helper_nat_propagates',
+    'smp_full_alat_request_uses_zero_model',
     'speculative_load_defers_nat_base',
     'speculative_load_defers_psr_ed',
     'speculative_load_handler_psr_ed_defers_retry',
@@ -3686,6 +3771,7 @@ CASE_NAMES = (
     'st8_spill_nated_source_writes_zero',
     'st8_spill_updates_unat_bit',
     'store_invalidates_advanced_load',
+    'store_fault_longjmp_closes_alat_writer',
     'store_postinc_x6_38_reserved_illegal_operation',
     'store_postinc_x6_39_reserved_illegal_operation',
     'store_postinc_x6_3a_reserved_illegal_operation',
@@ -3700,6 +3786,7 @@ CASE_NAMES = (
     'unimplemented_physical_load_merced_44bit',
     'unimplemented_physical_precludes_unaligned',
     'unimplemented_virtual_load_merced_54bit',
+    'unaligned_check_load_full_alat_hit_skips_access',
     'unaligned_check_load_sets_isr_ed',
     'xchg4_decode',
     'xchg4_result_base_alias_invalidates_alat',

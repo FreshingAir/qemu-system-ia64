@@ -67,7 +67,7 @@ static void test_fixed_layout(void)
     g_assert_cmphex(layout.i82559.class_id, ==, 0x0200);
     g_assert_cmphex(layout.i82559.subsystem_vendor_id, ==, 0x8086);
     g_assert_cmphex(layout.i82559.subsystem_id, ==, 0x0040);
-    g_assert_cmpuint(layout.i82559.revision, ==, 0x0c);
+    g_assert_cmpuint(layout.i82559.revision, ==, 0x08);
     g_assert_cmpuint(layout.i82559.prog_if, ==, 0);
     g_assert_cmpuint(layout.i82559_interrupt_pin, ==, 1);
     g_assert_cmpuint(layout.i82559_pid_pin, ==, 16);
@@ -82,22 +82,22 @@ static void test_fixed_layout(void)
     g_assert_cmpuint(layout.i82559_option_rom_enabled, ==, 0);
 
     g_assert_cmpuint(layout.isp12160_parent_root, ==, 1);
-    g_assert_cmpuint(layout.isp12160_bus, ==, 0x20);
-    g_assert_cmpuint(layout.isp12160_slot, ==, 2);
+    g_assert_cmpuint(layout.isp12160_bus, ==, 0x01);
+    g_assert_cmpuint(layout.isp12160_slot, ==, 0);
     g_assert_cmpuint(layout.isp12160.function, ==, 0);
     g_assert_cmphex(layout.isp12160.vendor_id, ==, 0x1077);
     g_assert_cmphex(layout.isp12160.device_id, ==, 0x1216);
     g_assert_cmphex(layout.isp12160.class_id, ==, 0x0100);
-    g_assert_cmphex(layout.isp12160.subsystem_vendor_id, ==, 0);
-    g_assert_cmphex(layout.isp12160.subsystem_id, ==, 0);
-    g_assert_cmpuint(layout.isp12160.revision, ==, 0);
+    g_assert_cmphex(layout.isp12160.subsystem_vendor_id, ==, 0x1077);
+    g_assert_cmphex(layout.isp12160.subsystem_id, ==, 0x0007);
+    g_assert_cmpuint(layout.isp12160.revision, ==, 0x06);
     g_assert_cmpuint(layout.isp12160.prog_if, ==, 0);
     g_assert_cmpuint(layout.isp12160_interrupt_pin, ==, 1);
     g_assert_cmpuint(layout.isp12160_pid_pin, ==, 20);
     g_assert_cmphex(layout.isp12160_io_bar_base, ==, 0x5000);
     g_assert_cmphex(layout.isp12160_io_bar_size, ==, 0x100);
     g_assert_cmphex(layout.isp12160_mmio_bar_base, ==, 0xa0010000);
-    g_assert_cmphex(layout.isp12160_mmio_bar_size, ==, 0x100);
+    g_assert_cmphex(layout.isp12160_mmio_bar_size, ==, 0x1000);
     g_assert_cmpuint(layout.isp12160_option_rom_enabled, ==, 0);
 
     g_assert_cmphex(layout.pic_master.base, ==, 0x20);

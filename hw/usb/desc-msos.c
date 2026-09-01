@@ -3,31 +3,8 @@
 #include "desc.h"
 
 /*
- * Microsoft OS Descriptors
- *
- * Windows tries to fetch some special descriptors with information
- * specifically for windows.  Presence is indicated using a special
- * string @ index 0xee.  There are two kinds of descriptors:
- *
- * compatid descriptor
- *   Used to bind drivers, if usb class isn't specific enough.
- *   Used for PTP/MTP for example (both share the same usb class).
- *
- * properties descriptor
- *   Does carry registry entries.  They show up in
- *   HLM\SYSTEM\CurrentControlSet\Enum\USB\<devid>\<serial>\Device Parameters
- *
- * Note that Windows caches the stuff it got in the registry, so when
- * playing with this you have to delete registry subtrees to make
- * windows query the device again:
- *   HLM\SYSTEM\CurrentControlSet\Control\usbflags
- *   HLM\SYSTEM\CurrentControlSet\Enum\USB
- * Windows will complain it can't delete entries on the second one.
- * It has deleted everything it had permissions too, which is enough
- * as this includes "Device Parameters".
- *
- * http://msdn.microsoft.com/en-us/library/windows/hardware/ff537430.aspx
- *
+ * Microsoft OS 1.0 descriptors expose compatible IDs and registry properties
+ * through vendor requests advertised by string descriptor index 0xee.
  */
 
 /* ------------------------------------------------------------------ */
@@ -139,7 +116,7 @@ static int usb_desc_msos_prop_str(uint8_t *dest, msos_prop_type type,
     data = (void *)(dest + length);
 
     data->dwPropertyDataLength = cpu_to_le32(vlen*2);
-    length += sizeof(*prop);
+    length += sizeof(*data);
 
     for (i = 0; i < vlen; i++) {
         data->bPropertyData[i*2]   = usb_lo(value[i]);
@@ -167,7 +144,7 @@ static int usb_desc_msos_prop_dword(uint8_t *dest, const wchar_t *name,
     data->bPropertyData[1] = (value >>  8) & 0xff;
     data->bPropertyData[2] = (value >> 16) & 0xff;
     data->bPropertyData[3] = (value >> 24) & 0xff;
-    length += sizeof(*prop) + 4;
+    length += sizeof(*data) + 4;
 
     prop->dwLength = cpu_to_le32(length);
     return length;
@@ -180,22 +157,12 @@ static int usb_desc_msos_prop(const USBDesc *desc, uint8_t *dest)
     int count = 0;
 
     if (desc->msos->Label) {
-        /*
-         * Given as example in the specs.  Haven't figured yet where
-         * this label shows up in the windows gui.
-         */
         length += usb_desc_msos_prop_str(dest+length, MSOS_REG_SZ,
                                          L"Label", desc->msos->Label);
         count++;
     }
 
     if (desc->msos->SelectiveSuspendEnabled) {
-        /*
-         * Signaling remote wakeup capability in the standard usb
-         * descriptors isn't enough to make windows actually use it.
-         * This is the "Yes, we really mean it" registry entry to flip
-         * the switch in the windows drivers.
-         */
         length += usb_desc_msos_prop_dword(dest+length,
                                            L"SelectiveSuspendEnabled", 1);
         count++;

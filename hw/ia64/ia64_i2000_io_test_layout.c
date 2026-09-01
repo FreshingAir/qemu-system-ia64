@@ -295,8 +295,7 @@ static bool io_test_validate_pci(const IA64I2000IoTestLayout *layout,
         return false;
     }
     if (layout->isp12160_parent_root >= 3 ||
-        layout->isp12160_bus !=
-            0x20U * layout->isp12160_parent_root ||
+        layout->isp12160_bus != ISP12160_QEMU_I2000_BUS ||
         layout->isp12160_slot >= 32 ||
         layout->isp12160.function >= 8 ||
         (layout->isp12160_parent_root == layout->parent_root &&

@@ -5,6 +5,7 @@ system_ss.add(when: 'CONFIG_NE2000_COMMON', if_true: files('ne2000.c'))
 # PCI network cards
 system_ss.add(when: 'CONFIG_NE2000_PCI', if_true: files('ne2000-pci.c'))
 system_ss.add(when: 'CONFIG_EEPRO100_PCI', if_true: files('eepro100.c'))
+system_ss.add(when: 'CONFIG_BCM5704_PCI', if_true: files('bcm5704.c'))
 system_ss.add(when: 'CONFIG_PCNET_PCI', if_true: files('pcnet-pci.c'))
 system_ss.add(when: 'CONFIG_PCNET_COMMON', if_true: files('pcnet.c'))
 system_ss.add(when: 'CONFIG_E1000_PCI', if_true: files('e1000.c', 'e1000x_common.c'))

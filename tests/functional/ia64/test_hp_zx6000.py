@@ -23,7 +23,9 @@ SMOKE_CASES = {
 GRAPHICS_CASES = {
     "protocols", "protocol-list", "pci-location", "pci-dma",
     "pci-attributes", "pci-bars", "device-path", "gop", "vbe-mode", "uga",
-    "framebuffer-io", "memory-map",
+    "framebuffer-io", "memory-map", "pci-vga-attributes",
+    "pci-vga-root-attributes", "pci-vga-root-resources",
+    "pci-vga-passthrough", "pci-controller-paths",
 }
 
 INPUT_CASES = {
@@ -116,6 +118,8 @@ class HPZx6000Boot(QemuSystemTest):
         dsdt = self.read_sdt(vm, struct.unpack_from("<Q", fadt, 140)[0])
         self.assertEqual(dsdt[:4], b"DSDT")
         self.assertEqual(sum(dsdt) & 0xff, 0)
+        self.assertEqual(dsdt.count(b"\x0c\x22\xf0\x00\x02"), 5)
+        self.assertEqual(dsdt.count(b"\x0c\x22\xf0\x00\x03"), 1)
         self.assertEqual(dsdt.count(b"MBRD"), 1)
         self.assertEqual(dsdt.count(b"\x0c\x41\xd0\x0c\x02"), 1)
         self.assertEqual(dsdt.count(b"_FIX"), 0)
@@ -139,12 +143,45 @@ class HPZx6000Boot(QemuSystemTest):
                             translation, length)
             )
 
-        for minimum in range(0, 0xC000, 0x2000):
+        def dword_memory(minimum, maximum, translation, length):
+            return (
+                b"\x87\x17\x00\x00\x0c\x01" +
+                struct.pack("<IIIII", 0, minimum, maximum,
+                            translation, length)
+            )
+
+        root0_io = (
+            (0x0000, 0x01CD, 0x01CE),
+            (0x01D2, 0x03AF, 0x01DE),
+            (0x03E0, 0x1FFF, 0x1C20),
+        )
+        for minimum, maximum, length in root0_io:
+            sparse = qword_io(
+                0x33, minimum, maximum,
+                ZX6000_LEGACY_IO_BASE, length,
+            )
+            self.assertEqual(dsdt.count(sparse), 1)
+
+        for minimum in range(0x2000, 0xC000, 0x2000):
             sparse = qword_io(
                 0x33, minimum, minimum + 0x1FFF,
                 ZX6000_LEGACY_IO_BASE, 0x2000,
             )
             self.assertEqual(dsdt.count(sparse), 1)
+
+        for minimum, maximum, length in (
+            (0x01CE, 0x01D1, 0x04),
+            (0x03B0, 0x03DF, 0x30),
+        ):
+            legacy_vga_io = qword_io(
+                0x33, minimum, maximum,
+                ZX6000_LEGACY_IO_BASE, length,
+            )
+            self.assertEqual(dsdt.count(legacy_vga_io), 1)
+        legacy_vga_memory = dword_memory(
+            0x000A0000, 0x000FFFFF, 0, 0x00060000,
+        )
+        self.assertEqual(dsdt.count(legacy_vga_memory), 1)
 
     @staticmethod
     def send_keys(vm, qcodes):

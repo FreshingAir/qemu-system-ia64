@@ -18,9 +18,26 @@
 #define INTEL_460GX_VENDOR_ID   0x8086
 #define INTEL_460GX_SAC_ID      0x84e0
 #define INTEL_460GX_SDC_ID      0x84e1
-#define INTEL_460GX_MAC_ID      0x84e3
-#define INTEL_460GX_MDC_ID      0x84e4
 #define INTEL_460GX_PXB_ID      0x84cb
+#define INTEL_460GX_WXB_ID      0x84e6
+#define INTEL_460GX_GXB_F1_ID   0x84ea
+#define INTEL_460GX_GXB_F2_ID   0x84e2
+
+#define INTEL_460GX_SAC_REVISION 0x03
+#define INTEL_460GX_SDC_REVISION 0x03
+#define INTEL_460GX_PXB_REVISION 0x05
+#define INTEL_460GX_WXB_REVISION 0x07
+#define INTEL_460GX_GXB_REVISION 0x02
+
+#define INTEL_460GX_PXB_PORT     0
+#define INTEL_460GX_WXB0_PORT    2
+#define INTEL_460GX_WXB1_PORT    3
+#define INTEL_460GX_GXB_PORT     4
+
+static const uint8_t sac_defined_function_mask[] = {
+    BIT(0) | BIT(1) | BIT(2),
+    BIT(2) | BIT(3),
+};
 
 typedef struct Intel460GXRegisterBlock {
     uint8_t config[INTEL_460GX_CONFIG_SIZE];
@@ -38,11 +55,11 @@ struct Intel460GXChipsetState {
 
     Intel460GXHostState *host;
     uint8_t expander_mask;
-    Intel460GXRegisterBlock sac[3];
-    Intel460GXRegisterBlock sac_memory[2];
+    Intel460GXRegisterBlock sac[2][8];
     Intel460GXRegisterBlock sdc;
-    Intel460GXRegisterBlock memory_card[2][2];
+    Intel460GXRegisterBlock downstream_sac[INTEL_460GX_DOWNSTREAM_PORTS];
     Intel460GXRegisterBlock expander[INTEL_460GX_DOWNSTREAM_PORTS];
+    Intel460GXRegisterBlock gxb_function2;
 };
 
 static uint32_t register_block_read(void *opaque, uint16_t offset,
@@ -117,7 +134,8 @@ static void register_block_set_long(uint8_t *config, unsigned offset,
 }
 
 static void register_block_init(Intel460GXRegisterBlock *block,
-                                uint16_t device_id, uint16_t class_id)
+                                uint16_t device_id, uint16_t class_id,
+                                uint8_t revision)
 {
     memset(block, 0, sizeof(*block));
     register_block_set_word(block->reset, PCI_VENDOR_ID,
@@ -126,7 +144,10 @@ static void register_block_init(Intel460GXRegisterBlock *block,
     register_block_set_word(block->reset, PCI_STATUS,
                             PCI_STATUS_DEVSEL_MEDIUM);
     register_block_set_long(block->reset, PCI_REVISION_ID,
-                            (uint32_t)class_id << 16);
+                            (uint32_t)class_id << 16 | revision);
+    register_block_set_word(block->reset, PCI_SUBSYSTEM_VENDOR_ID,
+                            INTEL_460GX_VENDOR_ID);
+    register_block_set_word(block->reset, PCI_SUBSYSTEM_ID, device_id);
     memcpy(block->config, block->reset, sizeof(block->config));
 }
 
@@ -136,88 +157,94 @@ static void intel_460gx_chipset_init_registers(
     unsigned i;
     unsigned function;
 
-    register_block_init(&s->sac[0], INTEL_460GX_SAC_ID,
-                        PCI_CLASS_BRIDGE_HOST);
-    register_block_init(&s->sac[1], INTEL_460GX_SAC_ID,
-                        PCI_CLASS_BRIDGE_HOST);
-    register_block_init(&s->sac[2], INTEL_460GX_SAC_ID,
-                        PCI_CLASS_BRIDGE_HOST);
-    s->sac[0].reset[PCI_HEADER_TYPE] = PCI_HEADER_TYPE_MULTI_FUNCTION;
-    s->sac[0].wmask[0x80] = BIT(7);
-    s->sac[0].wmask[0x81] = BIT(7);
-    s->sac[0].wmask[0x82] = BIT(7);
-    s->sac[0].w1cmask[0x80] = BIT(6);
-    s->sac[0].w1cmask[0x81] = BIT(6);
-    s->sac[0].w1cmask[0x82] = BIT(6);
-    memset(s->sac[0].sticky + 0x80, 0xff, 3);
-    register_block_set_long(s->sac[1].w1cmask, 0x40,
+    for (i = 0; i < 2; i++) {
+        for (function = 0; function < 8; function++) {
+            register_block_init(&s->sac[i][function], INTEL_460GX_SAC_ID,
+                                PCI_CLASS_BRIDGE_HOST,
+                                INTEL_460GX_SAC_REVISION);
+            s->sac[i][function].reset[PCI_HEADER_TYPE] =
+                PCI_HEADER_TYPE_MULTI_FUNCTION;
+        }
+    }
+    s->sac[0][0].wmask[0x80] = BIT(7);
+    s->sac[0][0].wmask[0x81] = BIT(7);
+    s->sac[0][0].wmask[0x82] = BIT(7);
+    s->sac[0][0].w1cmask[0x80] = BIT(6);
+    s->sac[0][0].w1cmask[0x81] = BIT(6);
+    s->sac[0][0].w1cmask[0x82] = BIT(6);
+    memset(s->sac[0][0].sticky + 0x80, 0xff, 3);
+    register_block_set_long(s->sac[0][1].w1cmask, 0x40,
                             UINT32_C(0xffff7fe1));
-    register_block_set_long(s->sac[1].w1cmask, 0x44,
+    register_block_set_long(s->sac[0][1].w1cmask, 0x44,
                             UINT32_C(0xffff7fe1));
-    memset(s->sac[1].sticky + 0x40, 0xff, 8);
-    s->sac[1].wmask[0x80] = 0x3f;
-
-    /* SAC memory targets expose PCI identity only. */
-    register_block_init(&s->sac_memory[0], INTEL_460GX_SAC_ID,
-                        PCI_CLASS_BRIDGE_HOST);
-    register_block_init(&s->sac_memory[1], INTEL_460GX_SAC_ID,
-                        PCI_CLASS_BRIDGE_HOST);
+    memset(s->sac[0][1].sticky + 0x40, 0xff, 8);
+    s->sac[0][1].wmask[0x80] = 0x3f;
 
     register_block_init(&s->sdc, INTEL_460GX_SDC_ID,
-                        PCI_CLASS_MEMORY_OTHER);
+                        PCI_CLASS_BRIDGE_HOST,
+                        INTEL_460GX_SDC_REVISION);
     memset(s->sdc.w1cmask + 0x80, 0xff, 8);
     s->sdc.coupled_w1c_a = 0x80;
     s->sdc.coupled_w1c_b = 0x84;
     s->sdc.coupled_w1c_size = 4;
     memset(s->sdc.wmask + 0xc8, 0xff, 4);
 
-    /* Memory-card targets expose PCI identity only. */
-    for (i = 0; i < 2; i++) {
-        register_block_init(&s->memory_card[i][0], INTEL_460GX_MAC_ID,
-                            PCI_CLASS_MEMORY_RAM);
-        register_block_init(&s->memory_card[i][1], INTEL_460GX_MDC_ID,
-                            PCI_CLASS_MEMORY_RAM);
-        s->memory_card[i][0].reset[PCI_HEADER_TYPE] =
-            PCI_HEADER_TYPE_MULTI_FUNCTION;
-    }
-
     for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
         Intel460GXRegisterBlock *block = &s->expander[i];
+        uint16_t device_id = INTEL_460GX_PXB_ID;
+        uint8_t revision = INTEL_460GX_PXB_REVISION;
 
-        register_block_init(block, INTEL_460GX_PXB_ID,
-                            PCI_CLASS_BRIDGE_PCI);
+        register_block_init(&s->downstream_sac[i], INTEL_460GX_SAC_ID,
+                            PCI_CLASS_BRIDGE_HOST,
+                            INTEL_460GX_SAC_REVISION);
+        s->downstream_sac[i].reset[PCI_HEADER_TYPE] =
+            PCI_HEADER_TYPE_MULTI_FUNCTION;
+
+        if (i == INTEL_460GX_WXB0_PORT || i == INTEL_460GX_WXB1_PORT) {
+            device_id = INTEL_460GX_WXB_ID;
+            revision = INTEL_460GX_WXB_REVISION;
+        } else if (i == INTEL_460GX_GXB_PORT) {
+            device_id = INTEL_460GX_GXB_F1_ID;
+            revision = INTEL_460GX_GXB_REVISION;
+        }
+        register_block_init(block, device_id, PCI_CLASS_BRIDGE_HOST,
+                            revision);
         block->w1cmask[0x44] = 0x7b;
         block->sticky[0x44] = 0x7b;
         block->wmask[0x46] = 0x7d;
     }
+    s->expander[INTEL_460GX_GXB_PORT].reset[PCI_HEADER_TYPE] =
+        PCI_HEADER_TYPE_MULTI_FUNCTION;
+    register_block_init(&s->gxb_function2, INTEL_460GX_GXB_F2_ID,
+                        PCI_CLASS_BRIDGE_OTHER,
+                        INTEL_460GX_GXB_REVISION);
+    s->gxb_function2.reset[PCI_HEADER_TYPE] =
+        PCI_HEADER_TYPE_MULTI_FUNCTION;
 
-    for (function = 0; function < G_N_ELEMENTS(s->sac); function++) {
-        memcpy(s->sac[function].config, s->sac[function].reset,
-               sizeof(s->sac[function].config));
-    }
-    for (function = 0; function < G_N_ELEMENTS(s->sac_memory); function++) {
-        memcpy(s->sac_memory[function].config,
-               s->sac_memory[function].reset,
-               sizeof(s->sac_memory[function].config));
-    }
     for (i = 0; i < 2; i++) {
-        memcpy(s->memory_card[i][0].config,
-               s->memory_card[i][0].reset,
-               sizeof(s->memory_card[i][0].config));
+        for (function = 0; function < 8; function++) {
+            memcpy(s->sac[i][function].config,
+                   s->sac[i][function].reset,
+                   sizeof(s->sac[i][function].config));
+        }
     }
+    memcpy(s->sdc.config, s->sdc.reset, sizeof(s->sdc.config));
+    for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
+        memcpy(s->downstream_sac[i].config,
+               s->downstream_sac[i].reset,
+               sizeof(s->downstream_sac[i].config));
+        memcpy(s->expander[i].config, s->expander[i].reset,
+               sizeof(s->expander[i].config));
+    }
+    memcpy(s->gxb_function2.config, s->gxb_function2.reset,
+           sizeof(s->gxb_function2.config));
 }
 
 uint32_t intel_460gx_chipset_present_mask(uint8_t expander_mask)
 {
-    uint32_t present = INTEL_460GX_CHIPSET_FIXED_PRESENT_MASK;
-    unsigned i;
-
-    for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
-        if (expander_mask & BIT(i)) {
-            present |= BIT(INTEL_460GX_CHIPSET_EXPANDER_DEVICE_BASE + i);
-        }
-    }
-    return present;
+    /* SAC function 0 is present at every xXB position. */
+    (void)expander_mask;
+    return INTEL_460GX_CHIPSET_FIXED_PRESENT_MASK;
 }
 
 static bool register_target(Intel460GXChipsetState *s, unsigned device,
@@ -248,41 +275,46 @@ static void intel_460gx_chipset_realize(DeviceState *dev, Error **errp)
         return;
     }
 
-    for (function = 0; function < G_N_ELEMENTS(s->sac); function++) {
-        if (!intel_460gx_host_register_bootstrap_sac(
-                s->host, function, &register_block_ops,
-                &s->sac[function], errp) ||
-            !register_target(s, INTEL_460GX_CHIPSET_SAC_DEVICE, function,
-                             &s->sac[function], errp)) {
-            return;
-        }
+    if (!intel_460gx_host_register_bootstrap_sac(
+            s->host, 0, &register_block_ops, &s->sac[0][0], errp)) {
+        return;
     }
-    for (function = 0; function < G_N_ELEMENTS(s->sac_memory); function++) {
-        if (!register_target(s, INTEL_460GX_CHIPSET_SAC_MEMORY_DEVICE,
-                             function + 2, &s->sac_memory[function], errp)) {
-            return;
+    for (i = 0; i < 2; i++) {
+        for (function = 0; function < 8; function++) {
+            if (!(sac_defined_function_mask[i] & BIT(function))) {
+                continue;
+            }
+            if (!register_target(s, INTEL_460GX_CHIPSET_SAC_DEVICE + i,
+                                 function, &s->sac[i][function], errp)) {
+                return;
+            }
         }
     }
     if (!register_target(s, INTEL_460GX_CHIPSET_SDC_DEVICE, 0,
                          &s->sdc, errp)) {
         return;
     }
-    for (i = 0; i < 2; i++) {
-        for (function = 0; function < 2; function++) {
-            if (!register_target(
-                    s, INTEL_460GX_CHIPSET_MEMORY_CARD_A + i, function,
-                    &s->memory_card[i][function], errp)) {
-                return;
-            }
+    for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
+        if (!register_target(s,
+                             INTEL_460GX_CHIPSET_EXPANDER_DEVICE_BASE + i,
+                             0, &s->downstream_sac[i], errp)) {
+            return;
         }
     }
     for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
         if ((s->expander_mask & BIT(i)) &&
             !register_target(s,
                              INTEL_460GX_CHIPSET_EXPANDER_DEVICE_BASE + i,
-                             0, &s->expander[i], errp)) {
+                             1, &s->expander[i], errp)) {
             return;
         }
+    }
+    if ((s->expander_mask & BIT(INTEL_460GX_GXB_PORT)) &&
+        !register_target(s,
+                         INTEL_460GX_CHIPSET_EXPANDER_DEVICE_BASE +
+                         INTEL_460GX_GXB_PORT,
+                         2, &s->gxb_function2, errp)) {
+        return;
     }
 }
 
@@ -302,21 +334,17 @@ static void intel_460gx_chipset_reset(DeviceState *dev)
     unsigned i;
     unsigned function;
 
-    for (function = 0; function < G_N_ELEMENTS(s->sac); function++) {
-        register_block_reset(&s->sac[function]);
-    }
-    for (function = 0; function < G_N_ELEMENTS(s->sac_memory); function++) {
-        register_block_reset(&s->sac_memory[function]);
-    }
-    register_block_reset(&s->sdc);
     for (i = 0; i < 2; i++) {
-        for (function = 0; function < 2; function++) {
-            register_block_reset(&s->memory_card[i][function]);
+        for (function = 0; function < 8; function++) {
+            register_block_reset(&s->sac[i][function]);
         }
     }
+    register_block_reset(&s->sdc);
     for (i = 0; i < INTEL_460GX_DOWNSTREAM_PORTS; i++) {
+        register_block_reset(&s->downstream_sac[i]);
         register_block_reset(&s->expander[i]);
     }
+    register_block_reset(&s->gxb_function2);
 }
 
 static bool register_block_post_load(void *opaque, int version_id,
@@ -353,26 +381,27 @@ static const VMStateDescription vmstate_intel_460gx_register_block = {
 
 static const VMStateDescription vmstate_intel_460gx_chipset = {
     .name = TYPE_INTEL_460GX_CHIPSET,
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT8_EQUAL(expander_mask, Intel460GXChipsetState),
-        VMSTATE_STRUCT_ARRAY(sac, Intel460GXChipsetState, 3, 1,
-                             vmstate_intel_460gx_register_block,
-                             Intel460GXRegisterBlock),
-        VMSTATE_STRUCT_ARRAY(sac_memory, Intel460GXChipsetState, 2, 1,
-                             vmstate_intel_460gx_register_block,
-                             Intel460GXRegisterBlock),
+        VMSTATE_STRUCT_2DARRAY(sac, Intel460GXChipsetState, 2, 8, 1,
+                               vmstate_intel_460gx_register_block,
+                               Intel460GXRegisterBlock),
         VMSTATE_STRUCT(sdc, Intel460GXChipsetState, 1,
                        vmstate_intel_460gx_register_block,
                        Intel460GXRegisterBlock),
-        VMSTATE_STRUCT_2DARRAY(memory_card, Intel460GXChipsetState, 2, 2, 1,
-                               vmstate_intel_460gx_register_block,
-                               Intel460GXRegisterBlock),
+        VMSTATE_STRUCT_ARRAY(downstream_sac, Intel460GXChipsetState,
+                             INTEL_460GX_DOWNSTREAM_PORTS, 1,
+                             vmstate_intel_460gx_register_block,
+                             Intel460GXRegisterBlock),
         VMSTATE_STRUCT_ARRAY(expander, Intel460GXChipsetState,
                              INTEL_460GX_DOWNSTREAM_PORTS, 1,
                              vmstate_intel_460gx_register_block,
                              Intel460GXRegisterBlock),
+        VMSTATE_STRUCT(gxb_function2, Intel460GXChipsetState, 1,
+                       vmstate_intel_460gx_register_block,
+                       Intel460GXRegisterBlock),
         VMSTATE_END_OF_LIST()
     },
 };

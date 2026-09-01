@@ -156,8 +156,8 @@ static void isp12160_test_realize(DeviceState *dev, Error **errp)
     bus = ia64_i2000_460gx_test_root_bus(
         s->test_460gx, IA64_ISP12160_TEST_ROOT_INDEX);
     if (!bus || pci_bus_num(bus) != IA64_ISP12160_TEST_PCI_BUS) {
-        error_setg(&local_err, "%s did not find root-1 bus 0x20",
-                   qtest_type);
+        error_setg(&local_err, "%s did not find root-1 bus 0x%x",
+                   qtest_type, IA64_ISP12160_TEST_PCI_BUS);
         goto fail;
     }
 

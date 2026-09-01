@@ -27,19 +27,16 @@ static void ia64_alat_clear(CPUIA64State *env)
 {
     int i;
 
+    if (env->alat_state.alat_active_count == 0) {
+        return;
+    }
     for (i = 0; i < IA64_ALAT_ENTRIES; i++) {
         env->alat_state.alat[i].valid = false;
     }
     env->alat_state.alat_active_count = 0;
 }
 
-/*
- * CPU-originated stores use precise physical-overlap invalidation.  DMA and
- * other external agents write RAM through the system memory APIs, which bump
- * a shared generation.  IA-64 permits an implementation to discard any ALAT
- * entry at any time, so conservatively failing all local entries on such a
- * write is architecturally valid and keeps the table coherent with DMA.
- */
+/* Own stores use PA overlap; other RAM-write generations clear the ALAT. */
 static bool ia64_alat_sync_memory_writes(CPUIA64State *env)
 {
     uint64_t generation = physical_memory_write_generation();
@@ -50,6 +47,19 @@ static bool ia64_alat_sync_memory_writes(CPUIA64State *env)
         return true;
     }
     return false;
+}
+
+static bool ia64_alat_memory_window_changed(CPUIA64State *env,
+                                             uint64_t generation)
+{
+    if (!physical_memory_write_generation_changed(generation)) {
+        return false;
+    }
+
+    ia64_alat_clear(env);
+    env->alat_state.memory_write_generation =
+        physical_memory_write_generation();
+    return true;
 }
 
 void ia64_invalidate_alat_reg_range(CPUIA64State *env,
@@ -131,16 +141,23 @@ void ia64_invalidate_rotating_fp_alat(CPUIA64State *env)
 
 uint64_t ia64_alat_chk_a(CPUIA64State *env, uint64_t va, uint32_t reg)
 {
+    bool found = false;
+    uint64_t generation = 0;
     int i;
 
     if (env->alat_state.alat_active_count != 0 &&
         !ia64_alat_sync_memory_writes(env)) {
+        generation = env->alat_state.memory_write_generation;
         for (i = 0; i < IA64_ALAT_ENTRIES; i++) {
             if (env->alat_state.alat[i].valid &&
                 env->alat_state.alat[i].reg == reg) {
-                return 0;
+                found = true;
+                break;
             }
         }
+    }
+    if (found && !ia64_alat_memory_window_changed(env, generation)) {
+        return 0;
     }
     env->cr_ifa = va;
     CPUState *cs = env_cpu(env);
@@ -171,13 +188,8 @@ static void ia64_set_alat(CPUIA64State *env, uint32_t reg, uint64_t addr,
     int match_index = -1;
     int i;
 
-    /*
-     * The caller sampled generation immediately before reading memory.  If
-     * an external agent wrote RAM before this allocation point, the loaded
-     * value cannot safely receive an ALAT entry.
-     */
-    if (physical_memory_write_generation_changed(generation)) {
-        ia64_alat_sync_memory_writes(env);
+    /* Reject allocation if RAM changed after the load-generation sample. */
+    if (ia64_alat_memory_window_changed(env, generation)) {
         return;
     }
 
@@ -216,9 +228,7 @@ static void ia64_set_alat(CPUIA64State *env, uint32_t reg, uint64_t addr,
     env->alat_state.alat[i].valid = true;
 
     /* Close the window around address translation and entry publication. */
-    if (physical_memory_write_generation_changed(generation)) {
-        ia64_alat_sync_memory_writes(env);
-    }
+    ia64_alat_memory_window_changed(env, generation);
 }
 
 void ia64_alat_set(CPUIA64State *env, uint32_t reg, uint64_t addr,
@@ -235,8 +245,10 @@ void ia64_alat_set_fp(CPUIA64State *env, uint32_t reg, uint64_t addr,
     }
 }
 
-static int ia64_find_alat_reg(CPUIA64State *env, uint32_t reg, bool fp)
+static int ia64_find_alat_reg(CPUIA64State *env, uint32_t reg, bool fp,
+                              uint64_t *generation)
 {
+    int found = -1;
     int i;
 
     if (env->alat_state.alat_active_count == 0) {
@@ -245,16 +257,22 @@ static int ia64_find_alat_reg(CPUIA64State *env, uint32_t reg, bool fp)
     if (ia64_alat_sync_memory_writes(env)) {
         return -1;
     }
+    *generation = env->alat_state.memory_write_generation;
 
     for (i = 0; i < IA64_ALAT_ENTRIES; i++) {
         if (env->alat_state.alat[i].valid &&
             env->alat_state.alat[i].reg == reg &&
             env->alat_state.alat[i].fp == fp) {
-            return i;
+            found = i;
+            break;
         }
     }
 
-    return -1;
+    if (found >= 0 &&
+        ia64_alat_memory_window_changed(env, *generation)) {
+        return -1;
+    }
+    return found;
 }
 
 static bool ia64_alat_matches_addr(CPUIA64State *env,
@@ -277,13 +295,14 @@ static uint64_t ia64_check_load_alat(CPUIA64State *env, uint32_t reg,
                                      uint64_t addr, uint32_t size,
                                      uint32_t clear)
 {
+    uint64_t generation;
     int i;
 
     if (fp && reg <= 1) {
         return 0;
     }
 
-    i = ia64_find_alat_reg(env, reg, fp);
+    i = ia64_find_alat_reg(env, reg, fp, &generation);
     if (i < 0) {
         return 0;
     }
@@ -294,6 +313,9 @@ static uint64_t ia64_check_load_alat(CPUIA64State *env, uint32_t reg,
         }
         return 0;
     }
+    if (ia64_alat_memory_window_changed(env, generation)) {
+        return 0;
+    }
     if (clear) {
         ia64_alat_invalidate_entry(env, &env->alat_state.alat[i]);
     }
@@ -302,7 +324,8 @@ static uint64_t ia64_check_load_alat(CPUIA64State *env, uint32_t reg,
 
 void ia64_alat_invalidate_reg(CPUIA64State *env, uint32_t reg)
 {
-    int i = ia64_find_alat_reg(env, reg, false);
+    uint64_t generation;
+    int i = ia64_find_alat_reg(env, reg, false, &generation);
 
     if (i >= 0) {
         ia64_alat_invalidate_entry(env, &env->alat_state.alat[i]);
@@ -311,7 +334,8 @@ void ia64_alat_invalidate_reg(CPUIA64State *env, uint32_t reg)
 
 void ia64_alat_invalidate_fp_reg(CPUIA64State *env, uint32_t reg)
 {
-    int i = ia64_find_alat_reg(env, reg, true);
+    uint64_t generation;
+    int i = ia64_find_alat_reg(env, reg, true, &generation);
 
     if (i >= 0) {
         ia64_alat_invalidate_entry(env, &env->alat_state.alat[i]);
@@ -343,6 +367,85 @@ uint64_t ia64_alat_check_load_fp_addr(CPUIA64State *env, uint32_t reg,
 {
     return ia64_check_load_alat(env, reg, true, true, addr, size, clear);
 }
+
+void ia64_alat_notify_store(CPUIA64State *env)
+{
+    if (!env->alat_state.alat_full) {
+        return;
+    }
+
+    g_assert(!env->alat_state.write_active);
+    ia64_alat_clear(env);
+    env->alat_state.memory_write_generation =
+        physical_memory_write_generation_advance();
+}
+
+void ia64_alat_write_begin(CPUIA64State *env)
+{
+    g_assert(!env->alat_state.write_active);
+    if (env->alat_state.alat_full) {
+        ia64_alat_sync_memory_writes(env);
+    }
+    env->alat_state.write_generation =
+        physical_memory_write_generation();
+    env->alat_state.write_observed = physical_memory_write_begin();
+    env->alat_state.write_active = true;
+}
+
+static bool ia64_alat_write_take_token(CPUIA64State *env)
+{
+    bool observed;
+
+    g_assert(env->alat_state.write_active);
+    observed = env->alat_state.write_observed;
+    env->alat_state.write_active = false;
+    env->alat_state.write_observed = false;
+    return observed;
+}
+
+static void ia64_alat_write_finish(CPUIA64State *env, uint64_t addr,
+                                   uint32_t size, bool precise)
+{
+    uint64_t generation = env->alat_state.write_generation;
+    bool observed = ia64_alat_write_take_token(env);
+    uint64_t expected = generation + observed;
+
+    physical_memory_write_end(observed);
+
+    if (env->alat_state.alat_full) {
+        if (!precise ||
+            env->alat_state.memory_write_generation != generation ||
+            physical_memory_write_generation_changed(expected)) {
+            ia64_alat_clear(env);
+            env->alat_state.memory_write_generation =
+                physical_memory_write_generation();
+            return;
+        }
+
+        /* The expected generation includes this local store. */
+        env->alat_state.memory_write_generation = expected;
+        ia64_invalidate_alat_store(env, addr, size);
+    }
+}
+
+void ia64_alat_write_end(CPUIA64State *env, uint64_t addr, uint32_t size)
+{
+    ia64_alat_write_finish(env, addr, size, true);
+}
+
+void ia64_alat_write_cancel(CPUIA64State *env)
+{
+    physical_memory_write_cancel(ia64_alat_write_take_token(env));
+}
+
+void ia64_alat_write_abort(CPUIA64State *env)
+{
+    if (env->alat_state.write_active) {
+        /* Faulted stores clear the local ALAT. */
+        ia64_alat_write_finish(env, 0, 0, false);
+    }
+}
+
 void ia64_invalidate_alat_store(CPUIA64State *env, uint64_t addr,
                                 uint32_t size)
 {

@@ -30,7 +30,7 @@ static void lsi53c1030_class_init(ObjectClass *oc, const void *data)
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
 
     pc->device_id = PCI_DEVICE_ID_LSI_53C1030;
-    pc->revision = 0x08;
+    pc->revision = 0x07;
     pc->subsystem_id = 0x1000;
     dc->desc = "LSI 53C1030 Ultra320 SCSI";
 }

@@ -9,6 +9,7 @@
 #define QEMU_SYSTEM_PHYSMEM_H
 
 #include "exec/hwaddr.h"
+#include "qemu/atomic.h"
 #include "system/ramlist.h"
 
 #define DIRTY_CLIENTS_ALL     ((1 << DIRTY_MEMORY_NUM) - 1)
@@ -19,13 +20,53 @@ bool physical_memory_get_dirty_flag(ram_addr_t addr, unsigned client);
 bool physical_memory_is_clean(ram_addr_t addr);
 
 /*
- * Monotonic notification for RAM writes performed through the system memory
- * APIs.  Readers use the generation to bracket a RAM read: the first sample
- * has acquire semantics, and changed() orders the preceding RAM read before
- * its closing sample.
+ * RAM-write observer API.  generation() has acquire semantics; changed()
+ * orders a preceding RAM read before its closing sample and reports active
+ * writers.  Call begin()/end() around raw-pointer writes, cancel() if no write
+ * occurred, or advance() after a store serialized against observer reads.
  */
 uint64_t physical_memory_write_generation(void);
 bool physical_memory_write_generation_changed(uint64_t generation);
+uint64_t physical_memory_write_generation_advance(void);
+
+/* Enable the one-way observer gate before RAM writers run. */
+void physical_memory_write_observer_enable(void);
+
+/*
+ * External RAM writers with retained host mappings use these unconditional
+ * scopes.  A scope opened before observer_enable() remains visible afterwards.
+ */
+extern bool physical_memory_write_observer_active;
+void physical_memory_write_external_begin(void);
+void physical_memory_write_external_end(void);
+void physical_memory_write_external_cancel(void);
+
+/* Pair end/cancel with the observer state sampled by begin. */
+static inline bool physical_memory_write_begin(void)
+{
+    bool observed = qatomic_load_acquire(
+        &physical_memory_write_observer_active);
+
+    if (unlikely(observed)) {
+        physical_memory_write_external_begin();
+    }
+    return observed;
+}
+
+static inline void physical_memory_write_end(bool observed)
+{
+    if (unlikely(observed)) {
+        physical_memory_write_external_end();
+    }
+}
+
+/* Close a scope which is known not to have changed guest RAM. */
+static inline void physical_memory_write_cancel(bool observed)
+{
+    if (unlikely(observed)) {
+        physical_memory_write_external_cancel();
+    }
+}
 
 uint8_t physical_memory_range_includes_clean(ram_addr_t start,
                                              ram_addr_t length,

@@ -22,6 +22,7 @@
 #define TEST_FIRMWARE_ENV "QTEST_IA64_FIRMWARE"
 
 #define ZX6000_DESCRIPTOR_GPA UINT64_C(0x00300000)
+#define ZX6000_AGP_ROOT       4U
 #define ZX6000_LOW_RAM_SIZE   UINT64_C(0x40000000)
 #define ZX6000_HIGH_RAM_BASE  UINT64_C(0x100000000)
 #define ZX6000_NVRAM_BASE     UINT64_C(0xfeb00000)
@@ -32,6 +33,20 @@
 #define ZX6000_INT10_ROM_BASE UINT64_C(0x000c0000)
 #define ZX6000_INT10_ROM_SIZE 0x0800U
 #define ZX6000_INT10_PCIR_OFFSET 0x0020U
+#define ZX6000_INT10_ATI_SIGNATURE_OFFSET 0x0074U
+#define ZX6000_INT10_ATI_HEADER_OFFSET 0x0080U
+#define ZX6000_INT10_ATI_HEADER_SIZE 0x0060U
+#define ZX6000_INT10_ATI_INIT_OFFSET 0x00e0U
+#define ZX6000_INT10_ATI_INIT_READ_SIZE 10U
+#define ZX6000_INT10_ATI_BIOS_SUPPORT_OFFSET 0x00f0U
+#define ZX6000_INT10_ATI_BIOS_SUPPORT_SIZE 12U
+#define ZX6000_INT10_ATI_MISC_OFFSET 0x00fcU
+#define ZX6000_INT10_ATI_MISC_SIZE 2U
+#define ZX6000_INT10_ATI_CONNECTOR_OFFSET 0x02e0U
+#define ZX6000_INT10_ATI_CONNECTOR_SIZE 6U
+#define ZX6000_INT10_ATI_PLL_OFFSET 0x0300U
+#define ZX6000_INT10_ATI_MEM_CONFIG_OFFSET 0x0383U
+#define ZX6000_INT10_ATI_MEM_REGION_SIZE 106U
 #define ZX6000_INT10_HANDLER_OFFSET 0x0100U
 #define ZX6000_INT10_MODE_LIST_OFFSET 0x01d0U
 #define ZX6000_INT10_VECTOR_ADDR UINT64_C(0x00000040)
@@ -40,7 +55,11 @@
 #define ZX6000_INT10_IO_DATA  (ZX6000_INT10_IO_BASE + 0x0eU)
 #define ZX6000_INT10_TRIGGER  0x4941U
 #define ZX6000_VBE2_SIGNATURE UINT32_C(0x32454256)
-#define ZX6000_RV100_FB_BASE  UINT64_C(0xa0000000)
+#define ZX6000_RV100_FB_BASE       UINT64_C(0xa0000000)
+#define ZX6000_RV100_MMIO_BASE     UINT64_C(0xa8000000)
+#define ZX6000_RV100_ROM_BASE      UINT64_C(0xa8010000)
+#define ZX6000_RV100_CNFG_MEMSIZE  0x00f8U
+#define ZX6000_RV100_VRAM_SIZE     (32U * MiB)
 #define ZX6000_VGA_PLANAR_SIZE UINT64_C(0x00040000)
 #define ZX6000_VGA_LEGACY_BASE UINT64_C(0x000a0000)
 #define ZX6000_BDA_VIDEO_MODE UINT64_C(0x00000449)
@@ -65,6 +84,20 @@
 #define ZX6000_CMD649_BMIDECSR 0x79
 
 #define ZX6000_LSI0_MMIO_BASE              UINT64_C(0x88000000)
+#define ZX6000_OHCI0_MMIO_BASE             UINT64_C(0x80023000)
+#define ZX6000_OHCI1_MMIO_BASE             UINT64_C(0x80022000)
+#define ZX6000_EHCI_MMIO_BASE              UINT64_C(0x80021000)
+#define ZX6000_OHCI_RH_DESCRIPTOR_A         0x48U
+#define ZX6000_EHCI_HCS_PARAMS              0x04U
+#define ZX6000_I82550_MMIO_BASE             UINT64_C(0x80020000)
+#define ZX6000_E100_SCB_EEPROM              0x0eU
+#define ZX6000_E100_EEPROM_SK               BIT(0)
+#define ZX6000_E100_EEPROM_CS               BIT(1)
+#define ZX6000_E100_EEPROM_DI               BIT(2)
+#define ZX6000_E100_EEPROM_DO               BIT(3)
+#define ZX6000_E100_EEPROM_OPCODE_READ      2U
+#define ZX6000_E100_EEPROM_ADDRESS_BITS     6U
+#define ZX6000_E100_EEPROM_WORDS            64U
 #define ZX6000_MPT_DOORBELL_OFFSET          0x00U
 #define ZX6000_MPT_INTERRUPT_STATUS_OFFSET  0x30U
 #define ZX6000_MPT_DOORBELL_ACTIVE          0x08000000U
@@ -126,6 +159,14 @@ static const uint8_t zx6000_last_bus[] = {
     0x1f, 0x3f, 0x5f, 0x7f, 0x9f, 0xdf,
 };
 
+static const uint32_t zx6000_rope[] = {
+    0, 1, 2, 3, 4, 6,
+};
+
+static const uint32_t zx6000_gsi_base[] = {
+    16, 27, 38, 49, 60, 71,
+};
+
 static const uint64_t zx6000_cpu_mmio_base[] = {
     UINT64_C(0x80000000), UINT64_C(0x88000000),
     UINT64_C(0x90000000), UINT64_C(0x98000000),
@@ -169,6 +210,73 @@ static QTestState *zx6000_start_with_options(const char *machine_options,
     return qtest_initf("-machine hp-zx6000%s%s -m 2G -smp 1 -S "
                        "-display none -serial none -net none -bios %s %s",
                        nvram_options, machine_options, firmware, options);
+}
+
+static void zx6000_i82550_eeprom_set_lines(QTestState *qts, uint8_t lines)
+{
+    qtest_writew(qts, ZX6000_I82550_MMIO_BASE + ZX6000_E100_SCB_EEPROM,
+                 lines);
+}
+
+static void zx6000_i82550_eeprom_clock_out(QTestState *qts, bool bit)
+{
+    uint8_t lines = ZX6000_E100_EEPROM_CS |
+                    (bit ? ZX6000_E100_EEPROM_DI : 0);
+
+    zx6000_i82550_eeprom_set_lines(qts, lines);
+    zx6000_i82550_eeprom_set_lines(qts,
+                                   lines | ZX6000_E100_EEPROM_SK);
+    zx6000_i82550_eeprom_set_lines(qts, lines);
+}
+
+static bool zx6000_i82550_eeprom_clock_in(QTestState *qts)
+{
+    bool bit;
+
+    zx6000_i82550_eeprom_set_lines(qts, ZX6000_E100_EEPROM_CS);
+    zx6000_i82550_eeprom_set_lines(
+        qts, ZX6000_E100_EEPROM_CS | ZX6000_E100_EEPROM_SK);
+    bit = qtest_readw(qts,
+                      ZX6000_I82550_MMIO_BASE + ZX6000_E100_SCB_EEPROM) &
+          ZX6000_E100_EEPROM_DO;
+    zx6000_i82550_eeprom_set_lines(qts, ZX6000_E100_EEPROM_CS);
+    return bit;
+}
+
+static uint16_t zx6000_i82550_eeprom_read_word(QTestState *qts,
+                                                unsigned address)
+{
+    uint16_t value = 0;
+    int bit;
+
+    g_assert_cmpuint(address, <, ZX6000_E100_EEPROM_WORDS);
+    zx6000_i82550_eeprom_set_lines(qts, 0);
+    zx6000_i82550_eeprom_set_lines(qts, ZX6000_E100_EEPROM_CS);
+    zx6000_i82550_eeprom_clock_out(qts, false);
+    zx6000_i82550_eeprom_clock_out(qts, true);
+    zx6000_i82550_eeprom_clock_out(
+        qts, ZX6000_E100_EEPROM_OPCODE_READ & BIT(1));
+    zx6000_i82550_eeprom_clock_out(
+        qts, ZX6000_E100_EEPROM_OPCODE_READ & BIT(0));
+    for (bit = ZX6000_E100_EEPROM_ADDRESS_BITS - 1; bit >= 0; bit--) {
+        zx6000_i82550_eeprom_clock_out(qts, address & BIT(bit));
+    }
+    for (bit = 0; bit < 16; bit++) {
+        value = value << 1 | zx6000_i82550_eeprom_clock_in(qts);
+    }
+    zx6000_i82550_eeprom_set_lines(qts, 0);
+    return value;
+}
+
+static uint16_t zx6000_i82550_eeprom_checksum(QTestState *qts)
+{
+    uint32_t sum = 0;
+    unsigned word;
+
+    for (word = 0; word < ZX6000_E100_EEPROM_WORDS; word++) {
+        sum += zx6000_i82550_eeprom_read_word(qts, word);
+    }
+    return sum;
 }
 
 static void zx6000_assert_block_devices(QTestState *qts,
@@ -547,9 +655,19 @@ static uint8_t zx6000_vga_indexed_read(QTestState *qts,
 
 static void zx6000_assert_int10_rom(QTestState *qts)
 {
+    static const uint8_t expected_connector[] = {
+        0x11, 0x11, 0x00, 0x23, 0x00, 0x00,
+    };
     uint8_t rom[ZX6000_INT10_ROM_SIZE];
+    uint8_t zero[ZX6000_INT10_ATI_BIOS_SUPPORT_SIZE] = { 0 };
+    uint8_t expected_mem[ZX6000_INT10_ATI_MEM_REGION_SIZE] = { 0 };
     uint8_t vector[4];
+    static const uint8_t init_fields[] = { 0x0c, 0x46, 0x4e, 0x52 };
+    static const uint8_t clock_fields[] = { 0x0e, 0x1a, 0x26 };
+    uint16_t ati_header;
+    uint16_t ati_pll;
     uint16_t pcir;
+    size_t i;
 
     qtest_memread(qts, ZX6000_INT10_ROM_BASE, rom, sizeof(rom));
     g_assert_cmphex(lduw_le_p(rom), ==, 0xaa55);
@@ -562,8 +680,85 @@ static void zx6000_assert_int10_rom(QTestState *qts)
     g_assert_cmphex(lduw_le_p(rom + pcir + 6), ==, 0x5159);
     g_assert_cmpuint(lduw_le_p(rom + pcir + 0x10) * 512U, ==,
                      sizeof(rom));
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_SIGNATURE_OFFSET, 10,
+                    "761295520", 10);
+    ati_header = lduw_le_p(rom + 0x48);
+    g_assert_cmphex(ati_header, ==, ZX6000_INT10_ATI_HEADER_OFFSET);
+    g_assert_cmphex(rom[ati_header], ==, 8);
+    g_assert_cmphex(rom[ati_header + 1], ==, 0xa0);
+    g_assert_cmpmem(rom + ati_header + 2, 4, zero, 4);
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 6), ==,
+                    ZX6000_INT10_ATI_HEADER_SIZE);
+    for (i = 0; i < G_N_ELEMENTS(init_fields); i++) {
+        g_assert_cmphex(lduw_le_p(rom + ati_header + init_fields[i]), ==,
+                        ZX6000_INT10_ATI_INIT_OFFSET);
+    }
+    g_assert_cmphex(rom[ZX6000_INT10_ATI_INIT_OFFSET - 1], ==, 0);
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_INIT_OFFSET,
+                    ZX6000_INT10_ATI_INIT_READ_SIZE, zero,
+                    ZX6000_INT10_ATI_INIT_READ_SIZE);
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 0x14), ==,
+                    ZX6000_INT10_ATI_BIOS_SUPPORT_OFFSET);
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_BIOS_SUPPORT_OFFSET,
+                    ZX6000_INT10_ATI_BIOS_SUPPORT_SIZE, zero,
+                    ZX6000_INT10_ATI_BIOS_SUPPORT_SIZE);
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 0x5e), ==,
+                    ZX6000_INT10_ATI_MISC_OFFSET);
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_MISC_OFFSET,
+                    ZX6000_INT10_ATI_MISC_SIZE, zero,
+                    ZX6000_INT10_ATI_MISC_SIZE);
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 0x2e), ==, 0);
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 0x50), ==,
+                    ZX6000_INT10_ATI_CONNECTOR_OFFSET);
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_CONNECTOR_OFFSET,
+                    ZX6000_INT10_ATI_CONNECTOR_SIZE,
+                    expected_connector, sizeof(expected_connector));
+    g_assert_cmphex(lduw_le_p(rom + ati_header + 0x48), ==,
+                    ZX6000_INT10_ATI_MEM_CONFIG_OFFSET);
+    expected_mem[0] = 3;
+    expected_mem[3] = 32;
+    expected_mem[4] = 0x25;
+    expected_mem[6] = 1;
+    expected_mem[8] = 0xff;
+    g_assert_cmpmem(rom + ZX6000_INT10_ATI_MEM_CONFIG_OFFSET - 3,
+                    sizeof(expected_mem), expected_mem,
+                    sizeof(expected_mem));
+    ati_pll = lduw_le_p(rom + ati_header + 0x30);
+    g_assert_cmphex(ati_pll, ==, ZX6000_INT10_ATI_PLL_OFFSET);
+    g_assert_cmphex(rom[ati_pll], ==, 0x0a);
+    g_assert_cmphex(rom[ati_pll + 1], ==, 0x46);
+    g_assert_cmphex(rom[ati_pll + 2], ==, 3);
+    g_assert_cmphex(rom[ati_pll + 3], ==, 3);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x04), ==, 0x05a6);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x06), ==, 0x059e);
+    g_assert_cmphex(rom[ati_pll + 0x0c], ==, 3);
+    g_assert_cmphex(rom[ati_pll + 0x0d], ==, 12);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x08), ==, 16600);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x0a), ==, 16600);
+    for (i = 0; i < G_N_ELEMENTS(clock_fields); i++) {
+        size_t offset = ati_pll + clock_fields[i];
+
+        g_assert_cmpuint(lduw_le_p(rom + offset), ==, 2700);
+        g_assert_cmpuint(lduw_le_p(rom + offset + 2), ==,
+                         i == 0 ? 60 : 12);
+        g_assert_cmpuint(ldl_le_p(rom + offset + 4), ==,
+                         i == 0 ? 12000 : 20000);
+        g_assert_cmpuint(ldl_le_p(rom + offset + 8), ==,
+                         i == 0 ? 35000 : 40000);
+    }
+    g_assert_cmphex(rom[ati_pll + 0x32], ==, 1);
+    g_assert_cmphex(rom[ati_pll + 0x33], ==, 0x12);
+    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x34), ==, 2700);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x36), ==, 40);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x3a), ==, 3000);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x3e), ==, 12000);
+    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x42), ==, 35000);
     g_assert_cmphex(zx6000_checksum(rom, sizeof(rom)), ==, 0);
     g_assert_cmphex(rom[ZX6000_INT10_HANDLER_OFFSET], !=, 0xcb);
+
+    /* The platform shadow must not overwrite a supplied PCI option ROM. */
+    g_assert_cmphex(qtest_readw(qts, ZX6000_RV100_ROM_BASE), ==, 0xaa55);
+    g_assert_cmphex(qtest_readb(qts, ZX6000_RV100_ROM_BASE + 2), !=, rom[2]);
 
     qtest_memread(qts, ZX6000_INT10_VECTOR_ADDR, vector, sizeof(vector));
     g_assert_cmphex(lduw_le_p(vector), ==, ZX6000_INT10_HANDLER_OFFSET);
@@ -837,13 +1032,21 @@ static void zx6000_assert_rv100(QTestState *qts)
     g_assert_cmphex(zx6000_config_readw(
                         qts, 4, devfn, PCI_CLASS_DEVICE), ==, 0x0300);
     g_assert_cmphex(zx6000_config_readl(
+                        qts, 4, devfn, PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    0x1292103c);
+    g_assert_cmphex(zx6000_config_readl(
                         qts, 4, devfn, PCI_BASE_ADDRESS_0), ==, 0xa0000008);
     g_assert_cmphex(zx6000_config_readl(
                         qts, 4, devfn, PCI_BASE_ADDRESS_1), ==, 0x8001);
     g_assert_cmphex(zx6000_config_readl(
                         qts, 4, devfn, PCI_BASE_ADDRESS_2), ==, 0xa8000000);
+    g_assert_cmphex(qtest_readl(qts, ZX6000_RV100_MMIO_BASE +
+                                    ZX6000_RV100_CNFG_MEMSIZE), ==,
+                    ZX6000_RV100_VRAM_SIZE);
     g_assert_cmphex(zx6000_config_readl(
-                        qts, 4, devfn, PCI_ROM_ADDRESS), ==, 0);
+                        qts, 4, devfn, PCI_ROM_ADDRESS), ==,
+                    ZX6000_RV100_ROM_BASE | PCI_ROM_ADDRESS_ENABLE);
+    g_assert_cmphex(qtest_readw(qts, ZX6000_RV100_ROM_BASE), ==, 0xaa55);
     g_assert_cmphex(zx6000_config_readb(
                         qts, 4, devfn, PCI_INTERRUPT_LINE), ==, 64);
     g_assert_cmphex(zx6000_config_readb(
@@ -852,14 +1055,33 @@ static void zx6000_assert_rv100(QTestState *qts)
 
 static void test_hp_zx6000_descriptor(void)
 {
+    static const struct {
+        uint8_t bus;
+        uint8_t device;
+        uint8_t pin;
+        uint32_t gsi;
+    } expected_routes[] = {
+        { 0x80, 0, 0, 64 }, /* RV100 */
+        { 0x00, 2, 0, 21 }, /* CMD649 */
+        { 0x00, 3, 0, 20 }, /* i82550C */
+        { 0x00, 1, 0, 16 }, /* OHCI function 0 */
+        { 0x00, 1, 1, 17 }, /* OHCI function 1 */
+        { 0x00, 1, 2, 18 }, /* EHCI */
+        { 0x20, 1, 0, 27 }, /* LSI function 0 */
+        { 0x20, 1, 1, 28 }, /* LSI function 1 */
+        { 0x20, 2, 0, 29 }, /* BCM5701 */
+    };
     uint8_t storage[2048] = { 0 };
     IA64PlatformDescriptor *descriptor =
         (IA64PlatformDescriptor *)storage;
     const IA64PlatformRamRange *ram;
     const IA64PlatformPciRoot *roots;
+    const IA64PlatformIoSapic *sapics;
+    const IA64PlatformPciRoute *routes;
     QTestState *qts = zx6000_start();
     uint32_t total_size;
     unsigned int root;
+    unsigned int route;
 
     qtest_memread(qts, ZX6000_DESCRIPTOR_GPA, storage,
                   sizeof(*descriptor));
@@ -877,6 +1099,8 @@ static void test_hp_zx6000_descriptor(void)
                      HP_ZX6000_PCI_ROOT_COUNT);
     g_assert_cmpuint(le32_to_cpu(descriptor->IoSapicCount), ==,
                      HP_ZX6000_PCI_ROOT_COUNT);
+    g_assert_cmpuint(le32_to_cpu(descriptor->PciRouteCount), ==,
+                     G_N_ELEMENTS(expected_routes));
     g_assert_cmphex(le64_to_cpu(descriptor->AcpiPmBase), ==,
                     ZX6000_ACPI_PM_BASE);
     g_assert_cmphex(le64_to_cpu(descriptor->AcpiPmSize), ==,
@@ -894,6 +1118,8 @@ static void test_hp_zx6000_descriptor(void)
 
     roots = (const IA64PlatformPciRoot *)(
         storage + le32_to_cpu(descriptor->PciRootOffset));
+    sapics = (const IA64PlatformIoSapic *)(
+        storage + le32_to_cpu(descriptor->IoSapicOffset));
     for (root = 0; root < HP_ZX6000_PCI_ROOT_COUNT; root++) {
         g_assert_cmpuint(roots[root].Bus, ==, zx6000_first_bus[root]);
         g_assert_cmpuint(roots[root].BusEnd, ==, zx6000_last_bus[root]);
@@ -911,17 +1137,42 @@ static void test_hp_zx6000_descriptor(void)
             0);
         g_assert_cmphex(le32_to_cpu(roots[root].Flags), ==,
                         IA64_PLATFORM_PCI_ROOT_FLAG_IDENTITY_DMA |
-                        IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO);
+                        IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO |
+                        (root == ZX6000_AGP_ROOT ?
+                         IA64_PLATFORM_PCI_ROOT_FLAG_AGP |
+                         IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY : 0));
         g_assert_cmphex(
             le64_to_cpu(roots[root].IoTranslationOffset), ==,
             ZX6000_SPARSE_IO_BASE);
         g_assert_cmphex(le64_to_cpu(roots[root].DmaBase), ==, 0);
         g_assert_cmphex(le64_to_cpu(roots[root].DmaSize), ==,
                         ZX6000_LOW_RAM_SIZE);
+        g_assert_cmpuint(le32_to_cpu(roots[root].Rope), ==,
+                         zx6000_rope[root]);
+        g_assert_cmphex(le64_to_cpu(sapics[root].Base), ==,
+                        HP_ZX6000_IOA_ADDRESS(root) +
+                        IA64_PLATFORM_ZX1_IO_SAPIC_OFFSET);
+        g_assert_cmpuint(le32_to_cpu(sapics[root].GsiBase), ==,
+                         zx6000_gsi_base[root]);
+        g_assert_cmpuint(sapics[root].Id, ==, zx6000_rope[root]);
         g_assert_cmphex(qtest_readq(
                             qts, HP_ZX6000_IOA_ADDRESS(root) +
                             HP_ZX1_IOA_FUNCTION_ID), ==,
                         UINT64_C(0x02b00000122e103c));
+    }
+
+    routes = (const IA64PlatformPciRoute *)(
+        storage + le32_to_cpu(descriptor->PciRouteOffset));
+    for (route = 0; route < G_N_ELEMENTS(expected_routes); route++) {
+        g_assert_cmpuint(le16_to_cpu(routes[route].Segment), ==, 0);
+        g_assert_cmpuint(routes[route].Bus, ==,
+                         expected_routes[route].bus);
+        g_assert_cmpuint(routes[route].Device, ==,
+                         expected_routes[route].device);
+        g_assert_cmpuint(routes[route].Pin, ==,
+                         expected_routes[route].pin);
+        g_assert_cmpuint(le32_to_cpu(routes[route].Gsi), ==,
+                         expected_routes[route].gsi);
     }
 
     qtest_quit(qts);
@@ -1008,17 +1259,37 @@ static void test_hp_zx6000_pci_layout(void)
     g_assert_cmphex(zx6000_config_readb(qts, 0, PCI_DEVFN(2, 0),
                                         ZX6000_CMD649_BMIDECSR), ==, 0x01);
 
-    zx6000_assert_device(qts, 0, PCI_DEVFN(3, 0), 0x8086, 0x1209,
+    zx6000_assert_device(qts, 0, PCI_DEVFN(3, 0), 0x8086, 0x1229,
                          PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
                          PCI_COMMAND_MASTER);
+    g_assert_cmphex(zx6000_config_readb(qts, 0, PCI_DEVFN(3, 0),
+                                        PCI_REVISION_ID), ==, 0x0d);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
-                                        PCI_BASE_ADDRESS_0), ==, 0x80020008);
+                                        PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    0x1274103c);
+    g_assert_cmphex(zx6000_config_readw(qts, 0, PCI_DEVFN(3, 0),
+                                        PCI_INTERRUPT_LINE), ==, 0x0114);
+    g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
+                                        PCI_BASE_ADDRESS_0), ==, 0x80020000);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
                                         PCI_BASE_ADDRESS_1), ==, 0xd01);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
                                         PCI_BASE_ADDRESS_2), ==, 0x80040000);
+    zx6000_config_writel(qts, 0, PCI_DEVFN(3, 0),
+                         PCI_BASE_ADDRESS_2, UINT32_MAX);
+    g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
+                                        PCI_BASE_ADDRESS_2), ==, 0xfffe0000);
+    zx6000_config_writel(qts, 0, PCI_DEVFN(3, 0),
+                         PCI_BASE_ADDRESS_2, 0x80040000);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(3, 0),
                                         PCI_ROM_ADDRESS), ==, 0);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 3), ==, 0x0203);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 5), ==, 0x0201);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 6), ==, 0x4701);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 0x0a), ==, 0x4880);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 0x0b), ==, 0x1274);
+    g_assert_cmphex(zx6000_i82550_eeprom_read_word(qts, 0x0c), ==, 0x103c);
+    g_assert_cmphex(zx6000_i82550_eeprom_checksum(qts), ==, 0xbaba);
 
     zx6000_assert_device(qts, 0, PCI_DEVFN(1, 0), 0x1033, 0x0035,
                          PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
@@ -1026,12 +1297,33 @@ static void test_hp_zx6000_pci_layout(void)
                          PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
     zx6000_assert_device(qts, 0, PCI_DEVFN(1, 2), 0x1033, 0x00e0,
                          PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    g_assert_cmphex(zx6000_config_readb(qts, 0, PCI_DEVFN(1, 0),
+                                        PCI_REVISION_ID), ==, 0x41);
+    g_assert_cmphex(zx6000_config_readb(qts, 0, PCI_DEVFN(1, 1),
+                                        PCI_REVISION_ID), ==, 0x41);
+    g_assert_cmphex(zx6000_config_readb(qts, 0, PCI_DEVFN(1, 2),
+                                        PCI_REVISION_ID), ==, 0x02);
+    g_assert_cmphex(zx6000_config_readw(qts, 0, PCI_DEVFN(1, 0),
+                                        PCI_INTERRUPT_LINE), ==, 0x0110);
+    g_assert_cmphex(zx6000_config_readw(qts, 0, PCI_DEVFN(1, 1),
+                                        PCI_INTERRUPT_LINE), ==, 0x0211);
+    g_assert_cmphex(zx6000_config_readw(qts, 0, PCI_DEVFN(1, 2),
+                                        PCI_INTERRUPT_LINE), ==, 0x0312);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(1, 0),
                                         PCI_BASE_ADDRESS_0), ==, 0x80023000);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(1, 1),
                                         PCI_BASE_ADDRESS_0), ==, 0x80022000);
     g_assert_cmphex(zx6000_config_readl(qts, 0, PCI_DEVFN(1, 2),
                                         PCI_BASE_ADDRESS_0), ==, 0x80021000);
+    g_assert_cmpuint(qtest_readl(qts, ZX6000_OHCI0_MMIO_BASE +
+                                     ZX6000_OHCI_RH_DESCRIPTOR_A) & 0xff,
+                     ==, 3);
+    g_assert_cmpuint(qtest_readl(qts, ZX6000_OHCI1_MMIO_BASE +
+                                     ZX6000_OHCI_RH_DESCRIPTOR_A) & 0xff,
+                     ==, 2);
+    g_assert_cmpuint(qtest_readb(qts, ZX6000_EHCI_MMIO_BASE +
+                                     ZX6000_EHCI_HCS_PARAMS) & 0xf,
+                     ==, 5);
 
     zx6000_assert_device(qts, 1, PCI_DEVFN(1, 0), 0x1000, 0x0030,
                          PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
@@ -1039,6 +1331,14 @@ static void test_hp_zx6000_pci_layout(void)
     zx6000_assert_device(qts, 1, PCI_DEVFN(1, 1), 0x1000, 0x0030,
                          PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
                          PCI_COMMAND_MASTER);
+    g_assert_cmphex(zx6000_config_readb(qts, 1, PCI_DEVFN(1, 0),
+                                        PCI_REVISION_ID), ==, 0x07);
+    g_assert_cmphex(zx6000_config_readb(qts, 1, PCI_DEVFN(1, 1),
+                                        PCI_REVISION_ID), ==, 0x07);
+    g_assert_cmphex(zx6000_config_readw(qts, 1, PCI_DEVFN(1, 0),
+                                        PCI_INTERRUPT_LINE), ==, 0x011b);
+    g_assert_cmphex(zx6000_config_readw(qts, 1, PCI_DEVFN(1, 1),
+                                        PCI_INTERRUPT_LINE), ==, 0x021c);
     g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(1, 0),
                                         PCI_BASE_ADDRESS_0), ==, 0x2001);
     g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(1, 0),
@@ -1051,6 +1351,21 @@ static void test_hp_zx6000_pci_layout(void)
                                         PCI_BASE_ADDRESS_1), ==, 0x88004000);
     g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(1, 1),
                                         PCI_BASE_ADDRESS_2), ==, 0x88020000);
+
+    zx6000_assert_device(qts, 1, PCI_DEVFN(2, 0), 0x14e4, 0x1645,
+                         PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
+    g_assert_cmphex(zx6000_config_readb(qts, 1, PCI_DEVFN(2, 0),
+                                        PCI_REVISION_ID), ==, 0x15);
+    g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(2, 0),
+                                        PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    0x12a4103c);
+    g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(2, 0),
+                                        PCI_BASE_ADDRESS_0), ==,
+                    0x88030004);
+    g_assert_cmphex(zx6000_config_readl(qts, 1, PCI_DEVFN(2, 0),
+                                        PCI_BASE_ADDRESS_1), ==, 0);
+    g_assert_cmphex(zx6000_config_readw(qts, 1, PCI_DEVFN(2, 0),
+                                        PCI_INTERRUPT_LINE), ==, 0x011d);
 
     zx6000_config_writel(qts, 4, PCI_DEVFN(0, 0), PCI_BASE_ADDRESS_0, 0);
     zx6000_config_writel(qts, 4, PCI_DEVFN(0, 0), PCI_BASE_ADDRESS_1, 0);

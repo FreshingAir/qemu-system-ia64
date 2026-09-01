@@ -1,7 +1,7 @@
 /*
  * SPDX-License-Identifier: GPL-2.0-or-later
  *
- * Internal OHCI and EFI USB protocol boundary.
+ * Internal USB and EFI USB protocol boundary.
  */
 
 #ifndef IA64_FIRMWARE_FW_USB_H

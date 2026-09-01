@@ -3099,6 +3099,8 @@ static void tcg_commit(MemoryListener *listener)
 }
 
 static uint64_t memory_write_generation;
+static unsigned int memory_write_active_writers;
+bool physical_memory_write_observer_active;
 
 uint64_t physical_memory_write_generation(void)
 {
@@ -3107,8 +3109,58 @@ uint64_t physical_memory_write_generation(void)
 
 bool physical_memory_write_generation_changed(uint64_t generation)
 {
+    unsigned int active_before;
+    unsigned int active_after;
+    uint64_t current_generation;
+
     smp_rmb();
-    return qatomic_load_acquire(&memory_write_generation) != generation;
+    active_before = qatomic_load_acquire(&memory_write_active_writers);
+    current_generation = qatomic_load_acquire(&memory_write_generation);
+    active_after = qatomic_load_acquire(&memory_write_active_writers);
+
+    return active_before || active_after ||
+           current_generation != generation;
+}
+
+uint64_t physical_memory_write_generation_advance(void)
+{
+    return qatomic_inc_fetch(&memory_write_generation);
+}
+
+void physical_memory_write_observer_enable(void)
+{
+    qatomic_store_release(&physical_memory_write_observer_active, true);
+}
+
+void physical_memory_write_external_begin(void)
+{
+    unsigned int old_active;
+
+    old_active = qatomic_fetch_inc(&memory_write_active_writers);
+    assert(old_active != UINT_MAX);
+
+    /* Order the active-writer notification before RAM stores. */
+    smp_mb();
+}
+
+void physical_memory_write_external_end(void)
+{
+    unsigned int old_active;
+
+    /* Order RAM stores before the generation update. */
+    smp_mb();
+    physical_memory_write_generation_advance();
+    old_active = qatomic_fetch_dec(&memory_write_active_writers);
+    assert(old_active != 0);
+}
+
+void physical_memory_write_external_cancel(void)
+{
+    unsigned int old_active;
+
+    /* A canceled scope does not advance the generation. */
+    old_active = qatomic_fetch_dec(&memory_write_active_writers);
+    assert(old_active != 0);
 }
 
 static void memory_map_init(void)
@@ -3142,7 +3194,6 @@ static void invalidate_and_set_dirty(MemoryRegion *mr, hwaddr addr,
 
     /* We know we're only called for RAM MemoryRegions */
     assert(ramaddr != RAM_ADDR_INVALID);
-    qatomic_inc(&memory_write_generation);
     addr += ramaddr;
 
     /* No early return if dirty_log_mask is or becomes 0, because
@@ -3172,6 +3223,8 @@ void memory_region_flush_rom_device(MemoryRegion *mr, hwaddr addr, hwaddr size)
     assert(memory_region_is_romd(mr));
 
     invalidate_and_set_dirty(mr, addr, size);
+    /* ROM-device writes are reported after the mutation. */
+    physical_memory_write_generation_advance();
 }
 
 int memory_access_size(MemoryRegion *mr, unsigned l, hwaddr addr)
@@ -3285,9 +3338,11 @@ static MemTxResult flatview_write_continue_step(MemTxAttrs attrs,
         /* RAM case */
         uint8_t *ram_ptr = qemu_ram_ptr_length(mr->ram_block, mr_addr, l,
                                                false, true);
+        bool observed = physical_memory_write_begin();
 
         memmove(ram_ptr, buf, *l);
         invalidate_and_set_dirty(mr, mr_addr, *l);
+        physical_memory_write_end(observed);
 
         return MEMTX_OK;
     }
@@ -3518,8 +3573,11 @@ MemTxResult address_space_write_rom(AddressSpace *as, hwaddr addr,
         } else {
             /* ROM/RAM case */
             void *ram_ptr = qemu_map_ram_ptr(mr->ram_block, addr1);
+            bool observed = physical_memory_write_begin();
+
             memcpy(ram_ptr, buf, l);
             invalidate_and_set_dirty(mr, addr1, l);
+            physical_memory_write_end(observed);
         }
         len -= l;
         addr += l;
@@ -3726,6 +3784,7 @@ void *address_space_map(AddressSpace *as,
     hwaddr l, xlat;
     MemoryRegion *mr;
     FlatView *fv;
+    void *ptr;
 
     trace_address_space_map(as, addr, len, is_write, *(uint32_t *) &attrs);
 
@@ -3777,7 +3836,13 @@ void *address_space_map(AddressSpace *as,
     *plen = flatview_extend_translation(fv, addr, len, mr, xlat,
                                         l, is_write, attrs);
     fuzz_dma_read_cb(addr, *plen, mr);
-    return qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
+    ptr = qemu_ram_ptr_length(mr->ram_block, xlat, plen, true, is_write);
+
+    if (ptr && is_write) {
+        /* Writable raw mappings remain active until address_space_unmap(). */
+        physical_memory_write_external_begin();
+    }
+    return ptr;
 }
 
 /* Unmaps a memory region previously mapped by address_space_map().
@@ -3794,6 +3859,7 @@ void address_space_unmap(AddressSpace *as, void *buffer, hwaddr len,
     if (mr != NULL) {
         if (is_write) {
             invalidate_and_set_dirty(mr, addr1, access_len);
+            physical_memory_write_external_end();
         }
         if (xen_map_cache_enabled()) {
             xen_invalidate_map_cache_entry(buffer);

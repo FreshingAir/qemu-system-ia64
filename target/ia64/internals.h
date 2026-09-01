@@ -19,8 +19,10 @@
 
 
 typedef struct IA64ExceptionState {
-    /* Architected/restart-visible exception state. */
+    /* Restart-visible exception and interruption-delivery state. */
     uint64_t fault_ip;
+    /* Internal delivery operand kept separate from architected CR.IFA. */
+    uint64_t fault_addr;
     uint64_t fault_imm;
     uint64_t fault_tmpl;
     uint32_t exception;
@@ -185,6 +187,10 @@ typedef struct IA64AlatState {
     IA64AlatEntry alat[IA64_ALAT_ENTRIES];
     uint32_t alat_active_count;
     bool alat_full;
+    /* Transient write-scope state for one faultable CPU store. */
+    bool write_active;
+    bool write_observed;
+    uint64_t write_generation;
     /* Transient host RAM-write generation observed by this local ALAT. */
     uint64_t memory_write_generation;
 } IA64AlatState;

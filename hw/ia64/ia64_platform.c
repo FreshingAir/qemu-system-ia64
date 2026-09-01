@@ -481,8 +481,8 @@ static bool ia64_platform_zx1_io_sapic_embedded(
                       IA64_PLATFORM_IO_SAPIC_SIZE >
                       IA64_PLATFORM_ZX1_LBA_CONFIG_SIZE);
 
-    if (le32_to_cpu(descriptor->PlatformId) !=
-        IA64_PLATFORM_ID_HP_ZX6000) {
+    if (!ia64_platform_is_hp_zx(
+            le32_to_cpu(descriptor->PlatformId))) {
         return false;
     }
     for (i = 0; i < count; i++) {
@@ -502,6 +502,8 @@ static bool ia64_platform_root_config_io_sapics_valid(
     const IA64PlatformDescriptor *descriptor,
     const IA64PlatformPciRoot *root)
 {
+    bool hp_zx = ia64_platform_is_hp_zx(
+        le32_to_cpu(descriptor->PlatformId));
     const uint8_t *bytes = (const uint8_t *)descriptor;
     uint64_t config_base = le64_to_cpu(root->ConfigBase);
     uint32_t offset = le32_to_cpu(descriptor->IoSapicOffset);
@@ -521,9 +523,10 @@ static bool ia64_platform_root_config_io_sapics_valid(
                 efi_base, IA64_PLATFORM_RESOURCE_ALIGNMENT)) {
             continue;
         }
-        if (le32_to_cpu(descriptor->PlatformId) !=
-                IA64_PLATFORM_ID_HP_ZX6000 ||
-            root->ConfigType != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA ||
+        if (!hp_zx) {
+            return false;
+        }
+        if (root->ConfigType != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA ||
             !ia64_platform_zx1_embedded_io_sapic(config_base,
                                                   sapic_base)) {
             return false;
@@ -670,7 +673,7 @@ static bool ia64_platform_desc_validate_entries(
         }
         if ((platform_id == IA64_PLATFORM_ID_HP_I2000 &&
              config_type != IA64_PLATFORM_PCI_CONFIG_CF8_CFC) ||
-            (platform_id == IA64_PLATFORM_ID_HP_ZX6000 &&
+            (ia64_platform_is_hp_zx(platform_id) &&
              config_type != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA)) {
             error_setg(errp,
                        "IA-64 PCI configuration backend does not match "
@@ -695,7 +698,7 @@ static bool ia64_platform_desc_validate_entries(
         }
         if (!ia64_platform_optional_u64_range_valid(io_base, io_size) ||
             ((flags & IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO) != 0 ?
-             (platform_id != IA64_PLATFORM_ID_HP_ZX6000 || io_size == 0 ||
+             (!ia64_platform_is_hp_zx(platform_id) || io_size == 0 ||
               io_translation != le64_to_cpu(descriptor->LegacyIoBase)) :
              io_translation != 0) ||
             (io_size != 0 && io_base + io_size > 0x10000ULL) ||
@@ -1011,7 +1014,6 @@ static bool ia64_platform_desc_validate_profile(
             IA64_PLATFORM_ID_HP_I2000 ||
         (flags & IA64_PLATFORM_HP_I2000_REQUIRED_FLAGS) !=
             IA64_PLATFORM_HP_I2000_REQUIRED_FLAGS ||
-        (flags & IA64_PLATFORM_FLAG_IDE_DMA) != 0 ||
         le64_to_cpu(descriptor->NvramBase) !=
             IA64_I2000_PROFILE_NVRAM_BASE ||
         le64_to_cpu(descriptor->NvramSize) !=
@@ -1173,7 +1175,7 @@ bool ia64_platform_desc_validate(const IA64PlatformDescriptor *descriptor,
     platform_id = le32_to_cpu(descriptor->PlatformId);
     if (platform_id != expected_platform_id ||
         (platform_id != IA64_PLATFORM_ID_HP_I2000 &&
-         platform_id != IA64_PLATFORM_ID_HP_ZX6000)) {
+         !ia64_platform_is_hp_zx(platform_id))) {
         error_setg(errp, "IA-64 platform descriptor ID mismatch");
         return false;
     }
@@ -1318,7 +1320,7 @@ bool ia64_platform_desc_validate(const IA64PlatformDescriptor *descriptor,
           reset_control_offset == poweroff_control_offset ||
           control_value == 0 || control_value > UINT8_MAX)) ||
         ((acpi_pm_base | acpi_pm_size | acpi_sci_gsi) != 0 &&
-         (platform_id != IA64_PLATFORM_ID_HP_ZX6000 ||
+         (!ia64_platform_is_hp_zx(platform_id) ||
           acpi_pm_base == 0 ||
           acpi_pm_size != IA64_PLATFORM_ACPI_PM_SIZE ||
           acpi_sci_gsi == 0 || acpi_sci_gsi > UINT16_MAX ||
@@ -1409,8 +1411,17 @@ bool ia64_platform_desc_validate(const IA64PlatformDescriptor *descriptor,
     sockets = le32_to_cpu(descriptor->SocketCount);
     cores = le32_to_cpu(descriptor->CoresPerSocket);
     threads = le32_to_cpu(descriptor->ThreadsPerCore);
-    if (processors < 1 || processors > 2 || sockets < 1 || sockets > 2 ||
-        cores != 1 || threads != 1 || processors != sockets) {
+    if (platform_id == IA64_PLATFORM_ID_HP_RX2660) {
+        if (processors < 1 || processors > 8 ||
+            sockets < 1 || sockets > 2 ||
+            cores < 1 || cores > 2 || threads < 1 || threads > 2 ||
+            processors != sockets * cores * threads) {
+            error_setg(errp, "invalid HP rx2660 processor topology");
+            return false;
+        }
+    } else if (processors < 1 || processors > 2 ||
+               sockets < 1 || sockets > 2 || cores != 1 || threads != 1 ||
+               processors != sockets) {
         error_setg(errp, "invalid HP IA-64 processor topology");
         return false;
     }

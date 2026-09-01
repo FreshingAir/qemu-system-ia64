@@ -32,6 +32,12 @@ typedef struct {
 #define FW_ATA_LBA48_MAX_LBA 0x0000ffffffffffffULL
 #define FW_ATA_IDENTIFY_LBA28_MAX_SECTORS 0x000000000fffffffULL
 #define FW_ATA_IDENTIFY_LBA48_MAX_SECTORS 0x0000ffffffffffffULL
+#define FW_ATA_IDENTIFY_CAPABILITIES_WORD 49U
+#define FW_ATA_IDENTIFY_VALIDITY_WORD     53U
+#define FW_ATA_IDENTIFY_UDMA_WORD         88U
+#define FW_ATA_IDENTIFY_DMA_SUPPORTED     (1U << 8)
+#define FW_ATA_IDENTIFY_UDMA_VALID        (1U << 2)
+#define FW_IDE_I2000_MAX_UDMA_MODE        2U
 
 static inline UINT64 fw_ata_command_max_lba(BOOLEAN Lba48)
 {
@@ -45,6 +51,33 @@ static inline UINT64 fw_ata_clamp_identify_sector_count(UINT64 Sectors,
                              FW_ATA_IDENTIFY_LBA28_MAX_SECTORS;
 
     return Sectors < maximum ? Sectors : maximum;
+}
+
+static inline BOOLEAN fw_ide_i2000_select_udma(const UINT16 *Identify,
+                                                UINT8 *Mode)
+{
+    UINT16 supported;
+
+    if (Identify == NULL || Mode == NULL ||
+        (Identify[FW_ATA_IDENTIFY_CAPABILITIES_WORD] &
+         FW_ATA_IDENTIFY_DMA_SUPPORTED) == 0 ||
+        (Identify[FW_ATA_IDENTIFY_VALIDITY_WORD] &
+         FW_ATA_IDENTIFY_UDMA_VALID) == 0) {
+        return 0;
+    }
+
+    supported = Identify[FW_ATA_IDENTIFY_UDMA_WORD] &
+        ((1U << (FW_IDE_I2000_MAX_UDMA_MODE + 1U)) - 1U);
+    if ((supported & (1U << 2)) != 0) {
+        *Mode = 2;
+    } else if ((supported & (1U << 1)) != 0) {
+        *Mode = 1;
+    } else if ((supported & 1U) != 0) {
+        *Mode = 0;
+    } else {
+        return 0;
+    }
+    return 1;
 }
 
 static inline BOOLEAN fw_ide_policy_port_range_valid(UINT16 Port, UINT8 Size)

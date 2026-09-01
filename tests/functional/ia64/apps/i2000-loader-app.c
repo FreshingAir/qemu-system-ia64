@@ -48,7 +48,7 @@
 #define ACPI_DSDT_SIGNATURE           0x54445344U
 #define ACPI_FADT_DSDT_OFFSET         40U
 #define ACPI_FADT_X_DSDT_OFFSET       140U
-#define I2000_DSDT_AML_SIZE           843U
+#define I2000_DSDT_AML_SIZE           1186U
 
 typedef struct {
     UINT32 Signature;
@@ -409,24 +409,13 @@ static BOOLEAN acpi_fadt_valid(const UINT8 *Fadt)
 
 static BOOLEAN acpi_dsdt_valid(const UINT8 *Fadt)
 {
-    static const UINT8 pci0_device[] = {
-        0x5b, 0x82, 0x41, 0x1a, 'P', 'C', 'I', '0',
-    };
-    static const UINT8 ifb0_device[] = {
-        0x5b, 0x82, 0x4c, 0x08, 'I', 'F', 'B', '0',
-    };
-    static const UINT8 ps2k_device[] = {
-        0x5b, 0x82, 0x2d, 'P', 'S', '2', 'K',
-    };
-    static const UINT8 ps2m_device[] = {
-        0x5b, 0x82, 0x1d, 'P', 'S', '2', 'M',
-    };
-    static const UINT8 pci1_device[] = {
-        0x5b, 0x82, 0x43, 0x0d, 'P', 'C', 'I', '1',
-    };
-    static const UINT8 pci2_device[] = {
-        0x5b, 0x82, 0x4c, 0x0b, 'P', 'C', 'I', '2',
-    };
+    static const UINT8 pci0_name[] = { 'P', 'C', 'I', '0' };
+    static const UINT8 pci1_name[] = { 'P', 'C', 'I', '1' };
+    static const UINT8 pci2_name[] = { 'P', 'C', 'I', '2' };
+    static const UINT8 pci3_name[] = { 'P', 'C', 'I', '3' };
+    static const UINT8 ifb0_name[] = { 'I', 'F', 'B', '0' };
+    static const UINT8 ps2k_name[] = { 'P', 'S', '2', 'K' };
+    static const UINT8 ps2m_name[] = { 'P', 'S', '2', 'M' };
     static const UINT8 empty_prt[] = {
         0x08, '_', 'P', 'R', 'T', 0x12, 0x02, 0x00,
     };
@@ -438,6 +427,7 @@ static BOOLEAN acpi_dsdt_valid(const UINT8 *Fadt)
     const UINT8 *ps2m;
     const UINT8 *pci1;
     const UINT8 *pci2;
+    const UINT8 *pci3;
     const UINT8 *prt;
     UINT32 fadt_length = get_u32(Fadt + 4U);
     UINT32 dsdt_length;
@@ -463,17 +453,18 @@ static BOOLEAN acpi_dsdt_valid(const UINT8 *Fadt)
 
     aml = dsdt + ACPI_SDT_HEADER_SIZE;
     aml_size = dsdt_length - ACPI_SDT_HEADER_SIZE;
-    pci0 = bytes_find(aml, aml_size, pci0_device, sizeof(pci0_device));
-    ifb0 = bytes_find(aml, aml_size, ifb0_device, sizeof(ifb0_device));
-    ps2k = bytes_find(aml, aml_size, ps2k_device, sizeof(ps2k_device));
-    ps2m = bytes_find(aml, aml_size, ps2m_device, sizeof(ps2m_device));
-    pci1 = bytes_find(aml, aml_size, pci1_device, sizeof(pci1_device));
-    pci2 = bytes_find(aml, aml_size, pci2_device, sizeof(pci2_device));
+    pci0 = bytes_find(aml, aml_size, pci0_name, sizeof(pci0_name));
+    ifb0 = bytes_find(aml, aml_size, ifb0_name, sizeof(ifb0_name));
+    ps2k = bytes_find(aml, aml_size, ps2k_name, sizeof(ps2k_name));
+    ps2m = bytes_find(aml, aml_size, ps2m_name, sizeof(ps2m_name));
+    pci1 = bytes_find(aml, aml_size, pci1_name, sizeof(pci1_name));
+    pci2 = bytes_find(aml, aml_size, pci2_name, sizeof(pci2_name));
+    pci3 = bytes_find(aml, aml_size, pci3_name, sizeof(pci3_name));
     prt = bytes_find(aml, aml_size, empty_prt, sizeof(empty_prt));
     return pci0 != NULL && ifb0 != NULL && ps2k != NULL && ps2m != NULL &&
-           pci1 != NULL && pci2 != NULL && prt != NULL &&
+           pci1 != NULL && pci2 != NULL && pci3 != NULL && prt != NULL &&
            ifb0 > pci0 && ps2k > ifb0 && ps2m > ps2k &&
-           pci1 > ps2m && prt > pci2;
+           pci1 > ps2m && pci2 > pci1 && prt > pci2 && pci3 > prt;
 }
 
 static BOOLEAN acpi_topology_valid(EFI_SYSTEM_TABLE *SystemTable)

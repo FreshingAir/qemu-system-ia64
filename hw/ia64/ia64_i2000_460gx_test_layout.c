@@ -14,7 +14,7 @@ static const IA64I2000460GXTestRoot fixed_roots[] = {
         .segment = 0,
         .config_mechanism = 1,
         .first_bus = 0x00,
-        .last_bus = 0x1f,
+        .last_bus = 0x00,
         .host_port = 0,
         .intx_base = 16,
         .io_base = 0x0000,
@@ -29,8 +29,8 @@ static const IA64I2000460GXTestRoot fixed_roots[] = {
     {
         .segment = 0,
         .config_mechanism = 1,
-        .first_bus = 0x20,
-        .last_bus = 0x3f,
+        .first_bus = 0x01,
+        .last_bus = 0x01,
         .host_port = 1,
         .intx_base = 20,
         .io_base = 0x4000,
@@ -45,8 +45,8 @@ static const IA64I2000460GXTestRoot fixed_roots[] = {
     {
         .segment = 0,
         .config_mechanism = 1,
-        .first_bus = 0x40,
-        .last_bus = 0x5f,
+        .first_bus = 0x02,
+        .last_bus = 0x02,
         .host_port = 2,
         .intx_base = 24,
         .io_base = 0x8000,
@@ -329,15 +329,13 @@ bool ia64_i2000_460gx_test_layout_validate(
                        "a fixed resource", i);
             return false;
         }
-        if (root->dma_base != fixture_range_end(
-                &layout->descriptor_envelope) ||
-            fixture_range_end(&dma) != fixture_range_end(&layout->ram) ||
-            root->dma_base < layout->ram.base ||
+        if (root->dma_base != layout->ram.base ||
+            root->dma_size != layout->ram.size ||
             root->dma_target_offset != root->dma_base - layout->ram.base ||
             root->dma_target_offset > layout->ram.size - root->dma_size) {
             error_setg(errp,
                        "i2000 460GX test root %u DMA alias is not the "
-                       "identity post-descriptor RAM view", i);
+                       "identity RAM view", i);
             return false;
         }
 

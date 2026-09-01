@@ -54,6 +54,9 @@ tests = {
     migration,
     pixman,
   ],
+  'test-usb-desc-msos': [
+    meson.project_source_root() / 'hw/usb/desc-msos.c',
+  ],
   'test-hp-lba-config': [
     meson.project_source_root() / 'hw/pci-host/hp-lba-config.c',
   ],
@@ -587,13 +590,19 @@ if 'ia64-softmmu' in target_dirs
        timeout: 30,
        suite: ['unit', 'ia64'])
 
+  ia64_gdbstub_deps = [emulators['qemu-system-ia64']]
+  ia64_gdbstub_args = [
+    files('ia64/test_gdbstub.py'),
+    meson.project_build_root() / 'qemu-system-ia64',
+  ]
+  if have_tools
+    ia64_gdbstub_deps += [qemu_img]
+    ia64_gdbstub_args += [meson.project_build_root() / 'qemu-img']
+  endif
   test('test-ia64-gdbstub',
        python,
-       depends: emulators['qemu-system-ia64'],
-       args: [
-         files('ia64/test_gdbstub.py'),
-         meson.project_build_root() / 'qemu-system-ia64',
-       ],
+       depends: ia64_gdbstub_deps,
+       args: ia64_gdbstub_args,
        protocol: 'tap',
        timeout: 30,
        is_parallel: false,

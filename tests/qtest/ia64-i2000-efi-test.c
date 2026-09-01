@@ -30,8 +30,8 @@ typedef union TestDescriptorStorage {
     uint8_t bytes[IA64_I2000_EFI_TEST_DESCRIPTOR_SIZE];
 } TestDescriptorStorage;
 
-static const uint8_t root_first_bus[] = { 0x00, 0x20, 0x40 };
-static const uint8_t root_last_bus[] = { 0x1f, 0x3f, 0x5f };
+static const uint8_t root_first_bus[] = { 0x00, 0x01, 0x02 };
+static const uint8_t root_last_bus[] = { 0x00, 0x01, 0x02 };
 static const uint64_t root_io_base[] = { 0x0000, 0x4000, 0x8000 };
 static const uint64_t root_mmio_base[] = {
     UINT64_C(0x90000000),
@@ -271,7 +271,8 @@ static void assert_descriptor(QTestState *qts, unsigned int cpu_count)
         g_assert_cmpuint(roots[i].BusEnd, ==, root_last_bus[i]);
         g_assert_cmpuint(roots[i].ConfigType, ==,
                          IA64_PLATFORM_PCI_CONFIG_CF8_CFC);
-        g_assert_cmphex(le32_to_cpu(roots[i].Flags), ==, 0);
+        g_assert_cmphex(le32_to_cpu(roots[i].Flags), ==,
+                        IA64_PLATFORM_PCI_ROOT_FLAG_IDENTITY_DMA);
         g_assert_cmphex(le64_to_cpu(roots[i].ConfigBase), ==, 0);
         g_assert_cmphex(le64_to_cpu(roots[i].IoBase), ==, root_io_base[i]);
         g_assert_cmphex(le64_to_cpu(roots[i].IoSize), ==, 0x4000);

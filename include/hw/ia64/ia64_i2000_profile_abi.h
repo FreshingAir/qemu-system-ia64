@@ -79,7 +79,7 @@
 /* Fixed primary IDE values. */
 #define IA64_I2000_PROFILE_IDE_SEGMENT                       0U
 #define IA64_I2000_PROFILE_IDE_BUS                           0U
-#define IA64_I2000_PROFILE_IDE_DEVICE                        2U
+#define IA64_I2000_PROFILE_IDE_DEVICE                        3U
 #define IA64_I2000_PROFILE_IDE_FUNCTION                      1U
 #define IA64_I2000_PROFILE_IDE_VENDOR_ID                     0x8086U
 #define IA64_I2000_PROFILE_IDE_DEVICE_ID                     0x7601U
@@ -89,6 +89,8 @@
 #define IA64_I2000_PROFILE_IDE_COMMAND_SIZE                  8U
 #define IA64_I2000_PROFILE_IDE_CONTROL_PORT                  0x03f6U
 #define IA64_I2000_PROFILE_IDE_CONTROL_SIZE                  1U
+#define IA64_I2000_PROFILE_IDE_BMDMA_PORT                    0x3ff0U
+#define IA64_I2000_PROFILE_IDE_BMDMA_SIZE                    16U
 #define IA64_I2000_PROFILE_IDE_IRQ                           14U
 #define IA64_I2000_PROFILE_IDE_PRIMARY_MASTER_UNIT_MASK      (1U << 0)
 

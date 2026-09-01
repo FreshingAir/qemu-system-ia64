@@ -181,6 +181,7 @@ static int ia64_cpu_pre_save(void *opaque)
 {
     IA64CPU *cpu = opaque;
 
+    g_assert(!cpu->env.alat_state.write_active);
     ia64_sync_rotating_fr(&cpu->env);
     ia64_itc_sync(&cpu->env);
     return 0;
@@ -190,12 +191,15 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
 {
     IA64CPU *cpu = opaque;
     CPUIA64State *env = &cpu->env;
+    IA64CPUClass *icc = IA64_CPU_GET_CLASS(cpu);
     bool has_clean_partition =
-        IA64_CPU_GET_CLASS(cpu)->rse_has_clean_partition;
-    uint32_t active_alat = 0;
+        icc->rse_has_clean_partition;
     unsigned int i;
 
-    (void)version_id;
+    if (version_id < 4) {
+        /* Version 3 used CR.IFA itself as the delivery operand. */
+        env->exception_state.fault_addr = env->cr_ifa;
+    }
 
     /* Migration stops vCPUs only at instruction boundaries. */
     env->rse.rse_access = false;
@@ -249,13 +253,16 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
     env->exception_state.suppressed_tlb_count = 0;
     env->exception_state.suppressed_tlb_overflow = false;
 
-    for (i = 0; i < IA64_ALAT_ENTRIES; i++) {
-        active_alat += env->alat_state.alat[i].valid;
-    }
-    env->alat_state.alat_active_count = active_alat;
+    /* Reset ALAT entries with the host-local write generation. */
+    memset(env->alat_state.alat, 0, sizeof(env->alat_state.alat));
+    env->alat_state.alat_active_count = 0;
     env->alat_state.alat_full = cpu->alat_full;
+    env->alat_state.write_active = false;
+    env->alat_state.write_observed = false;
+    env->alat_state.write_generation = 0;
     env->alat_state.memory_write_generation =
         physical_memory_write_generation();
+    env->pal.pal_proc_feature_status &= icc->pal_proc_feature_available;
 
     env->fp.transaction.active = false;
     env->fp.rotating_fr_materialized_rrb = env->cfm_rrb_fr;
@@ -269,7 +276,7 @@ static int ia64_cpu_post_load(void *opaque, int version_id)
 
 const VMStateDescription vmstate_ia64_cpu = {
     .name = "cpu",
-    .version_id = 3,
+    .version_id = 4,
     .minimum_version_id = 3,
     .pre_save = ia64_cpu_pre_save,
     .post_load = ia64_cpu_post_load,
@@ -289,6 +296,7 @@ const VMStateDescription vmstate_ia64_cpu = {
 
         /* Restart-visible exception state. */
         VMSTATE_UINT64(env.exception_state.fault_ip, IA64CPU),
+        VMSTATE_UINT64_V(env.exception_state.fault_addr, IA64CPU, 4),
         VMSTATE_UINT64(env.exception_state.fault_imm, IA64CPU),
         VMSTATE_UINT64(env.exception_state.fault_tmpl, IA64CPU),
         VMSTATE_UINT32(env.exception_state.exception, IA64CPU),

@@ -31,6 +31,10 @@ OBJECT_DECLARE_SIMPLE_TYPE(Intel82468GXIFBState, INTEL_82468GX_IFB)
 #define INTEL_82468GX_IFB_USB_DEVICE_ID   0x7602
 #define INTEL_82468GX_IFB_SMBUS_DEVICE_ID 0x7603
 
+#define INTEL_82468GX_IFB_IDETIM_PRIMARY  0x40
+#define INTEL_82468GX_IFB_IDETIM_SECONDARY 0x42
+#define INTEL_82468GX_IFB_IDETIM_DECODE   BIT(15)
+
 Intel82468GXIFBState *intel_82468gx_ifb_create(PCIBus *bus, int devfn,
                                                Error **errp);
 PCIDevice *intel_82468gx_ifb_function(Intel82468GXIFBState *s,

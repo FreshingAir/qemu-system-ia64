@@ -17,6 +17,7 @@
 #include "qemu/int128.h"
 
 bool ia64_exec_is_parallel(CPUIA64State *env);
+void ia64_exec_ensure_alat_exclusive(CPUIA64State *env, uintptr_t ra);
 int ia64_exec_mmu_index(CPUIA64State *env, bool ifetch);
 G_NORETURN void ia64_exec_exit_atomic(CPUIA64State *env, uintptr_t ra);
 
@@ -43,7 +44,8 @@ uint64_t ia64_exec_cmpxchg(CPUIA64State *env, uint64_t addr, uint64_t cmp,
                            uint64_t value, unsigned size, bool big_endian,
                            MemOpIdx oi, uintptr_t ra);
 Int128 ia64_exec_cmpxchg_16(CPUIA64State *env, uint64_t addr, Int128 cmp,
-                            Int128 value, bool big_endian, MemOpIdx oi,
+                            Int128 value, bool big_endian,
+                            unsigned invalidation_size, MemOpIdx oi,
                             uintptr_t ra);
 
 void ia64_exec_probe_write(CPUIA64State *env, uint64_t addr, int size,

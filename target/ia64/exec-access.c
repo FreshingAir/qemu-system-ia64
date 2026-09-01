@@ -21,7 +21,17 @@
 
 bool ia64_exec_is_parallel(CPUIA64State *env)
 {
-    return tcg_cflags_has(env_cpu(env), CF_PARALLEL);
+    CPUState *cs = env_cpu(env);
+
+    return tcg_cflags_has(cs, CF_PARALLEL) &&
+           !cpu_in_exclusive_context(cs);
+}
+
+void ia64_exec_ensure_alat_exclusive(CPUIA64State *env, uintptr_t ra)
+{
+    if (env->alat_state.alat_full && ia64_exec_is_parallel(env)) {
+        ia64_exec_exit_atomic(env, ra);
+    }
 }
 
 int ia64_exec_mmu_index(CPUIA64State *env, bool ifetch)
@@ -57,34 +67,36 @@ uint64_t ia64_exec_load_data(CPUIA64State *env, uint64_t addr,
 void ia64_exec_store_data(CPUIA64State *env, uint64_t addr, uint64_t value,
                           unsigned size, bool big_endian, uintptr_t ra)
 {
+    ia64_alat_write_begin(env);
     switch (size) {
     case 1:
         cpu_stb_data_ra(env, addr, value, ra);
-        return;
+        break;
     case 2:
         if (big_endian) {
             cpu_stw_be_data_ra(env, addr, value, ra);
         } else {
             cpu_stw_le_data_ra(env, addr, value, ra);
         }
-        return;
+        break;
     case 4:
         if (big_endian) {
             cpu_stl_be_data_ra(env, addr, value, ra);
         } else {
             cpu_stl_le_data_ra(env, addr, value, ra);
         }
-        return;
+        break;
     case 8:
         if (big_endian) {
             cpu_stq_be_data_ra(env, addr, value, ra);
         } else {
             cpu_stq_le_data_ra(env, addr, value, ra);
         }
-        return;
+        break;
     default:
         g_assert_not_reached();
     }
+    ia64_alat_write_end(env, addr, size);
 }
 
 uint64_t ia64_exec_load_mmuidx(CPUIA64State *env, uint64_t addr,
@@ -106,20 +118,22 @@ void ia64_exec_store_mmuidx(CPUIA64State *env, uint64_t addr, uint64_t value,
                             unsigned size, bool big_endian, int mmu_idx,
                             uintptr_t ra)
 {
+    ia64_alat_write_begin(env);
     switch (size) {
     case 1:
         cpu_stb_mmuidx_ra(env, addr, value, mmu_idx, ra);
-        return;
+        break;
     case 8:
         if (big_endian) {
             cpu_stq_be_mmuidx_ra(env, addr, value, mmu_idx, ra);
         } else {
             cpu_stq_le_mmuidx_ra(env, addr, value, mmu_idx, ra);
         }
-        return;
+        break;
     default:
         g_assert_not_reached();
     }
+    ia64_alat_write_end(env, addr, size);
 }
 
 /*
@@ -201,41 +215,71 @@ Int128 ia64_exec_load_16(CPUIA64State *env, uint64_t addr, MemOpIdx oi,
 void ia64_exec_store_16(CPUIA64State *env, uint64_t addr, Int128 value,
                         MemOpIdx oi, uintptr_t ra)
 {
+    ia64_alat_write_begin(env);
     cpu_st16_mmu(env, addr, value, oi, ra);
+    ia64_alat_write_end(env, addr, 16);
 }
 
 uint64_t ia64_exec_cmpxchg(CPUIA64State *env, uint64_t addr, uint64_t cmp,
                            uint64_t value, unsigned size, bool big_endian,
                            MemOpIdx oi, uintptr_t ra)
 {
+    uint64_t result;
+    uint64_t mask;
+
+    ia64_alat_write_begin(env);
     switch (size) {
     case 1:
-        return cpu_atomic_cmpxchgb_mmu(env, addr, cmp, value, oi, ra);
+        mask = UINT8_MAX;
+        result = cpu_atomic_cmpxchgb_mmu(env, addr, cmp, value, oi, ra);
+        break;
     case 2:
-        return big_endian ?
+        mask = UINT16_MAX;
+        result = big_endian ?
             cpu_atomic_cmpxchgw_be_mmu(env, addr, cmp, value, oi, ra) :
             cpu_atomic_cmpxchgw_le_mmu(env, addr, cmp, value, oi, ra);
+        break;
     case 4:
-        return big_endian ?
+        mask = UINT32_MAX;
+        result = big_endian ?
             cpu_atomic_cmpxchgl_be_mmu(env, addr, cmp, value, oi, ra) :
             cpu_atomic_cmpxchgl_le_mmu(env, addr, cmp, value, oi, ra);
+        break;
     case 8:
-        return big_endian ?
+        mask = UINT64_MAX;
+        result = big_endian ?
             cpu_atomic_cmpxchgq_be_mmu(env, addr, cmp, value, oi, ra) :
             cpu_atomic_cmpxchgq_le_mmu(env, addr, cmp, value, oi, ra);
+        break;
     default:
         g_assert_not_reached();
     }
+    if ((result & mask) == (cmp & mask)) {
+        ia64_alat_write_end(env, addr, size);
+    } else {
+        ia64_alat_write_cancel(env);
+    }
+    return result;
 }
 
 Int128 ia64_exec_cmpxchg_16(CPUIA64State *env, uint64_t addr, Int128 cmp,
-                            Int128 value, bool big_endian, MemOpIdx oi,
+                            Int128 value, bool big_endian,
+                            unsigned invalidation_size, MemOpIdx oi,
                             uintptr_t ra)
 {
 #if HAVE_CMPXCHG128
-    return big_endian ?
+    Int128 result;
+
+    ia64_alat_write_begin(env);
+    result = big_endian ?
         cpu_atomic_cmpxchgo_be_mmu(env, addr, cmp, value, oi, ra) :
         cpu_atomic_cmpxchgo_le_mmu(env, addr, cmp, value, oi, ra);
+    if (int128_eq(result, cmp)) {
+        ia64_alat_write_end(env, addr, invalidation_size);
+    } else {
+        ia64_alat_write_cancel(env);
+    }
+    return result;
 #else
     g_assert_not_reached();
 #endif

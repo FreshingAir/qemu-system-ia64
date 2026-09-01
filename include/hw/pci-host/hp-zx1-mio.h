@@ -10,6 +10,7 @@
 #include "hw/core/sysbus.h"
 
 #define TYPE_HP_ZX1_MIO "hp-zx1-mio"
+#define TYPE_HP_ZX2_MIO "hp-zx2-mio"
 OBJECT_DECLARE_SIMPLE_TYPE(HPZX1MIOState, HP_ZX1_MIO)
 
 typedef struct HPZX1IOAState HPZX1IOAState;

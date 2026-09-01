@@ -97,6 +97,12 @@ struct TCGCPUOps {
     void (*cpu_exec_enter)(CPUState *cpu);
     /** @cpu_exec_exit: Callback for cpu_exec cleanup */
     void (*cpu_exec_exit)(CPUState *cpu);
+    /**
+     * @cpu_exec_longjmp_cleanup: Target cleanup during TCG longjmp recovery
+     *
+     * Must not raise an exception.
+     */
+    void (*cpu_exec_longjmp_cleanup)(CPUState *cpu);
     /** @debug_excp_handler: Callback for handling debug exceptions */
     void (*debug_excp_handler)(CPUState *cpu);
 

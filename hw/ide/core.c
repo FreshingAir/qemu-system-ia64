@@ -260,12 +260,12 @@ static void ide_atapi_identify(IDEState *s)
     padstr((char *)(p + 27), s->drive_model_str, 40); /* model */
     put_le16(p + 48, 1); /* dword I/O (XXX: should not be set on CDROM) */
 #ifdef USE_DMA_CDROM
-    put_le16(p + 49, 1 << 9 | 1 << 8); /* DMA and LBA supported */
+    put_le16(p + 49, 1 << 11 | 1 << 9 | 1 << 8);
     put_le16(p + 53, 7); /* words 64-70, 54-58, 88 valid */
     put_le16(p + 62, 7);  /* single word dma0-2 supported */
     put_le16(p + 63, 7);  /* mdma0-2 supported */
 #else
-    put_le16(p + 49, 1 << 9); /* LBA supported, no DMA */
+    put_le16(p + 49, 1 << 11 | 1 << 9);
     put_le16(p + 53, 3); /* words 64-70, 54-58 valid */
     put_le16(p + 63, 0x103); /* DMA modes XXX: may be incorrect */
 #endif

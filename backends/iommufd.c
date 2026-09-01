@@ -271,7 +271,8 @@ int iommufd_backend_map_file_dma(IOMMUFDBackend *be, uint32_t ioas_id,
 }
 
 int iommufd_backend_unmap_dma(IOMMUFDBackend *be, uint32_t ioas_id,
-                              hwaddr iova, uint64_t size)
+                              hwaddr iova, uint64_t size,
+                              uint64_t *unmapped_size, bool *executed)
 {
     int ret, fd = be->fd;
     struct iommu_ioas_unmap unmap = {
@@ -280,6 +281,9 @@ int iommufd_backend_unmap_dma(IOMMUFDBackend *be, uint32_t ioas_id,
         .iova = iova,
         .length = size,
     };
+
+    *unmapped_size = 0;
+    *executed = false;
 
     if (cpr_is_incoming()) {
         return 0;
@@ -299,6 +303,10 @@ int iommufd_backend_unmap_dma(IOMMUFDBackend *be, uint32_t ioas_id,
         ret = 0;
     } else {
         trace_iommufd_backend_unmap_dma(fd, ioas_id, iova, size, ret);
+        if (!ret) {
+            *unmapped_size = unmap.length;
+            *executed = true;
+        }
     }
 
     if (ret) {

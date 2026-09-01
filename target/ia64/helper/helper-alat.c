@@ -4,6 +4,7 @@
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "arch/arch.h"
+#include "exec-access.h"
 
 uint64_t helper_chk_a(CPUIA64State *env, uint64_t va, uint32_t reg)
 {
@@ -68,8 +69,22 @@ uint64_t helper_check_load_alat_fp_addr(CPUIA64State *env, uint32_t reg,
     return ia64_alat_check_load_fp_addr(env, reg, addr, size, clear);
 }
 
-void helper_invalidate_alat_store(CPUIA64State *env, uint64_t addr,
-                                  uint32_t size)
+void helper_alat_write_begin(CPUIA64State *env)
 {
-    ia64_invalidate_alat_store(env, addr, size);
+    ia64_alat_write_begin(env);
+}
+
+void helper_alat_write_end(CPUIA64State *env, uint64_t addr, uint32_t size)
+{
+    ia64_alat_write_end(env, addr, size);
+}
+
+void helper_notify_alat_store(CPUIA64State *env)
+{
+    ia64_alat_notify_store(env);
+}
+
+void helper_alat_ensure_exclusive(CPUIA64State *env)
+{
+    ia64_exec_ensure_alat_exclusive(env, GETPC());
 }

@@ -34,6 +34,7 @@ static const char *ia64_nvram_option(const char *machine)
         g_str_equal(machine, "itanium-vpc") ||
         g_str_equal(machine, "itanium2-vpc") ||
         g_str_equal(machine, "hp-i2000") ||
+        g_str_equal(machine, "hp-rx2660") ||
         g_str_equal(machine, "hp-zx6000")) {
         return ",nvram=none";
     }

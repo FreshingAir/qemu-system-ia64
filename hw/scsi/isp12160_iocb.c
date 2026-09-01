@@ -1,5 +1,5 @@
 /*
- * ISP12160 A64 command and continuation IOCB parser
+ * ISP12160 command and continuation IOCB parser
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -9,30 +9,52 @@
 #include "hw/scsi/isp12160_iocb.h"
 #include "qemu/bswap.h"
 
-static bool bytes_are_zero(const uint8_t *bytes, size_t length)
-{
-    size_t i;
+typedef struct ISP12160IOCBFormat {
+    uint8_t command_type;
+    uint8_t continuation_type;
+    uint8_t command_segments;
+    uint8_t continuation_segments;
+    uint8_t command_segment_offset;
+    uint8_t continuation_segment_offset;
+    uint8_t segment_stride;
+    bool a64;
+} ISP12160IOCBFormat;
 
-    for (i = 0; i < length; i++) {
-        if (bytes[i]) {
-            return false;
-        }
-    }
-    return true;
-}
+static const ISP12160IOCBFormat format_32 = {
+    .command_type = ISP12160_IOCB_COMMAND_TYPE,
+    .continuation_type = ISP12160_IOCB_CONTINUE_TYPE,
+    .command_segments = ISP12160_IOCB_COMMAND_SEGMENTS,
+    .continuation_segments = ISP12160_IOCB_CONTINUE_SEGMENTS,
+    .command_segment_offset = ISP12160_IOCB_SEGMENT0_OFFSET,
+    .continuation_segment_offset = ISP12160_IOCB_CONTINUE_SEGMENT0_OFFSET,
+    .segment_stride = ISP12160_IOCB_SEGMENT_STRIDE,
+};
 
-static bool parse_segment(const uint8_t *entry, size_t offset,
+static const ISP12160IOCBFormat format_a64 = {
+    .command_type = ISP12160_IOCB_COMMAND_A64_TYPE,
+    .continuation_type = ISP12160_IOCB_CONTINUE_A64_TYPE,
+    .command_segments = ISP12160_IOCB_COMMAND_A64_SEGMENTS,
+    .continuation_segments = ISP12160_IOCB_CONTINUE_A64_SEGMENTS,
+    .command_segment_offset = ISP12160_IOCB_A64_SEGMENT0_OFFSET,
+    .continuation_segment_offset = ISP12160_IOCB_CONT_SEGMENT0_OFFSET,
+    .segment_stride = ISP12160_IOCB_A64_SEGMENT_STRIDE,
+    .a64 = true,
+};
+
+static bool parse_segment(const uint8_t *entry, size_t offset, bool a64,
                           ISP12160IOCBSegment *segment,
                           uint64_t *transfer_length, Error **errp)
 {
-    uint64_t address = ldq_le_p(entry + offset);
-    uint32_t length = ldl_le_p(entry + offset + sizeof(address));
+    uint64_t address = a64 ? ldq_le_p(entry + offset) :
+                             ldl_le_p(entry + offset);
+    uint32_t length = ldl_le_p(entry + offset + (a64 ? 8 : 4));
+    uint64_t last_address = a64 ? UINT64_MAX : UINT32_MAX;
 
     if (!length) {
         error_setg(errp, "ISP12160 IOCB contains an empty data segment");
         return false;
     }
-    if (address > UINT64_MAX - (length - 1U)) {
+    if (address > last_address - (length - 1U)) {
         error_setg(errp, "ISP12160 IOCB data segment wraps address space");
         return false;
     }
@@ -47,23 +69,12 @@ static bool parse_segment(const uint8_t *entry, size_t offset,
     return true;
 }
 
-static bool unused_segments_are_zero(const uint8_t *entry, size_t first,
-                                     size_t stride, size_t used, size_t total)
-{
-    size_t i;
-
-    for (i = used; i < total; i++) {
-        if (!bytes_are_zero(entry + first + i * stride, stride)) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
-                             ISP12160IOCBCommand *command,
-                             ISP12160IOCBSegment *segments,
-                             size_t segment_capacity, Error **errp)
+static bool isp12160_iocb_parse(const uint8_t *entries, size_t entry_count,
+                                ISP12160IOCBCommand *command,
+                                ISP12160IOCBSegment *segments,
+                                size_t segment_capacity,
+                                const ISP12160IOCBFormat *format,
+                                Error **errp)
 {
     const uint8_t *first;
     ISP12160IOCBCommand candidate = { 0 };
@@ -82,41 +93,34 @@ bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
     }
 
     first = entries;
-    if (first[ISP12160_IOCB_HEADER_TYPE_OFFSET] !=
-            ISP12160_IOCB_COMMAND_A64_TYPE ||
+    if (first[ISP12160_IOCB_HEADER_TYPE_OFFSET] != format->command_type ||
         first[ISP12160_IOCB_HEADER_COUNT_OFFSET] != entry_count ||
         first[ISP12160_IOCB_HEADER_STATUS_OFFSET]) {
-        error_setg(errp, "invalid ISP12160 A64 command entry header");
+        error_setg(errp, "invalid ISP12160 command entry header");
         return false;
     }
-    if (lduw_le_p(first + ISP12160_IOCB_A64_RESERVED_OFFSET) ||
-        !bytes_are_zero(first + ISP12160_IOCB_A64_RESERVED1_OFFSET,
-                        ISP12160_IOCB_A64_RESERVED1_BYTES)) {
-        error_setg(errp, "ISP12160 A64 command reserved fields are nonzero");
+    if (lduw_le_p(first + ISP12160_IOCB_A64_RESERVED_OFFSET)) {
+        error_setg(errp, "ISP12160 command reserved field is nonzero");
         return false;
     }
 
     cdb_length = lduw_le_p(first + ISP12160_IOCB_A64_CDB_LENGTH_OFFSET);
-    if (!cdb_length || cdb_length > ISP12160_IOCB_CDB_BYTES ||
-        !bytes_are_zero(first + ISP12160_IOCB_A64_CDB_OFFSET + cdb_length,
-                        ISP12160_IOCB_CDB_BYTES - cdb_length)) {
-        error_setg(errp, "invalid ISP12160 A64 command CDB length or tail");
+    if (!cdb_length || cdb_length > ISP12160_IOCB_CDB_BYTES) {
+        error_setg(errp, "invalid ISP12160 command CDB length");
         return false;
     }
     candidate.cdb_length = cdb_length;
 
     candidate.control_flags = lduw_le_p(
         first + ISP12160_IOCB_A64_CONTROL_FLAGS_OFFSET);
-    if (candidate.control_flags &
-        ~(ISP12160_IOCB_CONTROL_SIMPLE_TAG |
-          ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE |
-          ISP12160_IOCB_CONTROL_DATA_TO_DEVICE)) {
-        error_setg(errp, "unsupported ISP12160 A64 command control flags");
+    if (candidate.control_flags & ~ISP12160_IOCB_CONTROL_SUPPORTED) {
+        error_setg(errp, "unsupported ISP12160 command control flags");
         return false;
     }
+    candidate.segment_count = lduw_le_p(
+        first + ISP12160_IOCB_A64_SEGMENT_COUNT_OFFSET);
     direction_bits = candidate.control_flags &
-        (ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE |
-         ISP12160_IOCB_CONTROL_DATA_TO_DEVICE);
+        ISP12160_IOCB_CONTROL_DATA_UNKNOWN;
     switch (direction_bits) {
     case 0:
         candidate.direction = ISP12160_IOCB_DIRECTION_NONE;
@@ -127,32 +131,31 @@ bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
     case ISP12160_IOCB_CONTROL_DATA_TO_DEVICE:
         candidate.direction = ISP12160_IOCB_DIRECTION_TO_DEVICE;
         break;
-    default:
-        error_setg(errp, "bidirectional ISP12160 IOCBs are unsupported");
-        return false;
+    case ISP12160_IOCB_CONTROL_DATA_UNKNOWN:
+        candidate.direction = ISP12160_IOCB_DIRECTION_UNKNOWN;
+        break;
     }
 
-    candidate.segment_count = lduw_le_p(
-        first + ISP12160_IOCB_A64_SEGMENT_COUNT_OFFSET);
     expected_entries = 1;
-    if (candidate.segment_count > ISP12160_IOCB_COMMAND_A64_SEGMENTS) {
+    if (candidate.segment_count > format->command_segments) {
         expected_entries += DIV_ROUND_UP(
-            candidate.segment_count - ISP12160_IOCB_COMMAND_A64_SEGMENTS,
-            ISP12160_IOCB_CONTINUE_A64_SEGMENTS);
+            candidate.segment_count - format->command_segments,
+            format->continuation_segments);
     }
     if (entry_count != expected_entries) {
         error_setg(errp,
-                   "ISP12160 A64 command entry count does not match segments");
+                   "ISP12160 command entry count does not match segments");
         return false;
     }
     if (candidate.segment_count > segment_capacity) {
-        error_setg(errp, "ISP12160 A64 command exceeds segment capacity");
+        error_setg(errp, "ISP12160 command exceeds segment capacity");
         return false;
     }
-    if ((candidate.segment_count == 0) !=
+    if (candidate.direction != ISP12160_IOCB_DIRECTION_UNKNOWN &&
+        (candidate.segment_count == 0) !=
         (candidate.direction == ISP12160_IOCB_DIRECTION_NONE)) {
         error_setg(errp,
-                   "ISP12160 A64 command direction disagrees with segments");
+                   "ISP12160 command direction disagrees with segments");
         return false;
     }
 
@@ -161,58 +164,40 @@ bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
                                     candidate.segment_count);
     }
     while (segment_index < candidate.segment_count &&
-           segment_index < ISP12160_IOCB_COMMAND_A64_SEGMENTS) {
+           segment_index < format->command_segments) {
         if (!parse_segment(first,
-                           ISP12160_IOCB_A64_SEGMENT0_OFFSET +
-                           segment_index *
-                               ISP12160_IOCB_A64_SEGMENT_STRIDE,
+                           format->command_segment_offset +
+                           segment_index * format->segment_stride,
+                           format->a64,
                            &candidate_segments[segment_index],
                            &candidate.transfer_length, errp)) {
             return false;
         }
         segment_index++;
     }
-    if (!unused_segments_are_zero(
-            first, ISP12160_IOCB_A64_SEGMENT0_OFFSET,
-            ISP12160_IOCB_A64_SEGMENT_STRIDE,
-            MIN((size_t)candidate.segment_count,
-                (size_t)ISP12160_IOCB_COMMAND_A64_SEGMENTS),
-            ISP12160_IOCB_COMMAND_A64_SEGMENTS)) {
-        error_setg(errp, "ISP12160 A64 command has an unused data segment");
-        return false;
-    }
-
     for (continuation = 1; continuation < entry_count; continuation++) {
         const uint8_t *entry = entries +
             continuation * ISP12160_IOCB_ENTRY_BYTES;
-        size_t used = MIN((size_t)ISP12160_IOCB_CONTINUE_A64_SEGMENTS,
+        size_t used = MIN((size_t)format->continuation_segments,
                           candidate.segment_count - segment_index);
         size_t i;
 
         if (entry[ISP12160_IOCB_HEADER_TYPE_OFFSET] !=
-                ISP12160_IOCB_CONTINUE_A64_TYPE ||
+                format->continuation_type ||
             entry[ISP12160_IOCB_HEADER_COUNT_OFFSET] != 1 ||
             entry[ISP12160_IOCB_HEADER_STATUS_OFFSET]) {
-            error_setg(errp,
-                       "invalid ISP12160 A64 continuation entry header");
+            error_setg(errp, "invalid ISP12160 continuation entry header");
             return false;
         }
         for (i = 0; i < used; i++, segment_index++) {
             if (!parse_segment(entry,
-                               ISP12160_IOCB_CONT_SEGMENT0_OFFSET +
-                               i * ISP12160_IOCB_CONT_SEGMENT_STRIDE,
+                               format->continuation_segment_offset +
+                               i * format->segment_stride,
+                               format->a64,
                                &candidate_segments[segment_index],
                                &candidate.transfer_length, errp)) {
                 return false;
             }
-        }
-        if (!unused_segments_are_zero(
-                entry, ISP12160_IOCB_CONT_SEGMENT0_OFFSET,
-                ISP12160_IOCB_CONT_SEGMENT_STRIDE, used,
-                ISP12160_IOCB_CONTINUE_A64_SEGMENTS)) {
-            error_setg(errp,
-                       "ISP12160 A64 continuation has an unused segment");
-            return false;
         }
     }
 
@@ -225,7 +210,7 @@ bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
     candidate.channel = raw_target >> 7;
     candidate.target = raw_target & 0x7f;
     if (candidate.lun >= 8 || candidate.target >= 16) {
-        error_setg(errp, "invalid ISP12160 A64 command target or LUN");
+        error_setg(errp, "invalid ISP12160 command target or LUN");
         return false;
     }
     memcpy(candidate.cdb, first + ISP12160_IOCB_A64_CDB_OFFSET,
@@ -237,6 +222,24 @@ bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
                candidate.segment_count * sizeof(*segments));
     }
     return true;
+}
+
+bool isp12160_iocb_parse_32(const uint8_t *entries, size_t entry_count,
+                            ISP12160IOCBCommand *command,
+                            ISP12160IOCBSegment *segments,
+                            size_t segment_capacity, Error **errp)
+{
+    return isp12160_iocb_parse(entries, entry_count, command, segments,
+                               segment_capacity, &format_32, errp);
+}
+
+bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
+                             ISP12160IOCBCommand *command,
+                             ISP12160IOCBSegment *segments,
+                             size_t segment_capacity, Error **errp)
+{
+    return isp12160_iocb_parse(entries, entry_count, command, segments,
+                               segment_capacity, &format_a64, errp);
 }
 
 static bool completion_status_valid(uint16_t status)

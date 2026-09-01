@@ -52,6 +52,21 @@ static void ia64_gen_merced_dtlb1_touch(DisasContext *ctx, TCGv_i64 addr,
     }
 }
 
+static void ia64_gen_alat_write_begin(DisasContext *ctx)
+{
+    if (ctx->memory.full_alat) {
+        gen_helper_alat_write_begin(tcg_env);
+    }
+}
+
+static void ia64_gen_alat_write_end(DisasContext *ctx, TCGv_i64 addr,
+                                    uint32_t size)
+{
+    if (ctx->memory.full_alat) {
+        gen_helper_alat_write_end(tcg_env, addr, tcg_constant_i32(size));
+    }
+}
+
 void ia64_gen_qemu_ld_i64(DisasContext *ctx, TCGv_i64 value, TCGv_i64 addr,
                           int mmu_idx, MemOp memop)
 {
@@ -63,7 +78,9 @@ void ia64_gen_qemu_st_i64(DisasContext *ctx, TCGv_i64 value, TCGv_i64 addr,
                           int mmu_idx, MemOp memop)
 {
     ia64_gen_merced_dtlb1_touch(ctx, addr, mmu_idx, memop);
+    ia64_gen_alat_write_begin(ctx);
     tcg_gen_qemu_st_i64(value, addr, mmu_idx, memop);
+    ia64_gen_alat_write_end(ctx, addr, ia64_memop_size(memop));
 }
 
 void ia64_gen_qemu_ld_i128(DisasContext *ctx, TCGv_i128 value, TCGv_i64 addr,
@@ -77,7 +94,9 @@ void ia64_gen_qemu_st_i128(DisasContext *ctx, TCGv_i128 value, TCGv_i64 addr,
                            int mmu_idx, MemOp memop)
 {
     ia64_gen_merced_dtlb1_touch(ctx, addr, mmu_idx, memop);
+    ia64_gen_alat_write_begin(ctx);
     tcg_gen_qemu_st_i128(value, addr, mmu_idx, memop);
+    ia64_gen_alat_write_end(ctx, addr, 16);
 }
 
 void ia64_gen_atomic_xchg_i64(DisasContext *ctx, TCGv_i64 result,
@@ -85,7 +104,9 @@ void ia64_gen_atomic_xchg_i64(DisasContext *ctx, TCGv_i64 result,
                               MemOp memop)
 {
     ia64_gen_merced_dtlb1_touch(ctx, addr, mmu_idx, memop);
+    ia64_gen_alat_write_begin(ctx);
     tcg_gen_atomic_xchg_i64(result, addr, value, mmu_idx, memop);
+    ia64_gen_alat_write_end(ctx, addr, ia64_memop_size(memop));
 }
 
 void ia64_gen_atomic_cmpxchg_i64(DisasContext *ctx, TCGv_i64 result,
@@ -102,7 +123,9 @@ void ia64_gen_atomic_fetch_add_i64(DisasContext *ctx, TCGv_i64 result,
                                    MemOp memop)
 {
     ia64_gen_merced_dtlb1_touch(ctx, addr, mmu_idx, memop);
+    ia64_gen_alat_write_begin(ctx);
     tcg_gen_atomic_fetch_add_i64(result, addr, value, mmu_idx, memop);
+    ia64_gen_alat_write_end(ctx, addr, ia64_memop_size(memop));
 }
 
 static bool ia64_insn_may_set_fault_suppression(const Ia64Instruction *insn)
@@ -1552,26 +1575,6 @@ void ia64_gen_check_alignment(DisasContext *ctx,
         always_fault ? IA64_ALIGNMENT_NATURAL_REQUIRED :
                        IA64_ALIGNMENT_INTEGER,
         is_write ? IA64_ISR_W : IA64_ISR_R);
-}
-
-void ia64_gen_invalidate_alat_store(DisasContext *ctx, TCGv_i64 addr,
-                                    uint32_t size)
-{
-    TCGLabel *done;
-    TCGv_i32 active;
-
-    if (!ctx->memory.full_alat) {
-        return;
-    }
-
-    done = gen_new_label();
-    active = tcg_temp_new_i32();
-
-    tcg_gen_ld_i32(active, tcg_env,
-                   offsetof(CPUIA64State, alat_state.alat_active_count));
-    tcg_gen_brcondi_i32(TCG_COND_EQ, active, 0, done);
-    gen_helper_invalidate_alat_store(tcg_env, addr, tcg_constant_i32(size));
-    gen_set_label(done);
 }
 
 static TCGLabel *ia64_gen_predicate_skip(DisasContext *ctx,

@@ -14,6 +14,7 @@
 
 #include "exec/hwaddr.h"
 #include "system/memory.h"
+#include "system/physmem.h"
 
 struct MemoryRegionCache {
     uint8_t *ptr;
@@ -72,9 +73,13 @@ void address_space_stb_cached(MemoryRegionCache *cache,
                               hwaddr addr, uint8_t val,
                               MemTxAttrs attrs, MemTxResult *result)
 {
+    bool observed;
+
     assert(addr < cache->len);
     if (likely(cache->ptr)) {
+        observed = physical_memory_write_begin();
         stb_p(cache->ptr + addr, val);
+        physical_memory_write_end(observed);
     } else {
         address_space_stb_cached_slow(cache, addr, val, attrs, result);
     }
@@ -200,9 +205,13 @@ static inline MemTxResult
 address_space_write_cached(MemoryRegionCache *cache, hwaddr addr,
                            const void *buf, hwaddr len)
 {
+    bool observed;
+
     assert(addr < cache->len && len <= cache->len - addr);
     if (likely(cache->ptr)) {
+        observed = physical_memory_write_begin();
         memcpy(cache->ptr + addr, buf, len);
+        physical_memory_write_end(observed);
         return MEMTX_OK;
     } else {
         return address_space_write_cached_slow(cache, addr, buf, len);

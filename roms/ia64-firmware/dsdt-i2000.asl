@@ -23,30 +23,30 @@ DefinitionBlock ("", "DSDT", 2, "QEMU  ", "I2K4DSDT", 0x00000001)
             Name (_CRS, ResourceTemplate ()
             {
                 WordBusNumber (ResourceProducer, MinFixed, MaxFixed,
-                    PosDecode, 0, 0, 0x001F, 0, 0x0020)
+                    PosDecode, 0, 0, 0, 0, 1)
                 QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
-                    EntireRange, 0, 0, 0x00003FFF, 0, 0x00004000,
+                    EntireRange, 0, 0, 0x000001CD, 0, 0x000001CE,
                     , , , TypeStatic, DenseTranslation)
-                DWordMemory (ResourceProducer, PosDecode, MinFixed,
-                    MaxFixed, Cacheable, ReadWrite,
-                    0, 0x000A0000, 0x000BFFFF, 0, 0x00020000)
-                DWordMemory (ResourceProducer, PosDecode, MinFixed,
-                    MaxFixed, Cacheable, ReadOnly,
-                    0, 0x000C0000, 0x000C7FFF, 0, 0x00008000)
+                QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                    EntireRange, 0, 0x000001D2, 0x000003AF, 0, 0x000001DE,
+                    , , , TypeStatic, DenseTranslation)
+                QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                    EntireRange, 0, 0x000003E0, 0x00003FFF, 0, 0x00003C20,
+                    , , , TypeStatic, DenseTranslation)
                 QWordMemory (ResourceProducer, PosDecode, MinFixed,
                     MaxFixed, NonCacheable, ReadWrite,
                     0, 0x90000000, 0x9FFFFFFF, 0, 0x10000000)
             })
             Name (_PRT, Package ()
             {
+                Package () { 0x0004FFFF, 0, Zero, 16 },
                 Package () { 0x0005FFFF, 0, Zero, 16 },
-                Package () { 0x0003FFFF, 0, Zero, 16 },
-                Package () { 0x0002FFFF, 3, Zero, 19 }
+                Package () { 0x0003FFFF, 3, Zero, 19 }
             })
 
             Device (IFB0)
             {
-                Name (_ADR, 0x00020000)
+                Name (_ADR, 0x00030000)
 
                 Device (COM1)
                 {
@@ -86,13 +86,13 @@ DefinitionBlock ("", "DSDT", 2, "QEMU  ", "I2K4DSDT", 0x00000001)
             Name (_HID, "PNP0A03")
             Name (_CID, "PNP0A03")
             Name (_SEG, Zero)
-            Name (_BBN, 0x20)
+            Name (_BBN, One)
             Name (_UID, One)
             Name (_CCA, One)
             Name (_CRS, ResourceTemplate ()
             {
                 WordBusNumber (ResourceProducer, MinFixed, MaxFixed,
-                    PosDecode, 0, 0x0020, 0x003F, 0, 0x0020)
+                    PosDecode, 0, 1, 1, 0, 1)
                 QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
                     EntireRange, 0, 0x00004000, 0x00007FFF, 0, 0x00004000,
                     , , , TypeStatic, DenseTranslation)
@@ -102,8 +102,7 @@ DefinitionBlock ("", "DSDT", 2, "QEMU  ", "I2K4DSDT", 0x00000001)
             })
             Name (_PRT, Package ()
             {
-                Package () { 0x0002FFFF, 0, Zero, 20 },
-                Package () { 0x0003FFFF, 0, Zero, 20 }
+                Package () { 0x0000FFFF, 0, Zero, 20 }
             })
         }
 
@@ -112,13 +111,13 @@ DefinitionBlock ("", "DSDT", 2, "QEMU  ", "I2K4DSDT", 0x00000001)
             Name (_HID, "PNP0A03")
             Name (_CID, "PNP0A03")
             Name (_SEG, Zero)
-            Name (_BBN, 0x40)
+            Name (_BBN, 0x02)
             Name (_UID, 0x02)
             Name (_CCA, One)
             Name (_CRS, ResourceTemplate ()
             {
                 WordBusNumber (ResourceProducer, MinFixed, MaxFixed,
-                    PosDecode, 0, 0x0040, 0x005F, 0, 0x0020)
+                    PosDecode, 0, 2, 2, 0, 1)
                 QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
                     EntireRange, 0, 0x00008000, 0x0000BFFF, 0, 0x00004000,
                     , , , TypeStatic, DenseTranslation)
@@ -129,5 +128,38 @@ DefinitionBlock ("", "DSDT", 2, "QEMU  ", "I2K4DSDT", 0x00000001)
             Name (_PRT, Package () {})
         }
 
+        Device (PCI3)
+        {
+            Name (_HID, "PNP0A03")
+            Name (_CID, "PNP0A03")
+            Name (_SEG, Zero)
+            Name (_BBN, 0x03)
+            Name (_UID, 0x03)
+            Name (_CCA, One)
+            Name (_CRS, ResourceTemplate ()
+            {
+                WordBusNumber (ResourceProducer, MinFixed, MaxFixed,
+                    PosDecode, 0, 3, 3, 0, 1)
+                QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                    EntireRange, 0, 0x0000C000, 0x0000FFFF, 0, 0x00004000,
+                    , , , TypeStatic, DenseTranslation)
+                QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                    EntireRange, 0, 0x000001CE, 0x000001D1, 0, 0x00000004,
+                    , , , TypeStatic, DenseTranslation)
+                QWordIO (ResourceProducer, MinFixed, MaxFixed, PosDecode,
+                    EntireRange, 0, 0x000003B0, 0x000003DF, 0, 0x00000030,
+                    , , , TypeStatic, DenseTranslation)
+                DWordMemory (ResourceProducer, PosDecode, MinFixed,
+                    MaxFixed, NonCacheable, ReadWrite,
+                    0, 0x000A0000, 0x000FFFFF, 0, 0x00060000)
+                QWordMemory (ResourceProducer, PosDecode, MinFixed,
+                    MaxFixed, NonCacheable, ReadWrite,
+                    0, 0xE0000000, 0xEFFFFFFF, 0, 0x10000000)
+            })
+            Name (_PRT, Package ()
+            {
+                Package () { 0x0000FFFF, 0, Zero, 28 }
+            })
+        }
     }
 }

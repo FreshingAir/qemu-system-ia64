@@ -76,7 +76,14 @@ static inline int ia64_platform_zx1_embedded_io_sapic(
 #define IA64_PLATFORM_MAX_PROFILES        1U
 
 #define IA64_PLATFORM_ID_HP_I2000         0x00002000U
+#define IA64_PLATFORM_ID_HP_RX2660        0x00002660U
 #define IA64_PLATFORM_ID_HP_ZX6000        0x00006000U
+
+static inline int ia64_platform_is_hp_zx(unsigned int platform_id)
+{
+    return platform_id == IA64_PLATFORM_ID_HP_ZX6000 ||
+           platform_id == IA64_PLATFORM_ID_HP_RX2660;
+}
 
 #define IA64_PLATFORM_FLAG_NO_MCFG        (1U << 0)
 #define IA64_PLATFORM_FLAG_QEMU_EXTENSION (1U << 1)
@@ -114,9 +121,14 @@ static inline unsigned long long ia64_platform_firmware_compat_flags(
 
 #define IA64_PLATFORM_PCI_ROOT_FLAG_IDENTITY_DMA (1U << 0)
 #define IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO    (1U << 1)
+#define IA64_PLATFORM_PCI_ROOT_FLAG_AGP          (1U << 2)
+/* This root owns the platform's decoded legacy VGA I/O/memory aperture. */
+#define IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY   (1U << 3)
 #define IA64_PLATFORM_PCI_ROOT_KNOWN_FLAGS \
     (IA64_PLATFORM_PCI_ROOT_FLAG_IDENTITY_DMA | \
-     IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO)
+     IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO | \
+     IA64_PLATFORM_PCI_ROOT_FLAG_AGP | \
+     IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY)
 
 /*
  * PAL_PLATFORM_ADDR type 1 registers exactly one 64 MiB sparse-I/O block.
@@ -132,7 +144,7 @@ static inline int ia64_platform_legacy_io_valid(
 
     if (platform_id == IA64_PLATFORM_ID_HP_I2000) {
         phys_addr_bits = IA64_PLATFORM_I2000_PHYS_ADDR_BITS;
-    } else if (platform_id == IA64_PLATFORM_ID_HP_ZX6000) {
+    } else if (ia64_platform_is_hp_zx(platform_id)) {
         phys_addr_bits = IA64_PLATFORM_ZX6000_PHYS_ADDR_BITS;
     } else {
         return 0;

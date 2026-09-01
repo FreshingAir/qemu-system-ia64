@@ -12,25 +12,38 @@ from ia64.efi_build import app_path
 from ia64.media import make_fat_disk
 
 
-SMP_MERCED_CASES = {
+SMP_MERCED_BASE_CASES = {
     "sal-ap-wake", "merced-rendezvous", "merced-rendezvous-return",
+}
+SMP_MERCED_ZERO_CASES = SMP_MERCED_BASE_CASES | {
+    "zero-alat-check-reload",
 }
 
 
 class Ia64SmpMerced(Ia64FirmwareTest):
     def run_merced_ap_rendezvous(self, name: str, smp: int | str,
-                                 memory: str = "512M"):
+                                 memory: str = "512M",
+                                 alat: str = "zero"):
         disk = Path(self.scratch_file(f"smp-merced-{name}.img"))
         nvram = self.make_nvram(f"smp-merced-{name}.nvram")
         make_fat_disk(disk, app_path("smp-merced"))
         vm = self.launch_ia64(
             name=name, media=disk, smp=smp, memory=memory,
-            machine_options=f"firmware-console=serial,nvram={nvram}",
+            machine_options=(f"firmware-console=serial,nvram={nvram},"
+                             f"alat={alat}"),
             extra_args=("-cpu", "merced",
                         "-accel", "tcg,thread=multi"))
+        cases = SMP_MERCED_ZERO_CASES
         result = self.wait_ia64_suite(
-            vm, "smp-merced", SMP_MERCED_CASES, timeout=180.0)
-        self.assertSetEqual(set(result.cases), SMP_MERCED_CASES)
+            vm, "smp-merced", cases, timeout=180.0)
+        self.assertSetEqual(set(result.cases), cases)
+
+    def test_2_socket_requested_full_alat_is_zero(self):
+        self.run_merced_ap_rendezvous(
+            "2s-requested-full-alat-is-zero", 2, alat="full")
+
+    def test_2_socket_zero_alat(self):
+        self.run_merced_ap_rendezvous("2s-zero-alat", 2)
 
     def test_64_socket_rendezvous(self):
         self.run_merced_ap_rendezvous("64s", 64, memory="128M")

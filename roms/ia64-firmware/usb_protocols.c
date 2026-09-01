@@ -1915,6 +1915,7 @@ BOOLEAN fw_usb_protocols_install(VOID)
     EFI_STATUS status;
 
     if (controller == NULL || !usb_ohci_controller_present()) {
+        (void)usb_keyboard_init();
         return 1;
     }
     usb_protocol_initialize_interfaces();

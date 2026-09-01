@@ -55,7 +55,23 @@
 #define IA64_INT10_ROM_PCIR_OFFSET   0x0020U
 #define IA64_INT10_ROM_ATI_SIGNATURE_OFFSET 0x0074U
 #define IA64_INT10_ROM_ATI_HEADER_OFFSET 0x0080U
-#define IA64_INT10_ROM_ATI_PLL_OFFSET 0x00c0U
+#define IA64_INT10_ROM_ATI_HEADER_SIZE 0x0060U
+#define IA64_INT10_ROM_ATI_RAGE128_HEADER_SIZE 0x004aU
+#define IA64_INT10_ROM_ATI_INIT_OFFSET 0x00e0U
+#define IA64_INT10_ROM_ATI_INIT_READ_SIZE 10U
+#define IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET 0x00f0U
+#define IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE 12U
+#define IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET 0x00f0U
+#define IA64_INT10_ROM_ATI_RAGE128_MISC_SIZE 15U
+#define IA64_INT10_ROM_ATI_MISC_OFFSET 0x00fcU
+#define IA64_INT10_ROM_ATI_MISC_SIZE 2U
+#define IA64_INT10_ROM_ATI_CONNECTOR_OFFSET 0x02e0U
+#define IA64_INT10_ROM_ATI_CONNECTOR_SIZE 6U
+#define IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET 0x02e0U
+#define IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE 30U
+#define IA64_INT10_ROM_ATI_PLL_OFFSET 0x0300U
+#define IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET 0x0383U
+#define IA64_INT10_ROM_ATI_MEM_REGION_SIZE 106U
 #define IA64_INT10_ROM_HANDLER_OFFSET 0x0100U
 #define IA64_INT10_HANDLER_SIZE      116U
 #define IA64_INT10_ROM_OEM_OFFSET    0x0180U
@@ -72,6 +88,7 @@
 #define IA64_VGA_LEGACY_BASE         0x00000000000a0000ULL
 #define IA64_ATI_BIOS_0_SCRATCH      0x0010U
 #define IA64_ATI_VENDOR_ID           0x1002U
+#define IA64_ATI_RAGE128_DEVICE_ID   0x5046U
 #define IA64_ATI_RV100_DEVICE_ID     0x5159U
 #define IA64_ATI_ES1000_DEVICE_ID    0x515eU
 #define IA64_ATI_TEST_ROM_BASE       0x00000000d0020000ULL
@@ -302,14 +319,158 @@ static void test_assert_ppm_pixel(const char *filename, unsigned width,
     g_assert_cmphex(pixel[2], ==, blue);
 }
 
+static void assert_ati_combios(const uint8_t *rom, uint16_t device,
+                               uint8_t memory_mb)
+{
+    static const uint8_t expected_rage128_header[] = {
+        0x02, 0xa0, 0x01, 0x01, 0x03, 0x01, 0x4a, 0x00,
+    };
+    static const char expected_rage128_misc[] = "R128AGP SGS1UN";
+    static const uint8_t
+        expected_rage128_crt[IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE] = {
+        0x12, 0x00, 0x80, 0x00, 0x00, 0x00, 0x63, 0x4f,
+        0x51, 0x8c, 0x0c, 0x02, 0xdf, 0x01, 0xe9, 0x01,
+        0x82, 0x00, 0xd6, 0x09,
+    };
+    static const uint8_t expected_connector[] = {
+        0x11, 0x11, 0x00, 0x23, 0x00, 0x00,
+    };
+    static const uint8_t radeon_init_fields[] = { 0x46, 0x4e, 0x52 };
+    static const uint8_t radeon_only_fields[] = {
+        0x46, 0x48, 0x4e, 0x50, 0x52, 0x5e,
+    };
+    static const uint8_t clock_fields[] = { 0x0e, 0x1a, 0x26 };
+    uint8_t zero[IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE] = { 0 };
+    uint8_t expected_mem[IA64_INT10_ROM_ATI_MEM_REGION_SIZE] = { 0 };
+    uint16_t header = lduw_le_p(rom + 0x48);
+    bool rage128 = device == IA64_ATI_RAGE128_DEVICE_ID;
+    bool es1000 = device == IA64_ATI_ES1000_DEVICE_ID;
+    uint16_t pll;
+    size_t i;
+
+    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_SIGNATURE_OFFSET, 10,
+                    "761295520", 10);
+    g_assert_cmphex(header, ==, IA64_INT10_ROM_ATI_HEADER_OFFSET);
+    if (rage128) {
+        g_assert_cmpmem(rom + header, sizeof(expected_rage128_header),
+                        expected_rage128_header,
+                        sizeof(expected_rage128_header));
+        g_assert_cmphex(lduw_le_p(rom + header + 6), ==,
+                        IA64_INT10_ROM_ATI_RAGE128_HEADER_SIZE);
+    } else {
+        g_assert_cmphex(rom[header], ==, 8);
+        g_assert_cmphex(rom[header + 1], ==, 0xa0);
+        g_assert_cmpmem(rom + header + 2, 4, zero, 4);
+        g_assert_cmphex(lduw_le_p(rom + header + 6), ==,
+                        IA64_INT10_ROM_ATI_HEADER_SIZE);
+    }
+    g_assert_cmphex(lduw_le_p(rom + header + 0x0c), ==,
+                    IA64_INT10_ROM_ATI_INIT_OFFSET);
+    if (!rage128) {
+        for (i = 0; i < G_N_ELEMENTS(radeon_init_fields); i++) {
+            g_assert_cmphex(lduw_le_p(rom + header +
+                                      radeon_init_fields[i]), ==,
+                        IA64_INT10_ROM_ATI_INIT_OFFSET);
+        }
+    }
+    g_assert_cmphex(rom[IA64_INT10_ROM_ATI_INIT_OFFSET - 1], ==, 0);
+    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_INIT_OFFSET,
+                    IA64_INT10_ROM_ATI_INIT_READ_SIZE, zero,
+                    IA64_INT10_ROM_ATI_INIT_READ_SIZE);
+    if (rage128) {
+        g_assert_cmphex(lduw_le_p(rom + header + 0x14), ==,
+                        IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET);
+        g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET,
+                        IA64_INT10_ROM_ATI_RAGE128_MISC_SIZE,
+                        expected_rage128_misc,
+                        sizeof(expected_rage128_misc));
+        g_assert_cmphex(lduw_le_p(rom + header + 0x2e), ==,
+                        IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET);
+        g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET,
+                        IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE,
+                        expected_rage128_crt,
+                        sizeof(expected_rage128_crt));
+        for (i = 0; i < G_N_ELEMENTS(radeon_only_fields); i++) {
+            g_assert_cmphex(lduw_le_p(rom + header +
+                                      radeon_only_fields[i]), ==, 0);
+        }
+    } else {
+        g_assert_cmphex(lduw_le_p(rom + header + 0x14), ==,
+                        IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET);
+        g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET,
+                        IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE, zero,
+                        IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE);
+        g_assert_cmphex(lduw_le_p(rom + header + 0x2e), ==, 0);
+        g_assert_cmphex(lduw_le_p(rom + header + 0x5e), ==,
+                        IA64_INT10_ROM_ATI_MISC_OFFSET);
+        g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_MISC_OFFSET,
+                        IA64_INT10_ROM_ATI_MISC_SIZE, zero,
+                        IA64_INT10_ROM_ATI_MISC_SIZE);
+        g_assert_cmphex(lduw_le_p(rom + header + 0x50), ==,
+                        IA64_INT10_ROM_ATI_CONNECTOR_OFFSET);
+        g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_CONNECTOR_OFFSET,
+                        IA64_INT10_ROM_ATI_CONNECTOR_SIZE,
+                        expected_connector, sizeof(expected_connector));
+        g_assert_cmphex(lduw_le_p(rom + header + 0x48), ==,
+                        IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET);
+    }
+
+    expected_mem[0] = 3;
+    expected_mem[3] = memory_mb;
+    expected_mem[4] = 0x25;
+    expected_mem[6] = 1;
+    expected_mem[8] = 0xff;
+    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET - 3,
+                    sizeof(expected_mem), expected_mem,
+                    sizeof(expected_mem));
+
+    pll = lduw_le_p(rom + header + 0x30);
+    g_assert_cmphex(pll, ==, IA64_INT10_ROM_ATI_PLL_OFFSET);
+    g_assert_cmphex(rom[pll], ==, rage128 ? 6 : 0x0a);
+    g_assert_cmphex(rom[pll + 1], ==, rage128 ? 0x32 : 0x46);
+    g_assert_cmphex(rom[pll + 2], ==, 3);
+    g_assert_cmphex(rom[pll + 3], ==, rage128 ? 2 : 3);
+    g_assert_cmpuint(lduw_le_p(rom + pll + 0x04), ==,
+                     rage128 ? 0x0600 : (es1000 ? 0x05ee : 0x05a6));
+    g_assert_cmpuint(lduw_le_p(rom + pll + 0x06), ==,
+                     rage128 ? 0x05f8 : (es1000 ? 0x05e6 : 0x059e));
+    g_assert_cmpuint(lduw_le_p(rom + pll + 0x08), ==,
+                     rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    g_assert_cmpuint(lduw_le_p(rom + pll + 0x0a), ==,
+                     rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    g_assert_cmphex(rom[pll + 0x0c], ==, 3);
+    g_assert_cmphex(rom[pll + 0x0d], ==, 12);
+    for (i = 0; i < G_N_ELEMENTS(clock_fields); i++) {
+        size_t offset = pll + clock_fields[i];
+
+        g_assert_cmpuint(lduw_le_p(rom + offset), ==,
+                         rage128 ? 2950 : 2700);
+        g_assert_cmpuint(lduw_le_p(rom + offset + 2), ==,
+                         rage128 ? (i == 0 ? 65 : 29) :
+                                   (i == 0 ? 60 : 12));
+        g_assert_cmpuint(ldl_le_p(rom + offset + 4), ==,
+                         rage128 ? 12500 : (i == 0 ? 12000 : 20000));
+        g_assert_cmpuint(ldl_le_p(rom + offset + 8), ==,
+                         rage128 ? (i == 0 ? 40000 : 26041) :
+                                   (i == 0 ? 35000 : 40000));
+    }
+    if (!rage128) {
+        g_assert_cmphex(rom[pll + 0x32], ==, 1);
+        g_assert_cmphex(rom[pll + 0x33], ==, 0x12);
+        g_assert_cmpuint(lduw_le_p(rom + pll + 0x34), ==, 2700);
+        g_assert_cmpuint(ldl_le_p(rom + pll + 0x36), ==, 40);
+        g_assert_cmpuint(ldl_le_p(rom + pll + 0x3a), ==, 3000);
+        g_assert_cmpuint(ldl_le_p(rom + pll + 0x3e), ==, 12000);
+        g_assert_cmpuint(ldl_le_p(rom + pll + 0x42), ==, 35000);
+    }
+}
+
 static void test_int10_rom(void)
 {
     uint8_t rom[IA64_INT10_ROM_SIZE];
     uint8_t zero[IA64_INT10_ROM_SIZE] = { 0 };
     uint8_t vector[4];
     uint32_t vector_linear;
-    uint16_t ati_header;
-    uint16_t ati_pll;
     unsigned checksum = 0;
     QTestState *qts = ia64_vpc_start(NULL);
     size_t i;
@@ -332,17 +493,7 @@ static void test_int10_rom(void)
     g_assert_cmphex(lduw_le_p(rom + IA64_INT10_ROM_PCIR_OFFSET + 0x10),
                     ==, IA64_INT10_ROM_SIZE / 512);
     g_assert_cmpmem(rom + 0x60, 19, "QEMU IA64 VBE INT10", 19);
-    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_SIGNATURE_OFFSET, 10,
-                    "761295520", 10);
-    ati_header = lduw_le_p(rom + 0x48);
-    g_assert_cmphex(ati_header, ==, IA64_INT10_ROM_ATI_HEADER_OFFSET);
-    ati_pll = lduw_le_p(rom + ati_header + 0x30);
-    g_assert_cmphex(ati_pll, ==, IA64_INT10_ROM_ATI_PLL_OFFSET);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x08), ==, 23000);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x0e), ==, 2700);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x10), ==, 4);
-    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x12), ==, 12000);
-    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x16), ==, 35000);
+    assert_ati_combios(rom, IA64_ATI_RAGE128_DEVICE_ID, 16);
     g_assert_cmpmem(rom + IA64_INT10_ROM_OEM_OFFSET, 13,
                     "QEMU IA64 VBE", 13);
     g_assert_cmphex(lduw_le_p(rom + IA64_INT10_ROM_MODES_OFFSET),
@@ -382,8 +533,6 @@ static void test_int10_rom(void)
 static void assert_ati_model_int10_rom(const char *args, uint16_t device)
 {
     uint8_t rom[IA64_INT10_ROM_SIZE];
-    uint16_t ati_header;
-    uint16_t ati_pll;
     unsigned int checksum = 0;
     QTestState *qts = ia64_vpc_start(args);
     size_t i;
@@ -393,17 +542,7 @@ static void assert_ati_model_int10_rom(const char *args, uint16_t device)
                     IA64_ATI_VENDOR_ID);
     g_assert_cmphex(lduw_le_p(rom + IA64_INT10_ROM_PCIR_OFFSET + 6), ==,
                     device);
-    g_assert_cmpmem(rom + IA64_INT10_ROM_ATI_SIGNATURE_OFFSET, 10,
-                    "761295520", 10);
-    ati_header = lduw_le_p(rom + 0x48);
-    g_assert_cmphex(ati_header, ==, IA64_INT10_ROM_ATI_HEADER_OFFSET);
-    ati_pll = lduw_le_p(rom + ati_header + 0x30);
-    g_assert_cmphex(ati_pll, ==, IA64_INT10_ROM_ATI_PLL_OFFSET);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x08), ==, 23000);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x0e), ==, 2700);
-    g_assert_cmpuint(lduw_le_p(rom + ati_pll + 0x10), ==, 4);
-    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x12), ==, 12000);
-    g_assert_cmpuint(ldl_le_p(rom + ati_pll + 0x16), ==, 35000);
+    assert_ati_combios(rom, device, 16);
     for (i = 0; i < sizeof(rom); i++) {
         checksum += rom[i];
     }
@@ -1167,28 +1306,93 @@ static void test_machine_default_ram(void)
     }
 }
 
-static void test_smp_rejects_full_alat(void)
+static void test_smp_forces_zero_alat(void)
 {
-    const char *argv[] = {
-        qtest_qemu_binary(NULL),
-        "-machine", "ia64-vpc,alat=full,nvram=none",
-        "-smp", "2",
-        "-display", "none",
-        NULL,
-    };
-    g_autofree char *stderr_text = NULL;
-    g_autoptr(GError) error = NULL;
-    int wait_status;
+    if (g_test_subprocess()) {
+        g_autoptr(QDict) response = NULL;
+        QTestState *qts = qtest_init(
+            "-machine ia64-vpc,alat=full,nvram=none -smp 2 -S");
 
-    g_assert_true(g_spawn_sync(NULL, (char **)argv, NULL,
-                               G_SPAWN_STDOUT_TO_DEV_NULL,
-                               NULL, NULL, NULL, &stderr_text,
-                               &wait_status, &error));
-    g_assert_no_error(error);
-    g_assert_true(WIFEXITED(wait_status));
-    g_assert_cmpint(WEXITSTATUS(wait_status), ==, 1);
-    g_assert_nonnull(strstr(stderr_text,
-                            "full ALAT emulation is not SMP-safe"));
+        response = qtest_qmp(
+            qts, "{'execute':'qom-get','arguments':"
+                 "{'path':'/machine','property':'alat'}}");
+        g_assert_cmpstr(qdict_get_str(response, "return"), ==, "zero");
+        qtest_quit(qts);
+        return;
+    }
+
+    g_test_trap_subprocess(NULL, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_passed();
+    g_test_trap_assert_stderr(
+        "*warning: full ALAT emulation is disabled with 2 CPUs; "
+        "using the zero-entry ALAT model*");
+}
+
+static void test_full_alat_warns(void)
+{
+    if (g_test_subprocess()) {
+        g_autoptr(QDict) response = NULL;
+        QTestState *qts = qtest_init(
+            "-machine ia64-vpc,alat=full,nvram=none -smp 1 -S");
+
+        response = qtest_qmp(
+            qts, "{'execute':'qom-get','arguments':"
+                 "{'path':'/machine','property':'alat'}}");
+        g_assert_cmpstr(qdict_get_str(response, "return"), ==, "full");
+        qtest_quit(qts);
+        return;
+    }
+
+    g_test_trap_subprocess(NULL, 30 * G_USEC_PER_SEC, 0);
+    g_test_trap_assert_passed();
+    g_test_trap_assert_stderr(
+        "*warning: full ALAT emulation does not track direct external "
+        "writes to shared guest RAM*");
+}
+
+static void test_alat_active_writer_window(void)
+{
+    uint64_t active_alloc_count;
+    bool active_alloc_hit;
+    bool active_hit;
+    bool setup_hit;
+    QTestState *qts = qtest_init(
+        "-machine ia64-vpc,alat=full,nvram=none -m 4G -smp 1 -S "
+        "-accel tcg,thread=multi");
+
+    qtest_ia64_alat_active_writer(qts, &setup_hit, &active_hit,
+                                  &active_alloc_count, &active_alloc_hit);
+    g_assert_true(setup_hit);
+    g_assert_false(active_hit);
+    g_assert_cmpuint(active_alloc_count, ==, 0);
+    g_assert_false(active_alloc_hit);
+
+    qtest_quit(qts);
+}
+
+static void test_machine_defaults_to_zero_alat(void)
+{
+    static const char *const machines[] = {
+        "ia64-vpc", "itanium-vpc", "itanium2-vpc",
+        "hp-i2000", "hp-zx6000", "hp-rx2660",
+    };
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(machines); i++) {
+        g_autoptr(QDict) response = NULL;
+        QTestState *qts;
+
+        if (!qtest_has_machine(machines[i])) {
+            continue;
+        }
+        qts = qtest_initf("-machine %s,nvram=none -m 2G -S",
+                          machines[i]);
+        response = qtest_qmp(
+            qts, "{'execute':'qom-get','arguments':"
+                 "{'path':'/machine','property':'alat'}}");
+        g_assert_cmpstr(qdict_get_str(response, "return"), ==, "zero");
+        qtest_quit(qts);
+    }
 }
 
 static bool rtc_value_is_current(uint64_t value)
@@ -2439,8 +2643,14 @@ int main(int argc, char **argv)
 
         qtest_add_data_func(path, topology, test_smp_multicore_topology);
     }
-    qtest_add_func("/ia64-vpc/smp/reject-full-alat",
-                   test_smp_rejects_full_alat);
+    qtest_add_func("/ia64-vpc/smp/force-zero-alat",
+                   test_smp_forces_zero_alat);
+    qtest_add_func("/ia64-vpc/alat/full-warning",
+                   test_full_alat_warns);
+    qtest_add_func("/ia64-vpc/alat/active-writer-window",
+                   test_alat_active_writer_window);
+    qtest_add_func("/ia64-machine/alat/default-zero",
+                   test_machine_defaults_to_zero_alat);
     qtest_add_func("/ia64-vpc/input/profile-defaults",
                    test_profile_default_input);
     qtest_add_func("/ia64-vpc/rtc/aligned-read", test_rtc_aligned_read);

@@ -202,7 +202,7 @@ G_NORETURN void ia64_raise_unaligned(CPUIA64State *env, uint64_t addr,
         (IA64_ISR_R | IA64_ISR_W),
         fault_info & ~3ULL, fault_info & 3);
 
-    env->cr_ifa = addr;
+    env->exception_state.fault_addr = addr;
     env->cr_isr = isr_access;
     if (ia64_current_code_tlb_ed(env)) {
         env->cr_isr |= IA64_ISR_ED;
@@ -215,7 +215,9 @@ G_NORETURN void ia64_raise_nat_consumption(CPUIA64State *env,
                                            uint64_t isr_access,
                                   uint64_t fault_info)
 {
-    env->cr_ifa = 0;
+    if (env->psr & IA64_PSR_IC) {
+        env->cr_ifa = 0;
+    }
     env->cr_isr = IA64_ISR_CODE_REG_NAT | isr_access;
     ia64_raise_exception(env, IA64_EXCP_NAT_CONSUMPTION,
                            fault_info & ~3ULL, 0, fault_info & 3);
@@ -261,8 +263,8 @@ G_NORETURN void ia64_cpu_do_unaligned_access(CPUState *cs, vaddr addr,
     }
     cpu_restore_state(cs, retaddr);
     env->exception_state.fault_ip = env->ip;
+    env->exception_state.fault_addr = addr;
     env->exception_state.fault_imm = 0;
-    env->cr_ifa = addr;
     env->cr_isr = access_type == MMU_DATA_STORE ? IA64_ISR_W : IA64_ISR_R;
     if (ia64_current_code_tlb_ed(env)) {
         env->cr_isr |= IA64_ISR_ED;
@@ -660,6 +662,10 @@ void ia64_cpu_do_interrupt(CPUState *cs)
     case IA64_EXCP_LOWER_PRIVILEGE:
         fault_addr = cpu->env.exception_state.fault_ip;
         break;
+    case IA64_EXCP_UNALIGNED:
+        /* CR.IFA is only written for a collected interruption. */
+        fault_addr = cpu->env.exception_state.fault_addr;
+        break;
     case IA64_EXCP_DEBUG:
         /* Data and instruction debug faults both publish CR.IFA. */
         break;
@@ -687,6 +693,13 @@ void ia64_cpu_do_interrupt(CPUState *cs)
     } else if (!cpu->env.exception_state.native_completion_trap &&
                ia64_exception_uses_psr_ri_slot(excp, cpu->env.cr_isr)) {
         slot = (cpu->env.psr & IA64_PSR_RI_MASK) >> IA64_PSR_RI_SHIFT;
+    }
+    if (excp == IA64_EXCP_UNALIGNED) {
+        trace_ia64_unaligned_fault(cs->cpu_index,
+                                   cpu->env.exception_state.fault_ip,
+                                   fault_addr, slot, cpu->env.cr_isr,
+                                   cpu->env.psr,
+                                   (cpu->env.psr & IA64_PSR_IC) != 0);
     }
     if (ia64_psr_cpl(cpu->env.psr) == 3 &&
         excp != IA64_EXCP_EXTINT) {

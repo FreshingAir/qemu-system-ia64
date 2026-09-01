@@ -32,6 +32,7 @@
 #include "exec/translator.h"
 #include "exec/helper-proto.h"
 #include "system/memory.h"
+#include "system/physmem.h"
 #include "system/qtest.h"
 #include "system/tcg.h"
 
@@ -886,6 +887,7 @@ static void ia64_cpu_reset_hold(Object *obj, ResetType type)
     if (cpu->itm_timer != NULL) {
         timer_del(cpu->itm_timer);
     }
+    g_assert(!cpu->env.alat_state.write_active);
     memset(&cpu->env, 0, sizeof(cpu->env));
     cpu->env.alat_state.alat_full = cpu->alat_full;
     cpu->env.fp.fr[IA64_FR_ONE_INDEX] = IA64_FR_ONE;
@@ -916,10 +918,7 @@ static void ia64_cpu_reset_hold(Object *obj, ResetType type)
     }
     cpu->env.pal.pal_bus_feature_status = 0;
     cpu->env.pal.pal_proc_feature_status =
-        icc->model == IA64_CPU_MODEL_MONTECITO ?
-        (PAL_PROC_MONTECITO_ICACHE_COHERENCE |
-         PAL_PROC_MONTECITO_EXCLUSIVE_PREFETCH |
-         PAL_PROC_MONTECITO_HT) : 0;
+        icc->pal_proc_feature_available;
     cpu->env.pal.pal_proc_copy_valid = false;
     cpu->env.pal.pal_proc_copy_addr = 0;
     cpu->env.pal.pal_interrupt_block_addr = IA64_LOCAL_SAPIC_PA;
@@ -947,6 +946,19 @@ typedef struct IA64QTestStaleVictimWork {
     uint64_t probe_result;
     bool model_ready;
 } IA64QTestStaleVictimWork;
+
+typedef struct IA64QTestAlatWriterWork {
+    bool model_ready;
+    bool full_model;
+    bool setup_hit;
+    bool active_hit;
+    bool active_alloc_hit;
+    uint32_t active_alloc_count;
+} IA64QTestAlatWriterWork;
+
+#define IA64_QTEST_ALAT_VA  UINT64_C(0x8000)
+#define IA64_QTEST_ALAT_PA  (UINT64_C(8) * MiB)
+#define IA64_QTEST_ALAT_REG 22
 
 static void ia64_qtest_stale_victim_load_work(CPUState *cs,
                                                run_on_cpu_data data)
@@ -999,12 +1011,120 @@ static void ia64_qtest_stale_victim_load_work(CPUState *cs,
                                        mmu_idx, 0);
 }
 
+static void ia64_qtest_alat_writer_setup_work(CPUState *cs,
+                                               run_on_cpu_data data)
+{
+    IA64QTestAlatWriterWork *work = data.host_ptr;
+    CPUIA64State *env = cpu_env(cs);
+    uint64_t generation;
+
+    work->full_model = env->alat_state.alat_full;
+    if (!work->full_model) {
+        return;
+    }
+
+    env->psr &= ~(IA64_PSR_CPL_MASK | IA64_PSR_IS | IA64_PSR_PK |
+                  IA64_PSR_DB | IA64_PSR_DA | IA64_PSR_DD |
+                  IA64_PSR_ED | IA64_PSR_VM);
+    env->psr |= IA64_PSR_DT;
+    tlb_flush(cs);
+    work->model_ready = ia64_mmu_insert_firmware_tc(
+        env, IA64_QTEST_ALAT_VA, IA64_QTEST_ALAT_PA, true,
+        TARGET_PAGE_BITS);
+    if (!work->model_ready) {
+        return;
+    }
+
+    generation = ia64_alat_load_begin(env);
+    ia64_alat_set(env, IA64_QTEST_ALAT_REG, IA64_QTEST_ALAT_VA, 8,
+                  generation);
+    work->setup_hit = ia64_alat_check_load_addr(
+        env, IA64_QTEST_ALAT_REG, IA64_QTEST_ALAT_VA, 8, false);
+}
+
+static void ia64_qtest_alat_writer_active_work(CPUState *cs,
+                                                run_on_cpu_data data)
+{
+    IA64QTestAlatWriterWork *work = data.host_ptr;
+    CPUIA64State *env = cpu_env(cs);
+    IA64AlatEntry *entry = &env->alat_state.alat[0];
+    uint64_t generation;
+
+    /* Seed while the external writer is active. */
+    ia64_alat_invala(env);
+    *entry = (IA64AlatEntry) {
+        .phys_addr = IA64_QTEST_ALAT_PA,
+        .size = 8,
+        .reg = IA64_QTEST_ALAT_REG,
+        .valid = true,
+    };
+    env->alat_state.alat_active_count = 1;
+    work->active_hit = ia64_alat_check_load_addr(
+        env, IA64_QTEST_ALAT_REG, IA64_QTEST_ALAT_VA, 8, false);
+
+    generation = ia64_alat_load_begin(env);
+    ia64_alat_set(env, IA64_QTEST_ALAT_REG, IA64_QTEST_ALAT_VA, 8,
+                  generation);
+    work->active_alloc_count = env->alat_state.alat_active_count;
+    work->active_alloc_hit = ia64_alat_check_load_addr(
+        env, IA64_QTEST_ALAT_REG, IA64_QTEST_ALAT_VA, 8, false);
+}
+
+static bool ia64_qtest_alat_writer_command(CharFrontend *chr, gchar **words)
+{
+    IA64QTestAlatWriterWork work = { 0 };
+    bool observed;
+    CPUState *cs;
+    CPUState *other_cs;
+
+    if (words[1]) {
+        qtest_sendf(chr, "FAIL command takes no arguments\n");
+        return true;
+    }
+    if (!tcg_enabled()) {
+        qtest_sendf(chr, "FAIL command requires TCG\n");
+        return true;
+    }
+
+    cs = qemu_get_cpu(0);
+    if (!cs) {
+        qtest_sendf(chr, "FAIL command requires CPU 0\n");
+        return true;
+    }
+    CPU_FOREACH(other_cs) {
+        if (!cpu_is_stopped(other_cs)) {
+            qtest_sendf(chr, "FAIL command requires stopped CPUs\n");
+            return true;
+        }
+    }
+
+    run_on_cpu(cs, ia64_qtest_alat_writer_setup_work,
+               RUN_ON_CPU_HOST_PTR(&work));
+    if (!work.full_model || !work.model_ready) {
+        qtest_sendf(chr, "FAIL command requires a full ALAT model\n");
+        return true;
+    }
+
+    observed = physical_memory_write_begin();
+    run_on_cpu(cs, ia64_qtest_alat_writer_active_work,
+               RUN_ON_CPU_HOST_PTR(&work));
+    physical_memory_write_end(observed);
+
+    qtest_sendf(chr, "OK %u %u %u %u\n",
+                work.setup_hit, work.active_hit,
+                work.active_alloc_count, work.active_alloc_hit);
+    return true;
+}
+
 static bool ia64_qtest_command(CharFrontend *chr, gchar **words)
 {
     IA64QTestStaleVictimWork work = { 0 };
     CPUState *cs;
     int ret;
 
+    if (strcmp(words[0], "ia64-alat-active-writer") == 0) {
+        return ia64_qtest_alat_writer_command(chr, words);
+    }
     if (strcmp(words[0], "ia64-stale-victim-load") != 0) {
         return false;
     }
@@ -1066,6 +1186,9 @@ static void ia64_cpu_realize(DeviceState *dev, Error **errp)
         error_propagate(errp, local_err);
         return;
     }
+    if (cpu->alat_full) {
+        physical_memory_write_observer_enable();
+    }
 
     cpu->itm_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, ia64_itm_timer_cb, cpu);
 
@@ -1111,6 +1234,14 @@ static bool ia64_precise_smc_enabled(CPUState *cs)
     return cpu->env.psr & IA64_PSR_IS;
 }
 
+static void ia64_cpu_exec_longjmp_cleanup(CPUState *cs)
+{
+    IA64CPU *cpu = ia64_cpu_from_cpu_state(cs);
+
+    /* Abort an active CPU-store window. */
+    ia64_alat_write_abort(&cpu->env);
+}
+
 static const TCGCPUOps ia64_tcg_ops = {
     /*
      * Native IA-64 loads and stores are weakly ordered; their acquire,
@@ -1130,6 +1261,7 @@ static const TCGCPUOps ia64_tcg_ops = {
     .get_tb_cpu_state = ia64_get_tb_cpu_state,
     .synchronize_from_tb = ia64_cpu_synchronize_from_tb,
     .restore_state_to_opc = ia64_restore_state_to_opc,
+    .cpu_exec_longjmp_cleanup = ia64_cpu_exec_longjmp_cleanup,
     .mmu_index = ia64_cpu_mmu_index,
     .tlb_fill = ia64_cpu_tlb_fill,
     .pointer_wrap = ia64_pointer_wrap,
@@ -1206,12 +1338,7 @@ static void ia64_cpu_class_init(ObjectClass *oc, const void *data)
     icc->pal_l3_associativity = 12;
     icc->pal_l3_load_latency = 14;
     icc->pal_l3_tag_lsb = 20;
-    /*
-     * The Madison model implements WB, UC, UCE, and WC.  TCG has no
-     * physical write-coalescing buffer, so WC does not promise physical
-     * coalescing or timing; its architected access, ordering, speculation,
-     * and unsupported-operation rules remain distinct from WB.
-     */
+    /* WB, UC, UCE, and WC are distinct; WC buffering is not modeled. */
     icc->memory_attribute_mask = IA64_ITANIUM2_MEMORY_ATTRIBUTE_MASK;
     icc->fc_line_size = 128;
     icc->implemented_pmc_mask = 0x3fffULL;
@@ -1312,6 +1439,10 @@ static void ia64_cpu_model_class_init(ObjectClass *oc, const void *data)
     icc->implemented_pmd_mask = model->implemented_pmd_mask;
     icc->perf_cycles_mask = model->perf_cycles_mask;
     icc->perf_retired_mask = model->perf_retired_mask;
+    icc->pal_proc_feature_available = model->is_montecito ?
+        PAL_PROC_MONTECITO_AVAILABLE : 0;
+    icc->pal_proc_feature_controllable = model->is_montecito ?
+        PAL_PROC_MONTECITO_CONTROLLABLE : 0;
     icc->rse_has_clean_partition = model->rse_has_clean_partition;
     icc->data_debug_cross_16byte = model->data_debug_cross_16byte;
     icc->has_native_ia32 = model->has_native_ia32;
@@ -1351,10 +1482,7 @@ static const IA64CPUModelDef ia64_cpu_model_merced = {
      */
     .pal_version = 0x0000883001008830ULL,
     .pal_brand = "QEMU Itanium-compatible IA-64 CPU",
-    /*
-     * The selected 800 MHz part advances ITC at the processor rate.  Keep
-     * this ratio explicit because the dual-core model uses a divided ITC.
-     */
+    /* The 800 MHz model advances ITC at the processor frequency. */
     .frequency_base_hz = 100000000,
     .itc_frequency_hz = 800000000,
     .pal_l3_cache_size = 4 * MiB,
@@ -1362,21 +1490,12 @@ static const IA64CPUModelDef ia64_cpu_model_merced = {
     .processor_frequency_ratio = IA64_FREQUENCY_RATIO(8, 1),
     .bus_frequency_ratio = IA64_FREQUENCY_RATIO(4, 3),
     .itc_frequency_ratio = IA64_FREQUENCY_RATIO(8, 1),
-    /*
-     * Public product documentation specifies family 7 and the cache/TLB
-     * descriptors but does not publish the complete native IA-32 leaf-1
-     * signature.  Family 7, model 1, stepping 5 is retained as this model's
-     * compatibility identity; it is not used to select execution behavior.
-     */
+    /* IA-32 CPUID signature exposed by this CPU model. */
     .ia32_cpuid_version = 0x00000715,
     .ia32_cpuid_leaf2 = {
         0x00151001, 0x0000891a, 0x009b9690, 0x80000000,
     },
-    /*
-     * The architectural page-size table requires 64 MiB support on every
-     * processor, while the product-specific summary omits that size without
-     * declaring an exception.  Follow the normative architectural table.
-     */
+    /* Include the architecturally required 64 MiB page size. */
     .insertable_page_size_mask =
         (1ULL << 12) | (1ULL << 13) | (1ULL << 14) | (1ULL << 16) |
         (1ULL << 18) | (1ULL << 20) | (1ULL << 22) | (1ULL << 24) |
@@ -1533,21 +1652,9 @@ static const IA64CPUModelDef ia64_cpu_model_montecito = {
     .perf_cycles_mask = 0xf0ULL,
     .perf_retired_mask = 0xf0ULL,
     .rse_has_clean_partition = true,
-    /*
-     * Montecito removed native IA-32 hardware.  Product documentation
-     * describes a closed PAL-based translation layer for pre-OS use after
-     * PAL_COPY_PAL, but does not publish the translator implementation; the
-     * copied QEMU PAL image is only a procedure-call portal.  Do not treat
-     * that copy as enabling native PSR.is transitions, because doing so would
-     * also expose unsupported PAL-based execution to an operating system.
-     */
+    /* Native IA-32 and PAL-based IA-32 translation are not implemented. */
     .has_native_ia32 = false,
-    /*
-     * Montecito implements the virtualization extensions, but this model
-     * does not virtualize.  vmsw is decoded and reported as a Virtualization
-     * fault so a guest sees the architected interruption instead of a
-     * silently succeeding privilege-mode switch.
-     */
+    /* Virtualization mode is not modeled; vmsw raises Virtualization Fault. */
     .has_virtualization = true,
     .is_montecito = true,
 };
@@ -1587,6 +1694,31 @@ static void ia64_cpu_madison_zx6000_class_init(ObjectClass *oc,
              icc->itc_frequency_hz);
 }
 
+static void ia64_cpu_montecito_9010_class_init(ObjectClass *oc,
+                                                const void *data)
+{
+    IA64CPUClass *icc = IA64_CPU_CLASS(oc);
+
+    icc->pal_brand =
+        "QEMU Montecito 9010-compatible IA-64 CPU 1.60GHz 6MB";
+    icc->pal_l3_cache_size = 6 * MiB;
+    icc->pal_package_cache_size = 6 * MiB;
+    icc->pal_l3_associativity = 6;
+    icc->pal_proc_feature_available &= ~PAL_PROC_MONTECITO_HT;
+}
+
+static void ia64_cpu_montecito_9040_class_init(ObjectClass *oc,
+                                                const void *data)
+{
+    IA64CPUClass *icc = IA64_CPU_CLASS(oc);
+
+    icc->pal_brand =
+        "QEMU Montecito 9040-compatible IA-64 CPU 1.60GHz 18MB";
+    icc->pal_l3_cache_size = 9 * MiB;
+    icc->pal_package_cache_size = 18 * MiB;
+    icc->pal_l3_associativity = 9;
+}
+
 static const TypeInfo ia64_cpu_type_info[] = {
     {
         .name = TYPE_IA64_CPU,
@@ -1620,6 +1752,16 @@ static const TypeInfo ia64_cpu_type_info[] = {
         .parent = TYPE_IA64_CPU,
         .class_init = ia64_cpu_model_class_init,
         .class_data = &ia64_cpu_model_montecito,
+    },
+    {
+        .name = IA64_CPU_TYPE_NAME("montecito-9010"),
+        .parent = IA64_CPU_TYPE_NAME("montecito"),
+        .class_init = ia64_cpu_montecito_9010_class_init,
+    },
+    {
+        .name = IA64_CPU_TYPE_NAME("montecito-9040"),
+        .parent = IA64_CPU_TYPE_NAME("montecito"),
+        .class_init = ia64_cpu_montecito_9040_class_init,
     },
     {
         .name = IA64_CPU_TYPE_NAME("itanium"),

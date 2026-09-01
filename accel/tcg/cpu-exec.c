@@ -512,8 +512,14 @@ static void cpu_exec_exit(CPUState *cpu)
 
 static void cpu_exec_longjmp_cleanup(CPUState *cpu)
 {
+    const TCGCPUOps *tcg_ops = cpu->cc->tcg_ops;
+
     /* Non-buggy compilers preserve this; assert the correct value. */
     g_assert(cpu == current_cpu);
+
+    if (tcg_ops->cpu_exec_longjmp_cleanup) {
+        tcg_ops->cpu_exec_longjmp_cleanup(cpu);
+    }
 
 #ifdef CONFIG_USER_ONLY
     clear_helper_retaddr();

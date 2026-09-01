@@ -897,13 +897,7 @@ static int ia64_tlb_select_tc_slot(IA64TlbEntry *tlb, uint16_t capacity,
     int victim;
     uint16_t i;
 
-    /*
-     * TC victim selection is implementation-specific.  The documented
-     * first-generation DTLB2 is fully associative with 96 entries, but its
-     * victim policy is not disclosed.  Reuse the model's deterministic
-     * circular policy rather than inventing reference-recency behavior that
-     * software could observe.
-     */
+    /* Prefer an empty slot, then use deterministic circular replacement. */
     for (i = 0; i < capacity; i++) {
         if (!tlb[i].valid) {
             if (empty < 0) {
@@ -1472,7 +1466,9 @@ void ia64_check_instruction_debug(CPUIA64State *env, uint64_t address,
         return;
     }
 
-    env->cr_ifa = address;
+    if (env->psr & IA64_PSR_IC) {
+        env->cr_ifa = address;
+    }
     env->cr_isr = IA64_ISR_X;
     ia64_raise_exception(env, IA64_EXCP_DEBUG, address, 0, slot);
 }
@@ -1758,6 +1754,7 @@ static void ia64_raise_data_reference_exception_at(CPUIA64State *env,
 {
     CPUState *cs = env_cpu(env);
 
+    env->exception_state.fault_addr = va;
     if (env->psr & IA64_PSR_IC) {
         env->cr_ifa = va;
         if (ia64_exception_initializes_iha(excp)) {
@@ -1830,7 +1827,9 @@ ia64_raise_data_debug_at(CPUIA64State *env, uint64_t va,
                          bool itlb_ed, bool mandatory_rse,
                          uint64_t fault_ip, uint8_t fault_slot)
 {
-    env->cr_ifa = va;
+    if (env->psr & IA64_PSR_IC) {
+        env->cr_ifa = va;
+    }
     env->cr_isr = isr_access;
     if (is_speculative) {
         env->cr_isr |= IA64_ISR_SP;

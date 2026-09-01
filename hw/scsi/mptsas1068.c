@@ -29,6 +29,7 @@ static void mptsas1068_class_init(ObjectClass *oc, const void *data)
     PCIDeviceClass *pc = PCI_DEVICE_CLASS(oc);
 
     pc->device_id = PCI_DEVICE_ID_LSI_SAS1068;
+    pc->revision = 0x01;
     pc->subsystem_id = 0x8000;
     dc->desc = "LSI SAS 1068";
 }

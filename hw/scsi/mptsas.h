@@ -47,11 +47,14 @@ struct MPTSASState {
     MemoryRegion mmio_io;
     MemoryRegion port_io;
     MemoryRegion diag_io;
+    MemoryRegion pci_rom;
     QEMUBH *request_bh;
 
     /* properties */
     OnOffAuto msi;
     uint64_t sas_addr;
+    bool pci_64bit_bars;
+    uint32_t pci_rom_size;
 
     bool msi_in_use;
     uint8_t variant;

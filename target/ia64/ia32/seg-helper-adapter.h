@@ -9,6 +9,7 @@
 #include "target/i386/tcg/helper-tcg.h"
 #include "target/i386/tcg/seg_helper.h"
 #include "arch/arch.h"
+#include "exec-access.h"
 #include "ia32/ia32.h"
 
 /*
@@ -31,6 +32,9 @@ static void ia32_stack_access_prepare(CPUX86State *xenv, vaddr addr,
                       IA64_IA32_SEG_ACCESS_WRITE :
                       IA64_IA32_SEG_ACCESS_READ;
 
+    if (type == MMU_DATA_STORE) {
+        ia64_exec_ensure_alat_exclusive(env, retaddr);
+    }
     /* Translation and protection faults have priority over alignment. */
     ia64_ia32_probe_access(env, addr, size, type, mmu_idx, retaddr);
     ia64_ia32_record_data_access(env, addr, size, access);
@@ -71,6 +75,7 @@ static void ia32_stack_stw(CPUX86State *xenv, vaddr addr, uint16_t value,
     ia32_stack_access_prepare(xenv, addr, 2, MMU_DATA_STORE, retaddr);
     cpu_stw_le_mmuidx_ra(IA32_ARCH_ENV(xenv), addr, value,
                          IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(IA32_ARCH_ENV(xenv));
 }
 
 static void ia32_stack_stl(CPUX86State *xenv, vaddr addr, uint32_t value,
@@ -80,6 +85,7 @@ static void ia32_stack_stl(CPUX86State *xenv, vaddr addr, uint32_t value,
     ia32_stack_access_prepare(xenv, addr, 4, MMU_DATA_STORE, retaddr);
     cpu_stl_le_mmuidx_ra(IA32_ARCH_ENV(xenv), addr, value,
                          IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(IA32_ARCH_ENV(xenv));
 }
 
 static G_GNUC_UNUSED void ia32_stack_stq(CPUX86State *xenv, vaddr addr,
@@ -89,6 +95,7 @@ static G_GNUC_UNUSED void ia32_stack_stq(CPUX86State *xenv, vaddr addr,
     ia32_stack_access_prepare(xenv, addr, 8, MMU_DATA_STORE, retaddr);
     cpu_stq_le_mmuidx_ra(IA32_ARCH_ENV(xenv), addr, value,
                          IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(IA32_ARCH_ENV(xenv));
 }
 
 static void ia32_supervisor_access_prepare(CPUX86State *xenv, vaddr addr,
@@ -102,6 +109,9 @@ static void ia32_supervisor_access_prepare(CPUX86State *xenv, vaddr addr,
                       IA64_IA32_SEG_ACCESS_WRITE :
                       IA64_IA32_SEG_ACCESS_READ;
 
+    if (type == MMU_DATA_STORE) {
+        ia64_exec_ensure_alat_exclusive(env, retaddr);
+    }
     /* GDT/LDT/TSS accesses ignore EFLAGS.AC, but not PSR.ac. */
     ia64_ia32_probe_access(env, addr, size, type, mmu_idx, retaddr);
     ia64_ia32_record_data_access(env, addr, size, access);
@@ -160,6 +170,7 @@ static G_GNUC_UNUSED void ia32_supervisor_stw(CPUX86State *xenv,
     addr = (uint32_t)addr;
     ia32_supervisor_access_prepare(xenv, addr, 2, MMU_DATA_STORE, retaddr);
     cpu_stw_le_mmuidx_ra(env, addr, value, IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(env);
 }
 
 static void ia32_supervisor_stl(CPUX86State *xenv, vaddr addr,
@@ -170,6 +181,7 @@ static void ia32_supervisor_stl(CPUX86State *xenv, vaddr addr,
     addr = (uint32_t)addr;
     ia32_supervisor_access_prepare(xenv, addr, 4, MMU_DATA_STORE, retaddr);
     cpu_stl_le_mmuidx_ra(env, addr, value, IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(env);
 }
 
 static G_GNUC_UNUSED void ia32_supervisor_stq(CPUX86State *xenv,
@@ -181,6 +193,7 @@ static G_GNUC_UNUSED void ia32_supervisor_stq(CPUX86State *xenv,
     addr = (uint32_t)addr;
     ia32_supervisor_access_prepare(xenv, addr, 8, MMU_DATA_STORE, retaddr);
     cpu_stq_le_mmuidx_ra(env, addr, value, IA32_MMU_IDX(xenv), retaddr);
+    ia64_alat_notify_store(env);
 }
 
 #undef cpu_lduw_kernel_ra

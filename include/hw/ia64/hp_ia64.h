@@ -35,6 +35,7 @@ struct HPIA64MachineClass {
     uint64_t minimum_ram_size;
     uint64_t maximum_ram_size;
     hwaddr descriptor_gpa;
+    bool (*validate_smp)(const MachineState *machine, Error **errp);
 };
 
 bool hp_ia64_machine_validate(HPIA64MachineState *machine, Error **errp);

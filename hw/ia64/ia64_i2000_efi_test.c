@@ -243,6 +243,8 @@ static void i2000_descriptor_roots_init(
         roots[i].Segment = cpu_to_le16(source->segment);
         roots[i].Bus = source->first_bus;
         roots[i].ConfigType = source->config_mechanism;
+        roots[i].Flags = cpu_to_le32(
+            IA64_PLATFORM_PCI_ROOT_FLAG_IDENTITY_DMA);
         roots[i].ConfigBase = 0;
         roots[i].IoBase = cpu_to_le64(source->io_base);
         roots[i].IoSize = cpu_to_le64(source->io_size);

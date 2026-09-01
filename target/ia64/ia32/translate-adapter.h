@@ -41,8 +41,11 @@
                    offsetof(CPUIA64State, ip))
 #define X86_INT3_VECTOR(vector) ((vector) | 0x100)
 #define X86_IA32_SYSTEM_ENV 1
-#define X86_GEN_CODE_FETCH_CHECK(s) \
-    gen_helper_ia32_code_fetch_check(tcg_env)
+/* Enter exclusive execution before instruction side effects. */
+#define X86_GEN_CODE_FETCH_CHECK(s) do {                  \
+    gen_helper_alat_ensure_exclusive(tcg_env);            \
+    gen_helper_ia32_code_fetch_check(tcg_env);            \
+} while (0)
 #define X86_GEN_CPUID_SERIALIZE(s) do {                               \
     tcg_gen_mb(TCG_MO_ALL | TCG_BAR_SC);                              \
     (s)->base.is_jmp = DISAS_EOB_NEXT;                                \
@@ -183,10 +186,12 @@ static void ia64_ia32_gen_qemu_ld_i32(TCGv_i32 value, TCGv_i64 addr,
 }
 
 static void ia64_ia32_gen_qemu_st_i32(TCGv_i32 value, TCGv_i64 addr,
-                                      TCGArg mmu_idx, MemOp memop)
+                                       TCGArg mmu_idx, MemOp memop)
 {
+    gen_helper_alat_ensure_exclusive(tcg_env);
     ia64_ia32_gen_dtlb1_touch(addr, mmu_idx, memop);
     tcg_gen_qemu_st_i32(value, addr, mmu_idx, memop);
+    gen_helper_notify_alat_store(tcg_env);
 }
 
 static void ia64_ia32_gen_qemu_ld_i64(TCGv_i64 value, TCGv_i64 addr,
@@ -197,10 +202,12 @@ static void ia64_ia32_gen_qemu_ld_i64(TCGv_i64 value, TCGv_i64 addr,
 }
 
 static void ia64_ia32_gen_qemu_st_i64(TCGv_i64 value, TCGv_i64 addr,
-                                      TCGArg mmu_idx, MemOp memop)
+                                       TCGArg mmu_idx, MemOp memop)
 {
+    gen_helper_alat_ensure_exclusive(tcg_env);
     ia64_ia32_gen_dtlb1_touch(addr, mmu_idx, memop);
     tcg_gen_qemu_st_i64(value, addr, mmu_idx, memop);
+    gen_helper_notify_alat_store(tcg_env);
 }
 
 static void ia64_ia32_gen_qemu_ld_i128(TCGv_i128 value, TCGv_i64 addr,
@@ -211,11 +218,50 @@ static void ia64_ia32_gen_qemu_ld_i128(TCGv_i128 value, TCGv_i64 addr,
 }
 
 static void ia64_ia32_gen_qemu_st_i128(TCGv_i128 value, TCGv_i64 addr,
-                                       TCGArg mmu_idx, MemOp memop)
+                                        TCGArg mmu_idx, MemOp memop)
 {
+    gen_helper_alat_ensure_exclusive(tcg_env);
     ia64_ia32_gen_dtlb1_touch(addr, mmu_idx, memop);
     tcg_gen_qemu_st_i128(value, addr, mmu_idx, memop);
+    gen_helper_notify_alat_store(tcg_env);
 }
+
+#define IA64_IA32_DEFINE_ATOMIC2(name, type)                           \
+    static inline void ia64_ia32_##name(                               \
+        type result, TCGv_va addr, type value,                         \
+        TCGArg mmu_idx, MemOp memop)                                  \
+    {                                                                  \
+        gen_helper_alat_ensure_exclusive(tcg_env);                     \
+        name(result, addr, value, mmu_idx, memop);                     \
+        gen_helper_notify_alat_store(tcg_env);                         \
+    }
+
+#define IA64_IA32_DEFINE_ATOMIC3(name, type)                           \
+    static inline void ia64_ia32_##name(                               \
+        type result, TCGv_va addr, type old, type value,               \
+        TCGArg mmu_idx, MemOp memop)                                  \
+    {                                                                  \
+        gen_helper_alat_ensure_exclusive(tcg_env);                     \
+        name(result, addr, old, value, mmu_idx, memop);                \
+        gen_helper_notify_alat_store(tcg_env);                         \
+    }
+
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_add_fetch_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_and_fetch_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_fetch_add_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_fetch_and_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_fetch_or_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_fetch_xor_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_or_fetch_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_xchg_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC2(tcg_gen_atomic_xor_fetch_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC3(tcg_gen_atomic_cmpxchg_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC3(tcg_gen_atomic_cmpxchg_i128, TCGv_i128)
+IA64_IA32_DEFINE_ATOMIC3(tcg_gen_nonatomic_cmpxchg_i64, TCGv_i64)
+IA64_IA32_DEFINE_ATOMIC3(tcg_gen_nonatomic_cmpxchg_i128, TCGv_i128)
+
+#undef IA64_IA32_DEFINE_ATOMIC2
+#undef IA64_IA32_DEFINE_ATOMIC3
 
 #define tcg_gen_qemu_ld_i32 ia64_ia32_gen_qemu_ld_i32
 #define tcg_gen_qemu_st_i32 ia64_ia32_gen_qemu_st_i32
@@ -223,6 +269,31 @@ static void ia64_ia32_gen_qemu_st_i128(TCGv_i128 value, TCGv_i64 addr,
 #define tcg_gen_qemu_st_i64 ia64_ia32_gen_qemu_st_i64
 #define tcg_gen_qemu_ld_i128 ia64_ia32_gen_qemu_ld_i128
 #define tcg_gen_qemu_st_i128 ia64_ia32_gen_qemu_st_i128
+#define tcg_gen_atomic_add_fetch_i64 \
+    ia64_ia32_tcg_gen_atomic_add_fetch_i64
+#define tcg_gen_atomic_and_fetch_i64 \
+    ia64_ia32_tcg_gen_atomic_and_fetch_i64
+#define tcg_gen_atomic_fetch_add_i64 \
+    ia64_ia32_tcg_gen_atomic_fetch_add_i64
+#define tcg_gen_atomic_fetch_and_i64 \
+    ia64_ia32_tcg_gen_atomic_fetch_and_i64
+#define tcg_gen_atomic_fetch_or_i64 \
+    ia64_ia32_tcg_gen_atomic_fetch_or_i64
+#define tcg_gen_atomic_fetch_xor_i64 \
+    ia64_ia32_tcg_gen_atomic_fetch_xor_i64
+#define tcg_gen_atomic_or_fetch_i64 \
+    ia64_ia32_tcg_gen_atomic_or_fetch_i64
+#define tcg_gen_atomic_xchg_i64 ia64_ia32_tcg_gen_atomic_xchg_i64
+#define tcg_gen_atomic_xor_fetch_i64 \
+    ia64_ia32_tcg_gen_atomic_xor_fetch_i64
+#define tcg_gen_atomic_cmpxchg_i64 \
+    ia64_ia32_tcg_gen_atomic_cmpxchg_i64
+#define tcg_gen_atomic_cmpxchg_i128 \
+    ia64_ia32_tcg_gen_atomic_cmpxchg_i128
+#define tcg_gen_nonatomic_cmpxchg_i64 \
+    ia64_ia32_tcg_gen_nonatomic_cmpxchg_i64
+#define tcg_gen_nonatomic_cmpxchg_i128 \
+    ia64_ia32_tcg_gen_nonatomic_cmpxchg_i128
 
 #define X86_SKIP_HELPER_INFO
 #define tcg_x86_init ia64_ia32_translate_init

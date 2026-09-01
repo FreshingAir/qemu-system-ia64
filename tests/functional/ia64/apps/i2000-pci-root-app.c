@@ -2,17 +2,21 @@
 
 #include "ia64-test.h"
 
-#define TEST_ROOT_COUNT                3U
+#define TEST_ROOT_COUNT                4U
 #define TEST_RESOURCE_DESCRIPTOR_SIZE 46U
+#define TEST_MAX_RESOURCE_DESCRIPTORS  9U
 #define TEST_DEVICE_PATH_NODE_SIZE    12U
 
 typedef struct {
-    UINT8 BusBase;
-    UINT8 BusEnd;
-    UINT64 IoBase;
-    UINT64 IoSize;
-    UINT64 MemoryBase;
-    UINT64 MemorySize;
+    UINT8 Type;
+    UINT64 Granularity;
+    UINT64 Base;
+    UINT64 Size;
+} TEST_RESOURCE_EXPECTED;
+
+typedef struct {
+    const TEST_RESOURCE_EXPECTED *Resources;
+    UINTN ResourceCount;
 } TEST_ROOT_EXPECTED;
 
 typedef struct {
@@ -21,10 +25,40 @@ typedef struct {
     UINT8 *DevicePath;
 } TEST_ROOT;
 
+static const TEST_RESOURCE_EXPECTED expected_root0_resources[] = {
+    { 2, 0, 0x00, 1 },
+    { 1, 0, 0x0000, 0x01ce },
+    { 1, 0, 0x01d2, 0x01de },
+    { 1, 0, 0x03e0, 0x3c20 },
+    { 0, 32, 0x90000000ULL, 0x10000000ULL },
+};
+
+static const TEST_RESOURCE_EXPECTED expected_root1_resources[] = {
+    { 2, 0, 0x01, 1 },
+    { 1, 0, 0x4000, 0x4000 },
+    { 0, 32, 0xa0000000ULL, 0x10000000ULL },
+};
+
+static const TEST_RESOURCE_EXPECTED expected_root2_resources[] = {
+    { 2, 0, 0x02, 1 },
+    { 1, 0, 0x8000, 0x4000 },
+    { 0, 32, 0xb0000000ULL, 0x10000000ULL },
+};
+
+static const TEST_RESOURCE_EXPECTED expected_root3_resources[] = {
+    { 2, 0, 0x03, 1 },
+    { 1, 0, 0xc000, 0x4000 },
+    { 1, 0, 0x01ce, 0x0004 },
+    { 1, 0, 0x03b0, 0x0030 },
+    { 0, 32, 0x000a0000, 0x00060000 },
+    { 0, 32, 0xe0000000ULL, 0x10000000ULL },
+};
+
 static const TEST_ROOT_EXPECTED expected_roots[TEST_ROOT_COUNT] = {
-    { 0x00, 0x1f, 0x0000, 0x4000, 0x90000000ULL, 0x10000000ULL },
-    { 0x20, 0x3f, 0x4000, 0x4000, 0xa0000000ULL, 0x10000000ULL },
-    { 0x40, 0x5f, 0x8000, 0x4000, 0xb0000000ULL, 0x10000000ULL },
+    { expected_root0_resources, 5 },
+    { expected_root1_resources, 3 },
+    { expected_root2_resources, 3 },
+    { expected_root3_resources, 6 },
 };
 
 static UINT8 pci_root_guid[16] = IA64_GUID_PCI_ROOT_IO;
@@ -96,51 +130,84 @@ static BOOLEAN test_descriptor(const UINT8 *Descriptor, UINT8 Type,
            test_get_u64(Descriptor + 38) == Length;
 }
 
+static BOOLEAN test_expected_descriptor(
+    const UINT8 *Descriptor, const TEST_RESOURCE_EXPECTED *Expected)
+{
+    return test_descriptor(Descriptor, Expected->Type,
+                           Expected->Granularity, Expected->Base,
+                           Expected->Base + Expected->Size - 1U,
+                           Expected->Size);
+}
+
 static INTN test_root_index(EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *Root)
 {
-    const UINT8 *descriptor;
+    const UINT8 *descriptors[TEST_MAX_RESOURCE_DESCRIPTORS];
+    BOOLEAN matched[TEST_MAX_RESOURCE_DESCRIPTORS] = { 0 };
     const TEST_ROOT_EXPECTED *expected;
     VOID *configuration = NULL;
-    UINT64 bus_base;
+    const UINT8 *descriptor;
+    INTN root_index = -1;
+    UINTN descriptor_count = 0;
     UINTN index;
+    UINTN resource;
 
     if (Root->Configuration(Root, &configuration) != EFI_SUCCESS ||
         configuration == NULL) {
         return -1;
     }
     descriptor = configuration;
-    bus_base = test_get_u64(descriptor + 14);
-    for (index = 0; index < TEST_ROOT_COUNT; index++) {
-        if (expected_roots[index].BusBase == bus_base) {
-            break;
+    while (descriptor_count < TEST_MAX_RESOURCE_DESCRIPTORS &&
+           descriptor[0] != 0x79) {
+        if (descriptor[0] != 0x8a ||
+            test_get_u16(descriptor + 1) != 0x2b) {
+            return -1;
         }
+        descriptors[descriptor_count++] = descriptor;
+        descriptor += TEST_RESOURCE_DESCRIPTOR_SIZE;
     }
-    if (index == TEST_ROOT_COUNT) {
-        return -1;
-    }
-    expected = &expected_roots[index];
-    if (!test_descriptor(descriptor, 2, 0, expected->BusBase,
-                         expected->BusEnd,
-                         (UINT64)expected->BusEnd - expected->BusBase + 1U)) {
-        return -1;
-    }
-    descriptor += TEST_RESOURCE_DESCRIPTOR_SIZE;
-    if (!test_descriptor(descriptor, 1, 0, expected->IoBase,
-                         expected->IoBase + expected->IoSize - 1U,
-                         expected->IoSize)) {
-        return -1;
-    }
-    descriptor += TEST_RESOURCE_DESCRIPTOR_SIZE;
-    if (!test_descriptor(descriptor, 0, 32, expected->MemoryBase,
-                         expected->MemoryBase + expected->MemorySize - 1U,
-                         expected->MemorySize)) {
-        return -1;
-    }
-    descriptor += TEST_RESOURCE_DESCRIPTOR_SIZE;
     if (descriptor[0] != 0x79 || descriptor[1] != 0) {
         return -1;
     }
-    return (INTN)index;
+
+    for (resource = 0; resource < descriptor_count; resource++) {
+        if (descriptors[resource][3] != 2) {
+            continue;
+        }
+        if (root_index >= 0) {
+            return -1;
+        }
+        for (index = 0; index < TEST_ROOT_COUNT; index++) {
+            if (test_expected_descriptor(
+                    descriptors[resource],
+                    &expected_roots[index].Resources[0])) {
+                root_index = (INTN)index;
+                break;
+            }
+        }
+        if (index == TEST_ROOT_COUNT) {
+            return -1;
+        }
+    }
+    if (root_index < 0) {
+        return -1;
+    }
+    expected = &expected_roots[root_index];
+    if (descriptor_count != expected->ResourceCount) {
+        return -1;
+    }
+    for (resource = 0; resource < descriptor_count; resource++) {
+        for (index = 0; index < expected->ResourceCount; index++) {
+            if (!matched[index] && test_expected_descriptor(
+                    descriptors[resource], &expected->Resources[index])) {
+                matched[index] = 1;
+                break;
+            }
+        }
+        if (index == expected->ResourceCount) {
+            return -1;
+        }
+    }
+    return root_index;
 }
 
 static BOOLEAN test_root_device_path(const TEST_ROOT *Root, UINTN Index)
@@ -287,33 +354,48 @@ static UINT64 test_pci_address(UINT8 Bus, UINT8 Device)
 static BOOLEAN test_config_access(const TEST_ROOT *Roots,
                                   EFI_STATUS *Code, const char **Detail)
 {
-    UINT32 rage_id = 0;
-    UINT32 lsi_id = 0;
+    UINT32 quadro_id = 0;
+    UINT32 isp_id = 0;
     UINT32 ignored = 0;
+    UINT16 vbe_index = 0;
     EFI_STATUS status;
 
-    status = Roots[0].Io->Pci.Read(
-        Roots[0].Io, EfiPciWidthUint32, test_pci_address(0x00, 5),
-        1, &rage_id);
-    if (status != EFI_SUCCESS || rage_id != 0x50461002U) {
+    status = Roots[3].Io->Pci.Read(
+        Roots[3].Io, EfiPciWidthUint32, test_pci_address(0x03, 0),
+        1, &quadro_id);
+    if (status != EFI_SUCCESS || quadro_id != 0x015310deU) {
         *Code = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
-        *Detail = "rage128-config";
+        *Detail = "quadro2-config";
         return 0;
     }
     status = Roots[1].Io->Pci.Read(
-        Roots[1].Io, EfiPciWidthUint32, test_pci_address(0x20, 3),
-        1, &lsi_id);
-    if (status != EFI_SUCCESS || lsi_id != 0x00121000U) {
+        Roots[1].Io, EfiPciWidthUint32, test_pci_address(0x01, 0),
+        1, &isp_id);
+    if (status != EFI_SUCCESS || isp_id != 0x12161077U) {
         *Code = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
-        *Detail = "lsi-config";
+        *Detail = "isp12160-config";
         return 0;
     }
     status = Roots[0].Io->Pci.Read(
-        Roots[0].Io, EfiPciWidthUint32, test_pci_address(0x20, 3),
+        Roots[0].Io, EfiPciWidthUint32, test_pci_address(0x01, 0),
         1, &ignored);
     if (status != EFI_INVALID_PARAMETER) {
         *Code = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
         *Detail = "root-isolation";
+        return 0;
+    }
+    status = Roots[3].Io->Io.Read(
+        Roots[3].Io, EfiPciWidthUint16, 0x01ce, 1, &vbe_index);
+    if (status != EFI_SUCCESS) {
+        *Code = status;
+        *Detail = "vbe-owner";
+        return 0;
+    }
+    status = Roots[0].Io->Io.Read(
+        Roots[0].Io, EfiPciWidthUint16, 0x01ce, 1, &vbe_index);
+    if (status != EFI_INVALID_PARAMETER) {
+        *Code = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
+        *Detail = "vbe-isolation";
         return 0;
     }
     return 1;

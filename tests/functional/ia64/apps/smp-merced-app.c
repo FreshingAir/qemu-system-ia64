@@ -13,6 +13,11 @@
 #define TEST_WAIT_TICKS             5000000000ULL
 #define TEST_RETURN_TICKS           10000000ULL
 #define TEST_RENDEZVOUS_PAGE        0x0000000006000000ULL
+#define TEST_ALAT_ITERATIONS         4096U
+#define TEST_ALAT_DATA_INDEX         TEST_MAX_PROCESSOR_COUNT
+#define TEST_ALAT_READY_INDEX       (TEST_ALAT_DATA_INDEX + 1U)
+#define TEST_ALAT_GO_INDEX          (TEST_ALAT_DATA_INDEX + 2U)
+#define TEST_ALAT_SENTINEL           0xfeedfacecafebeefULL
 
 typedef struct {
     UINT64 Status;
@@ -212,19 +217,81 @@ static UINT64 read_itc(VOID)
     return itc;
 }
 
+/* Volatile keeps shared bare-metal state observable across CPUs. */
+static UINT64 alat_local_probe(volatile UINT64 *Data)
+{
+    UINT64 value;
+
+    __asm__ volatile ("ld8.a %0=[%1];;\n\t"
+                      "mov %0=%2;;\n\t"
+                      "ld8.c.nc %0=[%1];;"
+                      : "=&r"(value)
+                      : "r"(Data), "r"(TEST_ALAT_SENTINEL)
+                      : "memory");
+    return value;
+}
+
+static BOOLEAN alat_remote_store_probe(VOID)
+{
+    /* Volatile keeps the rendezvous handshake loads live. */
+    volatile UINT64 *page = rendezvous_counts();
+    UINT64 iteration;
+
+    for (iteration = 1; iteration <= TEST_ALAT_ITERATIONS; iteration++) {
+        UINT64 result;
+        UINT64 observed;
+
+        while (page[TEST_ALAT_READY_INDEX] != iteration) {
+            __asm__ volatile ("hint @pause" : : : "memory");
+        }
+        __asm__ volatile (
+            "{ .mmi\n\t"
+            "st8.rel [%2]=%4\n\t"
+            "ld8.a %0=[%3]\n\t"
+            "nop.i 0;;\n\t"
+            "}\n\t"
+            "mov %0=%5;;\n"
+            "1:\n\t"
+            "ld8.acq %1=[%3];;\n\t"
+            "cmp.eq p6,p7=%1,%4;;\n\t"
+            "(p7) br.cond.spnt 1b;;\n\t"
+            "ld8.c.nc %0=[%3];;"
+            : "=&r"(result), "=&r"(observed)
+            : "r"(&page[TEST_ALAT_GO_INDEX]),
+              "r"(&page[TEST_ALAT_DATA_INDEX]), "r"(iteration),
+              "r"(TEST_ALAT_SENTINEL)
+            : "p6", "p7", "memory");
+        if (result != iteration) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static VOID ap_rendezvous(VOID)
 {
     UINTN id = (read_lid() >> 24) & 0xffU;
     UINT64 masked = 1ULL << 16;
 
-    /*
-     * The SAL registration deliberately supplies GP=0, so the rendezvous
-     * handler must remain position-independent and avoid firmware-app
-     * globals.  Only processors that actually receive an IPI execute it.
-     */
+    /* The GP=0 SAL handler is position-independent and uses no app globals. */
     if (id > 0 && id < TEST_MAX_PROCESSOR_COUNT) {
         volatile UINT64 *counts =
             (volatile UINT64 *)(UINTN)TEST_RENDEZVOUS_PAGE;
+
+        if (id == 1 && counts[id] == 0) {
+            UINT64 iteration;
+
+            for (iteration = 1; iteration <= TEST_ALAT_ITERATIONS;
+                 iteration++) {
+                counts[TEST_ALAT_READY_INDEX] = iteration;
+                __asm__ volatile ("mf;;" : : : "memory");
+                while (counts[TEST_ALAT_GO_INDEX] != iteration) {
+                    __asm__ volatile ("hint @pause" : : : "memory");
+                }
+                counts[TEST_ALAT_DATA_INDEX] = iteration;
+                __asm__ volatile ("mf;;" : : : "memory");
+            }
+        }
 
         counts[id]++;
         __asm__ volatile ("mf;;" : : : "memory");
@@ -301,6 +368,8 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     BOOLEAN descriptors;
     BOOLEAN first_round = 0;
     BOOLEAN second_round = 0;
+    BOOLEAN full_alat = 0;
+    BOOLEAN alat_remote_store = 0;
 
     (void)ImageHandle;
     mProcessorCount = acpi_processor_count(SystemTable);
@@ -312,6 +381,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         for (offset = 0; offset < EFI_PAGE_SIZE; offset += sizeof(UINT64)) {
             *(volatile UINT64 *)(UINTN)(rendezvous_page + offset) = 0;
         }
+        full_alat = alat_local_probe(
+            &rendezvous_counts()[TEST_ALAT_DATA_INDEX]) ==
+            TEST_ALAT_SENTINEL;
     }
     descriptors = find_sal_descriptors(sal, &sal_descriptor[0],
                                        &sal_descriptor[1], &wake_vector);
@@ -332,6 +404,9 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
         for (id = 1; id < mProcessorCount; id++) {
             send_wake_ipi(id, wake_vector);
         }
+        if (mProcessorCount > 1) {
+            alat_remote_store = alat_remote_store_probe();
+        }
         first_round = wait_for_round(1);
         if (first_round) {
             wait_for_rendezvous_return();
@@ -347,6 +422,15 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
                     EFI_TIMEOUT, "secondary-start-timeout");
     ia64_test_check(&context, "merced-rendezvous-return", second_round,
                     EFI_TIMEOUT, "secondary-return-timeout");
+    if (full_alat) {
+        ia64_test_check(&context, "full-alat-smp-store-ordering",
+                        alat_remote_store, EFI_DEVICE_ERROR,
+                        "stale-full-alat-entry");
+    } else {
+        ia64_test_check(&context, "zero-alat-check-reload",
+                        alat_remote_store, EFI_DEVICE_ERROR,
+                        "zero-alat-did-not-reload");
+    }
     ia64_test_done(&context);
     return context.Failed == 0 ? EFI_SUCCESS : EFI_DEVICE_ERROR;
 }

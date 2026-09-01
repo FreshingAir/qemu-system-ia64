@@ -679,6 +679,23 @@ uint64_t qtest_ia64_stale_victim_load(QTestState *s, uint64_t va,
                                       bool *probe_succeeded);
 
 /**
+ * qtest_ia64_alat_active_writer:
+ * @s: #QTestState instance to operate on.
+ * @setup_hit: Return whether the initial ALAT entry was live.
+ * @active_hit: Return whether that entry hit with an active RAM writer.
+ * @active_alloc_count: Return entries allocated with the writer active.
+ * @active_alloc_hit: Return whether such an allocation hit.
+ *
+ * Exercise IA-64 ALAT lookup and allocation while an external RAM writer
+ * holds its begin/end window.  This command requires stopped TCG CPUs using
+ * the full ALAT model.
+ */
+void qtest_ia64_alat_active_writer(QTestState *s, bool *setup_hit,
+                                   bool *active_hit,
+                                   uint64_t *active_alloc_count,
+                                   bool *active_alloc_hit);
+
+/**
  * qtest_bufread:
  * @s: #QTestState instance to operate on.
  * @addr: Guest address to read from.
