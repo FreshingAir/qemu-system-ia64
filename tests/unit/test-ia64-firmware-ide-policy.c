@@ -37,7 +37,7 @@ static int test_fixed_policy(void)
 
     init_profile(&profile);
     if (!fw_i2000_ide_policy_init(&profile, &policy) ||
-        policy.Segment != 0 || policy.Bus != 0 || policy.Device != 2 ||
+        policy.Segment != 0 || policy.Bus != 0 || policy.Device != 3 ||
         policy.Function != 1 || policy.VendorId != 0x8086U ||
         policy.DeviceId != 0x7601U || policy.Class != 0x0101U ||
         policy.ProgIf != 0x80U || policy.CommandPort != 0x01f0U ||
@@ -137,8 +137,46 @@ static int test_ata_capacity_limits(void)
     return 0;
 }
 
+static int test_i2000_udma_selection(void)
+{
+    UINT16 identify[256] = { 0 };
+    UINT8 mode = 0xff;
+
+    identify[FW_ATA_IDENTIFY_CAPABILITIES_WORD] =
+        FW_ATA_IDENTIFY_DMA_SUPPORTED;
+    identify[FW_ATA_IDENTIFY_VALIDITY_WORD] =
+        FW_ATA_IDENTIFY_UDMA_VALID;
+    identify[FW_ATA_IDENTIFY_UDMA_WORD] = 0x003f;
+    if (!fw_ide_i2000_select_udma(identify, &mode) || mode != 2) {
+        return 1;
+    }
+
+    identify[FW_ATA_IDENTIFY_UDMA_WORD] = 0x0003;
+    if (!fw_ide_i2000_select_udma(identify, &mode) || mode != 1) {
+        return 1;
+    }
+    identify[FW_ATA_IDENTIFY_UDMA_WORD] = 0x0001;
+    if (!fw_ide_i2000_select_udma(identify, &mode) || mode != 0) {
+        return 1;
+    }
+    identify[FW_ATA_IDENTIFY_UDMA_WORD] = 0;
+    if (fw_ide_i2000_select_udma(identify, &mode)) {
+        return 1;
+    }
+    identify[FW_ATA_IDENTIFY_UDMA_WORD] = 0x0007;
+    identify[FW_ATA_IDENTIFY_VALIDITY_WORD] = 0;
+    if (fw_ide_i2000_select_udma(identify, &mode)) {
+        return 1;
+    }
+    identify[FW_ATA_IDENTIFY_VALIDITY_WORD] = FW_ATA_IDENTIFY_UDMA_VALID;
+    identify[FW_ATA_IDENTIFY_CAPABILITIES_WORD] = 0;
+    return fw_ide_i2000_select_udma(identify, &mode) ||
+           fw_ide_i2000_select_udma(NULL, &mode) ||
+           fw_ide_i2000_select_udma(identify, NULL);
+}
+
 int main(void)
 {
     return test_fixed_policy() || test_pci_identity() || test_rejections() ||
-           test_ata_capacity_limits();
+           test_ata_capacity_limits() || test_i2000_udma_selection();
 }

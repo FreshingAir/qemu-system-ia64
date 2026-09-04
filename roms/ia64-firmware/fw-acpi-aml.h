@@ -65,6 +65,10 @@ BOOLEAN fw_acpi_aml_word_bus_number(FWAcpiAmlBuilder *Builder,
                                     UINT16 Granularity, UINT16 Minimum,
                                     UINT16 Maximum, UINT16 Translation,
                                     UINT16 Length);
+BOOLEAN fw_acpi_aml_dword_memory(FWAcpiAmlBuilder *Builder,
+                                 UINT32 Granularity, UINT32 Minimum,
+                                 UINT32 Maximum, UINT32 Translation,
+                                 UINT32 Length);
 BOOLEAN fw_acpi_aml_qword_memory(FWAcpiAmlBuilder *Builder,
                                  UINT64 Granularity, UINT64 Minimum,
                                  UINT64 Maximum, UINT64 Translation,
@@ -79,18 +83,15 @@ BOOLEAN fw_acpi_aml_qword_io_to_memory(FWAcpiAmlBuilder *Builder,
                                        UINT64 Maximum, UINT64 Translation,
                                        UINT64 Length);
 
-/* EFI/ACPI root UIDs used by the zx6000 rope layout (UID 0x500 is absent). */
-UINT32 fw_acpi_zx6000_root_uid(UINTN RootIndex);
+BOOLEAN fw_acpi_ssdt_reparent_legacy_devices(UINT8 *Aml, UINTN Length,
+                                             const CHAR8 Parent[4]);
 
-/*
- * Build the AML body of the QEMU zx6000 DSDT.  PCI _MIN/_MAX values are
- * child-bus addresses and _TRA is the signed two's-complement descriptor
- * offset, so the corresponding CPU address is child address + _TRA.  PCI
- * I/O windows are sparse I/O-to-memory translations.  A PNP0C02 device
- * reserves both the physical MMIO page containing the platform ACPI PM
- * registers and their fixed System I/O compatibility aliases.  The latter
- * are forwarded through the first PCI root's sparse I/O aperture.
- */
+/* zx6000 ACPI root UIDs; 0x500 is absent. */
+UINT32 fw_acpi_zx6000_root_uid(UINTN RootIndex);
+UINT32 fw_acpi_hp_root_uid(const IA64PlatformPciRoot *Root,
+                           UINTN RootIndex, UINTN RootCount);
+
+/* Build the AML body shared by the zx6000 and rx2660 DSDTs. */
 BOOLEAN fw_acpi_build_zx6000_dsdt(
     UINT8 *Buffer, UINTN Capacity,
     const IA64PlatformPciRoot *Roots, UINTN RootCount,

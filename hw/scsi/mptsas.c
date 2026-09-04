@@ -1176,6 +1176,33 @@ static const MemoryRegionOps mptsas_diag_ops = {
     }
 };
 
+static uint64_t mptsas_pci_rom_read(void *opaque, hwaddr addr,
+                                    unsigned int size)
+{
+    return UINT64_MAX;
+}
+
+static void mptsas_pci_rom_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned int size)
+{
+}
+
+static const MemoryRegionOps mptsas_pci_rom_ops = {
+    .read = mptsas_pci_rom_read,
+    .write = mptsas_pci_rom_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+        .unaligned = true,
+    },
+};
+
 static QEMUSGList *mptsas_get_sg_list(SCSIRequest *sreq)
 {
     MPTSASRequest *req = sreq->hba_private;
@@ -1333,7 +1360,19 @@ static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
 {
     MPTSASState *s = MPT_SAS(dev);
     Error *err = NULL;
+    uint8_t memory_bar_type = PCI_BASE_ADDRESS_SPACE_MEMORY |
+                              PCI_BASE_ADDRESS_MEM_TYPE_32;
+    unsigned int diag_bar = 2;
     int ret;
+
+    if (s->pci_rom_size && !is_power_of_2(s->pci_rom_size)) {
+        error_setg(errp, "x-pci-rom-size must be zero or a power of two");
+        return;
+    }
+    if (s->pci_rom_size && dev->romfile && dev->romfile[0]) {
+        error_setg(errp, "x-pci-rom-size cannot be used with romfile");
+        return;
+    }
 
     dev->config[PCI_LATENCY_TIMER] = 0;
     dev->config[PCI_INTERRUPT_PIN] = 0x01;
@@ -1365,11 +1404,22 @@ static void mptsas_scsi_realize(PCIDevice *dev, Error **errp)
     memory_region_init_io(&s->diag_io, OBJECT(s), &mptsas_diag_ops, s,
                           "mptsas-diag", 0x10000);
 
+    if (s->pci_64bit_bars) {
+        memory_bar_type = PCI_BASE_ADDRESS_SPACE_MEMORY |
+                          PCI_BASE_ADDRESS_MEM_TYPE_64;
+        diag_bar = 3;
+    }
+
     pci_register_bar(dev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->port_io);
-    pci_register_bar(dev, 1, PCI_BASE_ADDRESS_SPACE_MEMORY |
-                                 PCI_BASE_ADDRESS_MEM_TYPE_32, &s->mmio_io);
-    pci_register_bar(dev, 2, PCI_BASE_ADDRESS_SPACE_MEMORY |
-                                 PCI_BASE_ADDRESS_MEM_TYPE_32, &s->diag_io);
+    pci_register_bar(dev, 1, memory_bar_type, &s->mmio_io);
+    pci_register_bar(dev, diag_bar, memory_bar_type, &s->diag_io);
+
+    /* The optional expansion ROM aperture contains no option ROM image. */
+    if (s->pci_rom_size) {
+        memory_region_init_io(&s->pci_rom, OBJECT(s), &mptsas_pci_rom_ops, s,
+                              "mptsas-pci-rom", s->pci_rom_size);
+        pci_register_bar(dev, PCI_ROM_SLOT, 0, &s->pci_rom);
+    }
 
     if (!mptsas_is_spi(s) && !s->sas_addr) {
         s->sas_addr = ((NAA_LOCALLY_ASSIGNED_ID << 24) |
@@ -1452,7 +1502,9 @@ static int mptsas_post_load(void *opaque, int version_id)
             port_id >= MPTSPI_MAX_TARGETS) {
             return -EINVAL;
         }
-    } else if (s->ioc1_flags || s->ioc1_coalescing_timeout ||
+    } else if (!s->max_devices || s->max_devices > MPTSAS_NUM_PORTS ||
+               s->max_buses > 1 ||
+               s->ioc1_flags || s->ioc1_coalescing_timeout ||
                s->ioc1_coalescing_depth) {
         return -EINVAL;
     }
@@ -1576,8 +1628,9 @@ static const VMStateDescription vmstate_mptsas = {
 
 static const Property mptsas_properties[] = {
     DEFINE_PROP_UINT64("sas_address", MPTSASState, sas_addr, 0),
-    /* TODO: test MSI support under Windows */
     DEFINE_PROP_ON_OFF_AUTO("msi", MPTSASState, msi, ON_OFF_AUTO_AUTO),
+    DEFINE_PROP_BOOL("x-pci-64bit-bars", MPTSASState, pci_64bit_bars, false),
+    DEFINE_PROP_UINT32("x-pci-rom-size", MPTSASState, pci_rom_size, 0),
 };
 
 static void mpt_fusion_class_init(ObjectClass *oc, const void *data)

@@ -1407,6 +1407,34 @@ uint64_t qtest_ia64_stale_victim_load(QTestState *s, uint64_t va,
     return value;
 }
 
+void qtest_ia64_alat_active_writer(QTestState *s, bool *setup_hit,
+                                   bool *active_hit,
+                                   uint64_t *active_alloc_count,
+                                   bool *active_alloc_hit)
+{
+    uint64_t values[4];
+    gchar **args;
+    int i;
+    int rc;
+
+    qtest_sendf(s, "ia64-alat-active-writer\n");
+    args = qtest_rsp_args(s, 5);
+
+    for (i = 0; i < ARRAY_SIZE(values); i++) {
+        rc = qemu_strtou64(args[i + 1], NULL, 0, &values[i]);
+        g_assert(rc == 0);
+    }
+    g_assert_cmpuint(values[0], <=, 1);
+    g_assert_cmpuint(values[1], <=, 1);
+    g_assert_cmpuint(values[3], <=, 1);
+
+    *setup_hit = values[0];
+    *active_hit = values[1];
+    *active_alloc_count = values[2];
+    *active_alloc_hit = values[3];
+    g_strfreev(args);
+}
+
 void qtest_add_func(const char *str, void (*fn)(void))
 {
     gchar *path = g_strdup_printf("/%s/%s", qtest_get_arch(), str);

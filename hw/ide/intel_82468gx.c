@@ -15,22 +15,29 @@
 #include "qemu/module.h"
 
 #include "ide-internal.h"
+#include "trace.h"
 
 static uint64_t ifb_bmdma_read(void *opaque, hwaddr addr, unsigned size)
 {
     BMDMAState *bm = opaque;
+    uint8_t value;
 
     if (size != 1) {
         return MAKE_64BIT_MASK(0, size * 8);
     }
     switch (addr & 3) {
     case 0:
-        return bm->cmd;
+        value = bm->cmd;
+        break;
     case 2:
-        return bm->status;
+        value = bm->status;
+        break;
     default:
-        return UINT8_MAX;
+        value = UINT8_MAX;
+        break;
     }
+    trace_bmdma_read(addr, value);
+    return value;
 }
 
 static void ifb_bmdma_write(void *opaque, hwaddr addr, uint64_t value,
@@ -41,6 +48,7 @@ static void ifb_bmdma_write(void *opaque, hwaddr addr, uint64_t value,
     if (size != 1) {
         return;
     }
+    trace_bmdma_write(addr, value);
     switch (addr & 3) {
     case 0:
         bmdma_cmd_writeb(bm, value);

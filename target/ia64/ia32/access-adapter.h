@@ -3,6 +3,8 @@
 #ifndef TARGET_IA64_IA32_ACCESS_ADAPTER_H
 #define TARGET_IA64_IA32_ACCESS_ADAPTER_H
 
+#include "arch/arch.h"
+#include "exec-access.h"
 #include "helper-compat.h"
 #include "ia32/ia32.h"
 #define X86_CPU_ARCH_ENV(env) ((CPUIA64State *)(env))
@@ -14,5 +16,9 @@
         (CPUIA64State *)(env), (uint32_t)(addr), (size),              \
         (access) == MMU_DATA_STORE ? IA64_IA32_SEG_ACCESS_WRITE :     \
                                      IA64_IA32_SEG_ACCESS_READ)
+#define X86_ACCESS_NOTIFY_STORE(env) \
+    ia64_alat_notify_store((CPUIA64State *)(env))
+#define X86_ACCESS_ENSURE_EXCLUSIVE(env, ra) \
+    ia64_exec_ensure_alat_exclusive((CPUIA64State *)(env), (ra))
 
 #endif /* TARGET_IA64_IA32_ACCESS_ADAPTER_H */

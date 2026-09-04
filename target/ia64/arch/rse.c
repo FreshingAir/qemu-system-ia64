@@ -1955,6 +1955,7 @@ void ia64_rfi(CPUIA64State *env, uint64_t fault_ip, uint32_t fault_slot)
 
     env->exception_state.exception = IA64_EXCP_NONE;
     env->exception_state.fault_ip = 0;
+    env->exception_state.fault_addr = 0;
     env->exception_state.fault_imm = 0;
     env->exception_state.fault_slot = 0;
     env->instruction_group_start = true;
@@ -2576,8 +2577,9 @@ uint64_t ia64_rse_cloop_zero_st1(CPUIA64State *env, uint32_t base_reg,
 
         if (ia64_exec_probe_host(env, addr, (int)span, MMU_DATA_STORE,
                                  mmu_idx, &host, ra)) {
+            ia64_alat_write_begin(env);
             memset(host, 0, span);
-            ia64_invalidate_alat_store(env, addr, (uint32_t)span);
+            ia64_alat_write_end(env, addr, (uint32_t)span);
             env->gr[base_reg] = addr + span;
             done += span;
             env->ar[IA64_AR_LC] = lc - done;
@@ -2585,7 +2587,6 @@ uint64_t ia64_rse_cloop_zero_st1(CPUIA64State *env, uint32_t base_reg,
         }
 
         ia64_exec_store_mmuidx(env, addr, 0, 1, false, mmu_idx, ra);
-        ia64_invalidate_alat_store(env, addr, 1);
         env->gr[base_reg] = addr + 1;
         done++;
         env->ar[IA64_AR_LC] = lc - done;

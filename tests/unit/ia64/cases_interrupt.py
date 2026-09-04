@@ -2141,6 +2141,28 @@ test_exception_unaligned_sets_ifa_isr = require_registers(
     {"ip": 0x5a20, "r14": 0xff9, "r15": IA64_ISR_R},
 )
 
+# SDM Vol. 2 Table 8-1 specifies no CR.IFA write when PSR.ic is clear.
+test_exception_unaligned_ic0_preserves_ifa = require_registers(
+    "exception_unaligned_ic0_preserves_ifa",
+    [
+        (0x10, *movl_mlx(19, 0x1122334455667788)),
+        (0x20, 0x00, mov_m_gr_cr(19, 20), adds(3, 0xff9, 0), nop_i()),
+        (0x30, 0x00, ld8(4, 3), nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR, 0x00, mov_m_cr_gr(14, 20),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x10, 0x00, mov_m_cr_gr(15, 17),
+         nop_i(), nop_i()),
+        (IA64_UNALIGNED_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_UNALIGNED_VECTOR + 0x20,
+                 IA64_UNALIGNED_VECTOR + 0x20)),
+    ],
+    {
+        "ip": IA64_UNALIGNED_VECTOR + 0x20,
+        "r14": 0x1122334455667788,
+        "r15": IA64_ISR_R | IA64_ISR_NI,
+    },
+)
+
 test_exception_unaligned_slot1_uses_psr_ri = require_registers(
     "exception_unaligned_slot1_uses_psr_ri",
     [
@@ -5132,6 +5154,72 @@ test_rfi_montecito_uncollected_transition_preserves_target = \
         }, entry=0x10)
 
 
+# SDM Vol. 2 Table 8-1: an uncollected debug fault must not write CR.IFA.
+test_native_ibr_ic0_preserves_ifa = require_registers(
+    "native_ibr_ic0_preserves_ifa", [
+        (0x10, *movl_mlx(19, 0x1122334455667788)),
+        (0x20, 0x00, mov_m_gr_cr(19, 20), nop_i(), nop_i()),
+        (0x30, *movl_mlx(4, 0)),
+        (0x40, *movl_mlx(5, 0x100)),
+        (0x50, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x60, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x70, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x80, 0x00, mov_ibr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x90, 0x00, srlz_i(), nop_i(), nop_i()),
+        (0xa0, *movl_mlx(2, IA64_PSR_DB)),
+        (0xb0, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xc0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xd0, 0x10, nop_m(), nop_i(), br_cond(0xd0, 0x100)),
+        (0x100, 0x00, nop_m(), nop_i(), nop_i()),
+        (0x110, 0x10, nop_m(), nop_i(), br_cond(0x110, 0x110)),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(8, 20), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(9, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x20,
+                 IA64_DEBUG_VECTOR + 0x20)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x20,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0x1122334455667788,
+        "r9": IA64_ISR_X | IA64_ISR_NI,
+    }, entry=0x10)
+
+
+test_native_dbr_ic0_preserves_ifa = require_registers(
+    "native_dbr_ic0_preserves_ifa", [
+        (0x10, *movl_mlx(19, 0x1122334455667788)),
+        (0x20, 0x00, mov_m_gr_cr(19, 20), nop_i(), nop_i()),
+        (0x30, *movl_mlx(4, 0)),
+        (0x40, *movl_mlx(5, 0x200)),
+        (0x50, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x60, 0x00, nop_m(), adds(4, 1, 0), nop_i()),
+        (0x70, *movl_mlx(5, 0x81ffffffffffffff)),
+        (0x80, 0x00, mov_dbr_indexed_write(4, 5), nop_i(), nop_i()),
+        (0x90, *movl_mlx(3, 0x200)),
+        (0xa0, *movl_mlx(2, IA64_PSR_DB)),
+        (0xb0, 0x00, mov_gr_psr_full(2), nop_i(), nop_i()),
+        (0xc0, 0x00, srlz_d(), nop_i(), nop_i()),
+        (0xd0, 0x00, ld8(8, 3), nop_i(), nop_i()),
+        (0xe0, 0x10, nop_m(), nop_i(), br_cond(0xe0, 0xe0)),
+        raw_bundle(0x200, 0x8877665544332211, 0),
+        (IA64_DEBUG_VECTOR, 0x00, mov_m_cr_gr(9, 20), nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x10, 0x00, mov_m_cr_gr(10, 17),
+         nop_i(), nop_i()),
+        (IA64_DEBUG_VECTOR + 0x20, 0x10, nop_m(), nop_i(),
+         br_cond(IA64_DEBUG_VECTOR + 0x20,
+                 IA64_DEBUG_VECTOR + 0x20)),
+    ], {
+        "ip": IA64_DEBUG_VECTOR + 0x20,
+        "exception": IA64_EXCP_NONE,
+        "fault_code": IA64_EXCP_DEBUG,
+        "r8": 0,
+        "r9": 0x1122334455667788,
+        "r10": IA64_ISR_R | IA64_ISR_NI,
+    }, entry=0x10)
+
+
 # SDM Vol. 2, 7.1: an instruction breakpoint is checked before predicate
 # evaluation, so a disabled instruction can still take the Debug fault.
 test_native_ibr_matches_predicated_off_instruction = require_registers(
@@ -5873,6 +5961,7 @@ CASE_NAMES = (
     'exception_reserved_template',
     'exception_syscall_break',
     'exception_unaligned',
+    'exception_unaligned_ic0_preserves_ifa',
     'exception_unaligned_sets_ifa_isr',
     'exception_unaligned_slot1_uses_psr_ri',
     'future_itm_rearm_preserves_pended_timer_irr',
@@ -5967,9 +6056,11 @@ CASE_NAMES = (
     'native_aligned_ldfe_matches_dbr_padding',
     'native_cmp8xchg16_debug_excludes_following_byte',
     'native_cmp8xchg16_debug_matches_lower_half',
+    'native_dbr_ic0_preserves_ifa',
     'native_dbr_overlap_precedes_unaligned_fault',
     'native_dbr_precedes_advanced_non_speculative_failure',
     'native_dbr_predicated_off_load_does_not_match',
+    'native_ibr_ic0_preserves_ifa',
     'native_ibr_matches_predicated_off_instruction',
     'native_madison_cross16_data_debug_precedes_unaligned',
     'native_madison_cross16_data_debug_respects_psr_dd',

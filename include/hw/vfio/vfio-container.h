@@ -13,10 +13,19 @@
 #ifndef HW_VFIO_VFIO_CONTAINER_H
 #define HW_VFIO_VFIO_CONTAINER_H
 
+#include "qemu/interval-tree.h"
+#include "qemu/thread.h"
 #include "system/memory.h"
 
 typedef struct VFIODevice VFIODevice;
 typedef struct VFIOIOMMUClass VFIOIOMMUClass;
+
+typedef struct VFIODMAUnmapResult {
+    /* Actual bytes reported by a completed backend unmap. */
+    uint64_t unmapped_size;
+    bool executed; /* The backend executed an unmap operation. */
+    bool complete; /* The requested range or address space was unmapped. */
+} VFIODMAUnmapResult;
 
 typedef struct {
     unsigned long *bitmap;
@@ -51,6 +60,10 @@ struct VFIOContainer {
     QLIST_ENTRY(VFIOContainer) next;
     QLIST_HEAD(, VFIODevice) device_list;
     GList *iova_ranges;
+    QemuMutex dma_map_lock;
+    IntervalTreeRoot writable_dma_mappings;
+    bool writable_dma_untrackable;
+    bool writable_dma_external_writer;
     NotifierWithReturn cpr_reboot_notifier;
     bool bypass_ro;
 };
@@ -197,12 +210,18 @@ struct VFIOIOMMUClass {
      * @size: size of the range to unmap
      * @iotlb: The IOMMU TLB mapping entry (or NULL)
      * @unmap_all: if set, unmap the entire address space
+     * @result: actual unmap result reported by the backend
      *
      * Returns 0 to indicate success and -errno otherwise.
      */
     int (*dma_unmap)(const VFIOContainer *bcontainer,
                      hwaddr iova, uint64_t size,
-                     IOMMUTLBEntry *iotlb, bool unmap_all);
+                     IOMMUTLBEntry *iotlb, bool unmap_all,
+                     VFIODMAUnmapResult *result);
+    /* Per-mapping completion is unavailable to the common tracker. */
+    bool dma_mapping_deferred;
+    /* Takes ownership of an active external-writer scope. */
+    void (*release_external_writer)(VFIOContainer *bcontainer);
 
 
     /**

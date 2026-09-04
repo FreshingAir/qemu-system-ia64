@@ -22,7 +22,7 @@ def test_cpu_models(qemu: str) -> None:
               if line and line != "Available CPUs:"]
     expected = [
         "itanium", "itanium2", "madison", "madison-zx6000", "merced",
-        "montecito",
+        "montecito-9010", "montecito-9040", "montecito",
     ]
     if result.returncode != 0 or models != expected:
         raise RuntimeError(

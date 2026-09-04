@@ -468,6 +468,11 @@ def ld2_sa(r1, r3, qp=0):
             | bitfield(r3, 20, 7) | bitfield(r1, 6, 7)
             | bitfield(qp, 0, 6))
 
+def ld4_sa(r1, r3, qp=0):
+    return (op(4) | bitfield(2, 27, 2) | bitfield(0x0e, 30, 6)
+            | bitfield(r3, 20, 7) | bitfield(r1, 6, 7)
+            | bitfield(qp, 0, 6))
+
 def ld2_c_clr(r1, r3, qp=0):
     return load_mem(0x21, r1, r3, qp)
 
@@ -816,6 +821,7 @@ __all__ = (
     'ld8_a',
     'ld8_sa',
     'ld2_sa',
+    'ld4_sa',
     'ld2_c_clr',
     'ld4_a',
     'ld4_c_clr',

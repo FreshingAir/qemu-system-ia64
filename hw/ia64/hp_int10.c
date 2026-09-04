@@ -1,12 +1,9 @@
 /*
  * HP IA-64 legacy INT 10h/VBE bridge
  *
- * Provide the post-ExitBootServices INT 10h subset required by IA-64 guests.
- * The emulated HP platforms have no executable x86 option ROM, so the
- * real-mode stub forwards those calls to QEMU C code through a private PCI
- * I/O window.  The service and VGA I/O windows are independent: zx6000 routes
- * VGA cycles to its AGP rope while firmware service cycles remain on PCI
- * root 0.
+ * Implements a post-ExitBootServices INT 10h subset.  X86 option-ROM
+ * execution is not implemented; the real-mode stub forwards calls to QEMU C
+ * code through a dedicated PCI I/O window.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -29,13 +26,32 @@
 #define HP_INT10_ROM_PCIR_OFFSET      0x0020U
 #define HP_INT10_ROM_ATI_SIGNATURE    0x0074U
 #define HP_INT10_ROM_ATI_HEADER       0x0080U
-#define HP_INT10_ROM_ATI_PLL          0x00c0U
+#define HP_INT10_ROM_ATI_HEADER_SIZE  0x0060U
+#define HP_INT10_ROM_ATI_RAGE128_HEADER_SIZE 0x004aU
+#define HP_INT10_ROM_ATI_INIT         0x00e0U
+#define HP_INT10_ROM_ATI_INIT_READ    10U
+#define HP_INT10_ROM_ATI_BIOS_SUPPORT 0x00f0U
+#define HP_INT10_ROM_ATI_BIOS_SUPPORT_SIZE 12U
+#define HP_INT10_ROM_ATI_RAGE128_MISC 0x00f0U
+#define HP_INT10_ROM_ATI_RAGE128_MISC_SIZE 15U
+#define HP_INT10_ROM_ATI_MISC         0x00fcU
+#define HP_INT10_ROM_ATI_MISC_SIZE    2U
 #define HP_INT10_ROM_HANDLER          0x0100U
 #define HP_INT10_ROM_OEM              0x0180U
 #define HP_INT10_ROM_VENDOR           0x0190U
 #define HP_INT10_ROM_PRODUCT          0x01a0U
 #define HP_INT10_ROM_REVISION         0x01c0U
 #define HP_INT10_ROM_MODES            0x01d0U
+#define HP_INT10_ROM_ATI_CONNECTOR    0x02e0U
+#define HP_INT10_ROM_ATI_CONNECTOR_SIZE 6U
+#define HP_INT10_ROM_ATI_RAGE128_CRT  0x02e0U
+#define HP_INT10_ROM_ATI_RAGE128_CRT_SIZE 30U
+#define HP_INT10_ROM_ATI_PLL          0x0300U
+#define HP_INT10_ROM_ATI_PLL_READ_SIZE 0x006eU
+#define HP_INT10_ROM_ATI_MEM_CONFIG   0x0383U
+#define HP_INT10_ROM_ATI_MEM_PREFIX_SIZE 3U
+#define HP_INT10_ROM_ATI_MEM_RESET_OFFSET 3U
+#define HP_INT10_ROM_ATI_MEM_RESET_SIZE 100U
 #define HP_INT10_ROM_NVIDIA_BMP       0x0600U
 #define HP_INT10_VECTOR_ADDR          (0x10U * 4U)
 
@@ -67,11 +83,8 @@
 #define HP_INT10_BDA_VIDEO_SWITCHES   0x00000488U
 
 #define HP_INT10_ATI_VENDOR_ID        0x1002U
-#define HP_INT10_ATI_PLL_XCLK         23000U
-#define HP_INT10_ATI_PLL_REFERENCE    2700U
-#define HP_INT10_ATI_PLL_DIVIDER      4U
-#define HP_INT10_ATI_PLL_MIN_FREQ     12000U
-#define HP_INT10_ATI_PLL_MAX_FREQ     35000U
+#define HP_INT10_ATI_RAGE128_DEVICE_ID 0x5046U
+#define HP_INT10_ATI_ES1000_DEVICE_ID 0x515eU
 
 #define HP_INT10_NVIDIA_VENDOR_ID     0x10deU
 #define HP_INT10_NVIDIA_BMP_MAJOR     0x05U
@@ -1219,28 +1232,136 @@ static const MemoryRegionOps hp_int10_io_ops = {
     },
 };
 
-static void hp_int10_install_ati_bios_info(uint8_t *rom, uint16_t vendor)
+static void hp_int10_install_ati_clock_range(uint8_t *pll, size_t offset,
+                                              uint16_t reference,
+                                              uint16_t divider,
+                                              uint32_t minimum,
+                                              uint32_t maximum)
+{
+    stw_le_p(pll + offset, reference);
+    stw_le_p(pll + offset + 2, divider);
+    stl_le_p(pll + offset + 4, minimum);
+    stl_le_p(pll + offset + 8, maximum);
+}
+
+static void hp_int10_install_ati_bios_info(uint8_t *rom, PCIDevice *vga,
+                                           uint32_t memory_size)
 {
     static const char ati_bios_signature[] = "761295520";
+    static const uint8_t ati_rage128_header[] = {
+        0x02, 0xa0, 0x01, 0x01, 0x03, 0x01,
+        HP_INT10_ROM_ATI_RAGE128_HEADER_SIZE, 0x00,
+    };
+    static const char ati_rage128_misc[] = "R128AGP SGS1UN";
+    static const uint8_t
+        ati_rage128_crt[HP_INT10_ROM_ATI_RAGE128_CRT_SIZE] = {
+        0x12, 0x00, 0x80, 0x00, 0x00, 0x00, 0x63, 0x4f,
+        0x51, 0x8c, 0x0c, 0x02, 0xdf, 0x01, 0xe9, 0x01,
+        0x82, 0x00, 0xd6, 0x09,
+    };
+    static const uint8_t ati_vga_connector[] = {
+        0x11, 0x11, 0x00, 0x23, 0x00, 0x00,
+    };
+    uint8_t *header = rom + HP_INT10_ROM_ATI_HEADER;
+    uint8_t *pll = rom + HP_INT10_ROM_ATI_PLL;
+    uint16_t vendor = pci_get_word(vga->config + PCI_VENDOR_ID);
+    uint16_t device = pci_get_word(vga->config + PCI_DEVICE_ID);
+    bool rage128 = device == HP_INT10_ATI_RAGE128_DEVICE_ID;
+    bool es1000 = device == HP_INT10_ATI_ES1000_DEVICE_ID;
+    uint32_t memory_mb = MIN(memory_size / MiB, 256U);
+    uint32_t memory_step = memory_mb > UINT8_MAX ? 2 : 1;
+    uint32_t memory_units = memory_mb / memory_step;
 
     if (vendor != HP_INT10_ATI_VENDOR_ID) {
         return;
     }
+    g_assert(memory_size % MiB == 0);
+    g_assert(memory_mb != 0 && memory_mb % memory_step == 0);
+    g_assert(memory_units != 0 && memory_units <= UINT8_MAX);
 
-    /* Legacy ATI header data for Rage128 and pre-ATOM RV100 compatibility. */
     memcpy(rom + HP_INT10_ROM_ATI_SIGNATURE,
            ati_bios_signature, sizeof(ati_bios_signature));
     stw_le_p(rom + 0x48, HP_INT10_ROM_ATI_HEADER);
-    stw_le_p(rom + HP_INT10_ROM_ATI_HEADER + 0x30, HP_INT10_ROM_ATI_PLL);
-    stw_le_p(rom + HP_INT10_ROM_ATI_PLL + 0x08, HP_INT10_ATI_PLL_XCLK);
-    stw_le_p(rom + HP_INT10_ROM_ATI_PLL + 0x0e,
-             HP_INT10_ATI_PLL_REFERENCE);
-    stw_le_p(rom + HP_INT10_ROM_ATI_PLL + 0x10,
-             HP_INT10_ATI_PLL_DIVIDER);
-    stl_le_p(rom + HP_INT10_ROM_ATI_PLL + 0x12,
-             HP_INT10_ATI_PLL_MIN_FREQ);
-    stl_le_p(rom + HP_INT10_ROM_ATI_PLL + 0x16,
-             HP_INT10_ATI_PLL_MAX_FREQ);
+    if (rage128) {
+        memcpy(header, ati_rage128_header, sizeof(ati_rage128_header));
+    } else {
+        header[0] = 8;
+        header[1] = 0xa0;
+        stw_le_p(header + 0x06, HP_INT10_ROM_ATI_HEADER_SIZE);
+    }
+    stw_le_p(header + 0x0c, HP_INT10_ROM_ATI_INIT);
+    stw_le_p(header + 0x1c,
+             pci_get_word(vga->config + PCI_SUBSYSTEM_VENDOR_ID));
+    stw_le_p(header + 0x1e,
+             pci_get_word(vga->config + PCI_SUBSYSTEM_ID));
+    stw_le_p(header + 0x30, HP_INT10_ROM_ATI_PLL);
+    if (rage128) {
+        stw_le_p(header + 0x14, HP_INT10_ROM_ATI_RAGE128_MISC);
+        stw_le_p(header + 0x2e, HP_INT10_ROM_ATI_RAGE128_CRT);
+        memcpy(rom + HP_INT10_ROM_ATI_RAGE128_MISC, ati_rage128_misc,
+               sizeof(ati_rage128_misc));
+        memcpy(rom + HP_INT10_ROM_ATI_RAGE128_CRT, ati_rage128_crt,
+               sizeof(ati_rage128_crt));
+    } else {
+        stw_le_p(header + 0x14, HP_INT10_ROM_ATI_BIOS_SUPPORT);
+        stw_le_p(header + 0x46, HP_INT10_ROM_ATI_INIT);
+        stw_le_p(header + 0x48, HP_INT10_ROM_ATI_MEM_CONFIG);
+        stw_le_p(header + 0x4e, HP_INT10_ROM_ATI_INIT);
+        /* One VGA/primary-DAC connector entry. */
+        stw_le_p(header + 0x50, HP_INT10_ROM_ATI_CONNECTOR);
+        memcpy(rom + HP_INT10_ROM_ATI_CONNECTOR, ati_vga_connector,
+               sizeof(ati_vga_connector));
+        stw_le_p(header + 0x52, HP_INT10_ROM_ATI_INIT);
+        stw_le_p(header + 0x5e, HP_INT10_ROM_ATI_MISC);
+    }
+
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG - 3] =
+        HP_INT10_ROM_ATI_MEM_RESET_OFFSET;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG - 2] =
+        memory_step == 1 ? 0 : memory_step;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG - 1] = 0;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG] = (uint8_t)memory_units;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG + 1] =
+        memory_step == 1 ? 0x25 : 0x2d;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG + 2] = 0;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG + 3] = 1;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG + 4] = 0;
+    rom[HP_INT10_ROM_ATI_MEM_CONFIG + 5] = 0xff;
+
+    pll[0] = rage128 ? 6 : 0x0a;
+    pll[1] = rage128 ? 0x32 : 0x46;
+    pll[2] = 3;
+    pll[3] = rage128 ? 2 : 3;
+    stw_le_p(pll + 0x04, rage128 ? 0x0600 :
+             (es1000 ? 0x05ee : 0x05a6));
+    stw_le_p(pll + 0x06, rage128 ? 0x05f8 :
+             (es1000 ? 0x05e6 : 0x059e));
+    stw_le_p(pll + 0x08, rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    stw_le_p(pll + 0x0a, rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    pll[0x0c] = 3;
+    pll[0x0d] = 12;
+    if (rage128) {
+        hp_int10_install_ati_clock_range(pll, 0x0e,
+                                         2950, 65, 12500, 40000);
+        hp_int10_install_ati_clock_range(pll, 0x1a,
+                                         2950, 29, 12500, 26041);
+        hp_int10_install_ati_clock_range(pll, 0x26,
+                                         2950, 29, 12500, 26041);
+    } else {
+        hp_int10_install_ati_clock_range(pll, 0x0e,
+                                         2700, 60, 12000, 35000);
+        hp_int10_install_ati_clock_range(pll, 0x1a,
+                                         2700, 12, 20000, 40000);
+        hp_int10_install_ati_clock_range(pll, 0x26,
+                                         2700, 12, 20000, 40000);
+        pll[0x32] = 1;
+        pll[0x33] = 0x12;
+        stw_le_p(pll + 0x34, 2700);
+        stl_le_p(pll + 0x36, 40);
+        stl_le_p(pll + 0x3a, 3000);
+        stl_le_p(pll + 0x3e, 12000);
+        stl_le_p(pll + 0x42, 35000);
+    }
 }
 
 static void hp_int10_install_nvidia_bios_info(uint8_t *rom, uint16_t vendor)
@@ -1253,12 +1374,7 @@ static void hp_int10_install_nvidia_bios_info(uint8_t *rom, uint16_t vendor)
         return;
     }
 
-    /*
-     * Minimal, synthetic NV15 BMP 5.06 metadata.  This is generated from
-     * the public BMP layout rather than copied from an NVIDIA option ROM.
-     * The card is already initialised by QEMU, so legacy init-script
-     * pointers intentionally remain zero.
-     */
+    /* NV15 metadata with zero init-script pointers. */
     memcpy(bmp, "\xff\x7f" "NV\0", 5);
     bmp[5] = HP_INT10_NVIDIA_BMP_MAJOR;
     bmp[6] = HP_INT10_NVIDIA_BMP_MINOR;
@@ -1302,7 +1418,31 @@ static void hp_int10_install_rom(HPIA64Int10 *s)
              HP_INT10_ROM_REVISION);
     g_assert(HP_INT10_ROM_REVISION + sizeof(hp_int10_revision) <=
              HP_INT10_ROM_MODES);
-    g_assert(HP_INT10_ROM_MODES + (s->mode_count + 1) * 2 < sizeof(rom));
+    g_assert(HP_INT10_ROM_ATI_HEADER + HP_INT10_ROM_ATI_HEADER_SIZE <=
+             HP_INT10_ROM_ATI_INIT);
+    g_assert(HP_INT10_ROM_ATI_INIT + HP_INT10_ROM_ATI_INIT_READ <=
+             HP_INT10_ROM_ATI_BIOS_SUPPORT);
+    g_assert(HP_INT10_ROM_ATI_BIOS_SUPPORT +
+             HP_INT10_ROM_ATI_BIOS_SUPPORT_SIZE <=
+             HP_INT10_ROM_ATI_MISC);
+    g_assert(HP_INT10_ROM_ATI_RAGE128_MISC +
+             HP_INT10_ROM_ATI_RAGE128_MISC_SIZE <=
+             HP_INT10_ROM_HANDLER);
+    g_assert(HP_INT10_ROM_ATI_MISC + HP_INT10_ROM_ATI_MISC_SIZE <=
+             HP_INT10_ROM_HANDLER);
+    g_assert(HP_INT10_ROM_MODES + (s->mode_count + 1) * 2 <=
+             HP_INT10_ROM_ATI_CONNECTOR);
+    g_assert(HP_INT10_ROM_ATI_CONNECTOR +
+             HP_INT10_ROM_ATI_CONNECTOR_SIZE <= HP_INT10_ROM_ATI_PLL);
+    g_assert(HP_INT10_ROM_ATI_RAGE128_CRT +
+             HP_INT10_ROM_ATI_RAGE128_CRT_SIZE <= HP_INT10_ROM_ATI_PLL);
+    g_assert(HP_INT10_ROM_ATI_PLL + HP_INT10_ROM_ATI_PLL_READ_SIZE <=
+             HP_INT10_ROM_ATI_MEM_CONFIG -
+             HP_INT10_ROM_ATI_MEM_PREFIX_SIZE);
+    g_assert(HP_INT10_ROM_ATI_MEM_CONFIG +
+             HP_INT10_ROM_ATI_MEM_RESET_OFFSET +
+             HP_INT10_ROM_ATI_MEM_RESET_SIZE <=
+             HP_INT10_ROM_NVIDIA_BMP);
 
     rom[0] = 0x55;
     rom[1] = 0xaa;
@@ -1326,7 +1466,8 @@ static void hp_int10_install_rom(HPIA64Int10 *s)
     rom[HP_INT10_ROM_PCIR_OFFSET + 0x14] = 0;
     rom[HP_INT10_ROM_PCIR_OFFSET + 0x15] = 0x80;
     memcpy(rom + 0x60, "QEMU HP IA64 INT10", 19);
-    hp_int10_install_ati_bios_info(rom, vendor);
+    hp_int10_install_ati_bios_info(rom, s->vga,
+                                   hp_int10_vbe_memory_size(s));
     hp_int10_install_nvidia_bios_info(rom, vendor);
     memcpy(rom + HP_INT10_ROM_HANDLER, hp_int10_handler,
            sizeof(hp_int10_handler));
@@ -1347,6 +1488,7 @@ static void hp_int10_install_rom(HPIA64Int10 *s)
         checksum += rom[i];
     }
     rom[sizeof(rom) - 1] = -checksum;
+
     cpu_physical_memory_write(HP_INT10_ROM_BASE, rom, sizeof(rom));
 
     stw_le_p(vector, HP_INT10_ROM_HANDLER);

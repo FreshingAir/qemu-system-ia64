@@ -38,10 +38,11 @@ config HP_I2000
     select MC146818RTC
     select EEPRO100_PCI
     select ISP12160
-    select LSI_SCSI_PCI
+    select CS4281
     select ATI_VGA
     select NVIDIA_QUADRO2
     select VGA_PCI
+    select USB_HID
 
 config IA64_460GX_DMA_TEST
     bool
@@ -114,11 +115,18 @@ config HP_ZX6000
     select HP_ZX1_IOA
     select IDE_CMD649
     select MPTSPI_SCSI_PCI
+    select BCM5704_PCI
     select EEPRO100_PCI
     select ATI_VGA
     select VGA_PCI
     select USB_NEC_PCI
     select USB_HID
+
+config HP_RX2660
+    bool
+    depends on IA64
+    select HP_ZX6000
+    select MPTSAS_SCSI_PCI
 
 config IA64_VPC_GRAPHICS
     bool

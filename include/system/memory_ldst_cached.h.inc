@@ -74,9 +74,13 @@ static inline uint64_t ADDRESS_SPACE_LD_CACHED(q)(MemoryRegionCache *cache,
 static inline void ADDRESS_SPACE_ST_CACHED(w)(MemoryRegionCache *cache,
     hwaddr addr, uint16_t val, MemTxAttrs attrs, MemTxResult *result)
 {
+    bool observed;
+
     assert(addr < cache->len && 2 <= cache->len - addr);
     if (likely(cache->ptr)) {
+        observed = physical_memory_write_begin();
         ST_P(w)(cache->ptr + addr, val);
+        physical_memory_write_end(observed);
     } else {
         ADDRESS_SPACE_ST_CACHED_SLOW(w)(cache, addr, val, attrs, result);
     }
@@ -85,9 +89,13 @@ static inline void ADDRESS_SPACE_ST_CACHED(w)(MemoryRegionCache *cache,
 static inline void ADDRESS_SPACE_ST_CACHED(l)(MemoryRegionCache *cache,
     hwaddr addr, uint32_t val, MemTxAttrs attrs, MemTxResult *result)
 {
+    bool observed;
+
     assert(addr < cache->len && 4 <= cache->len - addr);
     if (likely(cache->ptr)) {
+        observed = physical_memory_write_begin();
         ST_P(l)(cache->ptr + addr, val);
+        physical_memory_write_end(observed);
     } else {
         ADDRESS_SPACE_ST_CACHED_SLOW(l)(cache, addr, val, attrs, result);
     }
@@ -96,9 +104,13 @@ static inline void ADDRESS_SPACE_ST_CACHED(l)(MemoryRegionCache *cache,
 static inline void ADDRESS_SPACE_ST_CACHED(q)(MemoryRegionCache *cache,
     hwaddr addr, uint64_t val, MemTxAttrs attrs, MemTxResult *result)
 {
+    bool observed;
+
     assert(addr < cache->len && 8 <= cache->len - addr);
     if (likely(cache->ptr)) {
+        observed = physical_memory_write_begin();
         ST_P(q)(cache->ptr + addr, val);
+        physical_memory_write_end(observed);
     } else {
         ADDRESS_SPACE_ST_CACHED_SLOW(q)(cache, addr, val, attrs, result);
     }

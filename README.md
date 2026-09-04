@@ -1,32 +1,29 @@
 # qemu-system-ia64
 
-Experimental QEMU full-system emulation for IA-64 guests.
+Full-system QEMU emulation for IA-64 guests.
 
 > [!IMPORTANT]
-> This is an independent, LLM-assisted QEMU fork. Report project-specific
-> issues here, not to upstream QEMU.
+> This fork is independent of upstream QEMU. Report issues for this fork here,
+> not upstream.
 
 ## Quick start
 
-### Download prebuilt binaries
+### Prebuilt binaries
 
-Download a host archive and the separate firmware artifact from
+Download builds from
 [GitHub Actions](https://github.com/syunnPC/qemu-system-ia64/actions/workflows/build.yml).
 Builds are available for Windows AMD64 and Linux AMD64/AArch64.
-
-Place `ia64-firmware.bin` in the working directory, or pass its path with
-`-bios`. [GitHub Releases](https://github.com/syunnPC/qemu-system-ia64/releases)
-contains selected builds but may not be current.
+[GitHub Releases](https://github.com/syunnPC/qemu-system-ia64/releases)
+may be older than the latest Actions builds.
 
 > [!WARNING]
-> The `x86-64-v2-optimized` AMD64 builds require an x86-64-v2 host and disable
-> debugging and hardening features for additional speed. They are experimental
-> and may be unstable.
-> If a guest is unstable, use the matching standard build.
+> `x86-64-v2-optimized` AMD64 builds require an x86-64-v2 host, use aggressive
+> optimizations, and disable debugging and hardening. Use a standard build if a
+> guest is unstable.
 
 ### Build from source
 
-Building the firmware requires an IA-64 ELF cross toolchain with
+Firmware builds require an IA-64 ELF cross toolchain with
 `ia64-linux-gnu-` tools on `PATH`.
 
 ```sh
@@ -34,7 +31,7 @@ Building the firmware requires an IA-64 ELF cross toolchain with
 ninja -C build qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
 ```
 
-### Command line example
+### Run
 
 ```sh
 ./build/qemu-system-ia64 \
@@ -43,61 +40,93 @@ ninja -C build qemu-system-ia64 roms/ia64-firmware/ia64-firmware.bin
   -display gtk
 ```
 
-Use the `nvram=<path>` machine property to specify an NVRAM file. Set
-`nvram=none` for non-persistent EFI variables.
+Use the `nvram=<path>` machine property for an NVRAM file, or `nvram=none` for
+non-persistent EFI variables.
 
 ## Machine profiles
 
-A machine must be selected explicitly with `-machine`.
+Select a machine explicitly with `-machine`.
 
-| Machine | Intended use | Default CPU | Default VGA |
-| --- | --- | --- | --- |
-| `hp-i2000` | Older IA-64 operating systems | `merced` (fixed) | NVIDIA Quadro2 Pro |
-| `hp-zx6000` | Most IA-64 operating systems | `madison-zx6000` (fixed) | ATI Radeon RV100 |
-| `itanium2-vpc` | Most IA-64 operating systems | `montecito` | ATI Rage 128 Pro |
-| `itanium-vpc` | Older IA-64 operating systems | `merced` | ATI Rage 128 Pro |
+| Machine | CPU models | Max sockets | Max total cores / threads | Default input | Default VGA | Default RAM |
+| --- | --- | ---: | ---: | --- | --- | ---: |
+| `hp-i2000` | `merced` | 2 | 2 | USB keyboard + tablet | NVIDIA Quadro2 Pro | 2 GiB |
+| `hp-zx6000` | `madison-zx6000` | 2 | 2 | USB keyboard + tablet | ATI Radeon RV100 | 2 GiB |
+| `hp-rx2660` | `montecito-9010` (default), `montecito-9040` | 2 | 9010: 2 / 2; 9040: 4 / 8 | USB keyboard + tablet | ATI RN50 | 8 GiB |
+| `itanium2-vpc` | Any model below; `montecito` by default | 64 | 64 | USB keyboard + tablet | ATI Rage 128 Pro | 2 GiB |
+| `itanium-vpc` | Any model below; `merced` by default | 64 | 64 | PS/2 keyboard + mouse | ATI Rage 128 Pro | 2 GiB |
 
-`ia64-vpc` is an alias of `itanium2-vpc`. The HP profiles reject `-cpu`
-overrides; the virtual PC profiles allow them. All profiles use
-`ia64-firmware.bin` by default unless overridden with `-bios`. The HP machine
-profiles remain experimental.
-
-Use `-vga quadro2` for Quadro2 Pro or `-vga ati` for an ATI adapter. The ATI
-`model` property accepts `rage128p`, `rv100`, and `es1000`; for example:
+Use `-vga quadro2` for NVIDIA Quadro2 Pro or `-vga ati` for an ATI adapter.
+ATI models are `rage128p`, `rv100`, and `es1000`:
 
 ```sh
 -vga ati -global ati-vga.model=es1000
 ```
 
+Configure the preferred resolution and VRAM size (MiB) with:
+
+```sh
+# ATI
+-vga ati \
+  -global ati-vga.model=es1000 \
+  -global ati-vga.xres=1920 \
+  -global ati-vga.yres=1080 \
+  -global ati-vga.vgamem_mb=32
+
+# NVIDIA Quadro2 Pro
+-vga quadro2 \
+  -global nvidia-quadro2.xres=1920 \
+  -global nvidia-quadro2.yres=1080 \
+  -global nvidia-quadro2.vgamem_mb=32
+```
+
+Specify `xres` and `yres` together. `xres` must be a multiple of 8.
+
+## CPU models
+
+Select a model with `-cpu <model>`. Use `-cpu help` to list available models.
+
+| Model | Generation | Cores/socket | Threads/core | Clock | L3/socket |
+| --- | --- | ---: | ---: | ---: | ---: |
+| `merced` | Merced | 1 | 1 | 800 MHz | 4 MiB |
+| `madison` | Madison | 1 | 1 | 1.6 GHz | 3 MiB |
+| `madison-zx6000` | Madison | 1 | 1 | 1.5 GHz | 6 MiB |
+| `montecito` | Montecito | 2 | 2 | 1.6 GHz | 24 MiB (12 MiB/core) |
+| `montecito-9010` | Montecito | 1 | 1 | 1.6 GHz | 6 MiB |
+| `montecito-9040` | Montecito | 2 | 1-2 | 1.6 GHz | 18 MiB (9 MiB/core) |
+
+Clock and cache values are guest-visible metadata and do not affect emulation
+speed.
+
+CPU selection does not set the topology. Configure it separately:
+
+```sh
+-smp cpus=N,sockets=S,cores=C,threads=T
+```
+
+For a fully populated topology, `N` is `S * C * T`; omit `cpus` to calculate it
+from the other values. Use `-accel tcg,thread=multi` for more than one vCPU.
+
 ## Common options
 
 | Purpose | Option |
 | --- | --- |
-| One vCPU | `-accel tcg,thread=single` |
-| Multiple vCPUs | `-accel tcg,thread=multi -smp N` |
 | User-mode networking | `-nic user,model=e1000` |
 | Disable networking | `-nic none` |
 | Serial console | `-serial stdio` |
 | AHCI HDD | `-drive ...,if=none,id=<id> -device ide-hd,drive=<id>,bus=ide.<number>` |
 | AHCI CD | `-drive ...,media=cdrom,readonly=on,if=none,id=<id> -device ide-cd,drive=<id>,bus=ide.<number>` |
 
-The HP profiles support up to two vCPUs; the virtual PC profiles support up to
-64. Two to four vCPUs are usually the best choice, and more than eight is not
-recommended.
-
-Press F2, F12, or Delete during startup to open the EFI shell.
-
 ## Status
 
-Several IA-64 operating systems boot, but instruction emulation, privileged
-behavior, floating-point handling, and device support remain experimental.
+Instruction emulation, privileged behavior, floating-point handling,
+and device support remain experimental.
 
 ## Related projects
 
 - [IA-64 ATI XPDM driver](https://github.com/syunnPC/qemu-system-ia64-ati-xpdm)
 - [IA-64 NVIDIA XPDM driver](https://github.com/syunnPC/qemu-system-ia64-nv-xpdm)
 
-### Screenshots
+## Screenshots
 
 <table align="center">
   <tr>
@@ -139,8 +168,8 @@ behavior, floating-point handling, and device support remain experimental.
 Proprietary guest operating-system images, installation media, and firmware
 are not included. Users must supply them under the applicable licenses.
 
-This independent project is not affiliated with, endorsed by, sponsored by,
-or supported by Intel, HPE, the QEMU Project, or Microsoft Corporation.
+This project is independent and is not affiliated with, endorsed by, sponsored
+by, or supported by Intel, HPE, the QEMU Project, or Microsoft Corporation.
 
 QEMU is licensed under the GNU General Public License, version 2; see the
 license files in this repository. Microsoft and Windows are trademarks of the

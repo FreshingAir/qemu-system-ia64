@@ -1,8 +1,9 @@
 /*
  * QLogic ISP12160 mailbox, queue, and SCSI model
  *
- * Models selected mailbox and queue registers, bounded A64 IOCBs, and a SCSI
- * bus.
+ * Models selected mailbox and queue registers, IOCBs, and a SCSI bus.  The
+ * onboard RISC processor and firmware execution are not implemented; firmware
+ * uploads are represented by their address range and additive checksum.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -20,14 +21,15 @@
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "trace.h"
 
 #define ISP12160_MAILBOX_BYTES          (ISP12160_MAILBOX_COUNT * 2)
 #define ISP12160_RISC_WORDS             0x10000u
 #define ISP12160_SCSI_MAX_OUTSTANDING     256U
 #define ISP12160_SCSI_MAX_CHAIN_ENTRIES   UINT8_MAX
 #define ISP12160_SCSI_MAX_SEGMENTS        \
-    (ISP12160_IOCB_COMMAND_A64_SEGMENTS + \
-     ISP12160_IOCB_CONTINUE_A64_SEGMENTS * \
+    (ISP12160_IOCB_COMMAND_SEGMENTS + \
+     ISP12160_IOCB_CONTINUE_SEGMENTS * \
      (ISP12160_SCSI_MAX_CHAIN_ENTRIES - 1U))
 #define ISP12160_SCSI_BH_BUDGET           64U
 #define ISP12160_SCSI_REQUEST_MAGIC        UINT32_C(0x49533252)
@@ -83,12 +85,18 @@ struct ISP12160State {
 
     uint16_t token_address;
     uint16_t token_ram[ISP12160_QEMU_TOKEN_WORDS];
+    uint16_t native_firmware_start;
+    uint16_t native_firmware_checksum;
+    uint32_t native_firmware_words;
     bool token_loaded;
+    bool native_firmware_loaded;
     bool token_verified;
     bool risc_running;
     bool risc_paused;
     bool mailbox_pending;
     bool mailbox_staging;
+    bool irq_ack_pending;
+    bool response_irq_unobserved;
 
     /* The queue model configures rings without consuming IOCBs. */
     ISP12160QueueState request_queue;
@@ -163,6 +171,7 @@ static void isp12160_reset_queues(ISP12160State *s)
 {
     memset(&s->request_queue, 0, sizeof(s->request_queue));
     memset(&s->response_queue, 0, sizeof(s->response_queue));
+    s->response_irq_unobserved = false;
 }
 
 static void isp12160_invalidate_token(ISP12160State *s)
@@ -170,7 +179,11 @@ static void isp12160_invalidate_token(ISP12160State *s)
     isp12160_scsi_reset_transport(s);
     s->token_address = 0;
     memset(s->token_ram, 0, sizeof(s->token_ram));
+    s->native_firmware_start = 0;
+    s->native_firmware_checksum = 0;
+    s->native_firmware_words = 0;
     s->token_loaded = false;
+    s->native_firmware_loaded = false;
     s->token_verified = false;
     s->risc_running = false;
     s->risc_paused = false;
@@ -197,6 +210,7 @@ static void isp12160_reset_risc(ISP12160State *s)
     }
     s->mailbox_pending = false;
     s->mailbox_staging = false;
+    s->irq_ack_pending = false;
     isp12160_reset_mailboxes(s);
     s->semaphore = 0;
     s->istatus &= ~(ISP12160_ISTATUS_PCI_INT |
@@ -218,6 +232,7 @@ static void isp12160_reset_state(ISP12160State *s)
     s->host_command = 0;
     s->mailbox_pending = false;
     s->mailbox_staging = false;
+    s->irq_ack_pending = false;
     isp12160_reset_mailboxes(s);
     isp12160_invalidate_token(s);
 
@@ -284,6 +299,61 @@ static uint16_t isp12160_load_qemu_token(ISP12160State *s,
     return ISP12160_MBS_COMMAND_COMPLETE;
 }
 
+static uint16_t isp12160_load_native_firmware(ISP12160State *s,
+                                               const uint16_t *mb, bool a64)
+{
+    PCIDevice *pdev = PCI_DEVICE(s);
+    g_autofree uint8_t *buffer = NULL;
+    uint64_t dma_address;
+    uint32_t risc_end;
+    uint32_t expected_address;
+    size_t bytes;
+    unsigned int i;
+
+    if (!mb[4]) {
+        return ISP12160_MBS_COMMAND_PARAM_ERR;
+    }
+    risc_end = (uint32_t)mb[1] + mb[4];
+    if (risc_end > ISP12160_RISC_WORDS) {
+        return ISP12160_MBS_COMMAND_PARAM_ERR;
+    }
+    expected_address = s->native_firmware_loaded ?
+        (uint32_t)s->native_firmware_start + s->native_firmware_words :
+        mb[1];
+    if (mb[1] != expected_address) {
+        isp12160_invalidate_token(s);
+        return ISP12160_MBS_COMMAND_PARAM_ERR;
+    }
+
+    bytes = (size_t)mb[4] * sizeof(uint16_t);
+    dma_address = isp12160_mailbox_dma_address(mb, a64);
+    if (dma_address > UINT64_MAX - (bytes - 1U)) {
+        isp12160_invalidate_token(s);
+        return ISP12160_MBS_COMMAND_PARAM_ERR;
+    }
+    if (!(pdev->config[PCI_COMMAND] & PCI_COMMAND_MASTER)) {
+        isp12160_invalidate_token(s);
+        return ISP12160_MBS_HOST_INTERFACE_ERR;
+    }
+
+    buffer = g_malloc(bytes);
+    if (pci_dma_read(pdev, dma_address, buffer, bytes) != MEMTX_OK) {
+        isp12160_invalidate_token(s);
+        return ISP12160_MBS_HOST_INTERFACE_ERR;
+    }
+
+    if (!s->native_firmware_loaded) {
+        isp12160_invalidate_token(s);
+        s->native_firmware_start = mb[1];
+        s->native_firmware_loaded = true;
+    }
+    for (i = 0; i < mb[4]; i++) {
+        s->native_firmware_checksum += lduw_le_p(buffer + i * 2U);
+    }
+    s->native_firmware_words += mb[4];
+    return ISP12160_MBS_COMMAND_COMPLETE;
+}
+
 static uint16_t isp12160_verify_qemu_token(ISP12160State *s,
                                            const uint16_t *mb)
 {
@@ -292,6 +362,13 @@ static uint16_t isp12160_verify_qemu_token(ISP12160State *s,
     s->risc_running = false;
     s->risc_paused = false;
     isp12160_reset_queues(s);
+
+    if (s->native_firmware_loaded &&
+        mb[1] == s->native_firmware_start &&
+        !s->native_firmware_checksum) {
+        s->token_verified = true;
+        return ISP12160_MBS_COMMAND_COMPLETE;
+    }
 
     if (!s->token_loaded || mb[1] != s->token_address) {
         return ISP12160_MBS_COMMAND_PARAM_ERR;
@@ -308,7 +385,7 @@ static bool isp12160_queue_span_valid(uint64_t base, uint16_t count, bool a64)
 {
     uint64_t bytes = (uint64_t)count * ISP12160_QUEUE_ENTRY_BYTES;
 
-    return !(base & (ISP12160_QUEUE_ENTRY_BYTES - 1)) &&
+    return !(base & (ISP12160_QUEUE_BASE_ALIGNMENT - 1)) &&
            base <= UINT64_MAX - (bytes - 1) &&
            (a64 || base <= UINT32_MAX - (bytes - 1));
 }
@@ -349,6 +426,13 @@ static uint16_t isp12160_init_queue(ISP12160State *s, const uint16_t *mb,
 static uint16_t isp12160_execute_qemu_token(ISP12160State *s,
                                             const uint16_t *mb)
 {
+    if (s->native_firmware_loaded &&
+        mb[1] == s->native_firmware_start) {
+        s->token_verified = true;
+        s->risc_running = true;
+        s->risc_paused = false;
+        return ISP12160_MBS_COMMAND_COMPLETE;
+    }
     if (!s->token_loaded || !s->token_verified ||
         mb[1] != s->token_address) {
         return ISP12160_MBS_COMMAND_PARAM_ERR;
@@ -369,10 +453,16 @@ static uint16_t isp12160_run_mailbox(ISP12160State *s,
         return ISP12160_MBS_COMMAND_COMPLETE;
 
     case ISP12160_MBC_LOAD_RAM:
-        return isp12160_load_qemu_token(s, mb, false);
+        return mb[4] <= ISP12160_QEMU_TOKEN_WORDS &&
+               !s->native_firmware_loaded ?
+               isp12160_load_qemu_token(s, mb, false) :
+               isp12160_load_native_firmware(s, mb, false);
 
     case ISP12160_MBC_LOAD_RAM_A64_ROM:
-        return isp12160_load_qemu_token(s, mb, true);
+        return mb[4] <= ISP12160_QEMU_TOKEN_WORDS &&
+               !s->native_firmware_loaded ?
+               isp12160_load_qemu_token(s, mb, true) :
+               isp12160_load_native_firmware(s, mb, true);
 
     case ISP12160_MBC_VERIFY_CHECKSUM:
         return isp12160_verify_qemu_token(s, mb);
@@ -384,10 +474,13 @@ static uint16_t isp12160_run_mailbox(ISP12160State *s,
         if (!s->risc_running || s->risc_paused) {
             return ISP12160_MBS_COMMAND_ERR;
         }
-        /* QEMU protocol version for the selected model. */
         memset(&s->mailbox[1], 0,
                (ISP12160_MAILBOX_COUNT - 1) * sizeof(uint16_t));
-        if (s->variant == ISP12160_VARIANT_SCSI) {
+        if (s->native_firmware_loaded) {
+            s->mailbox[1] = ISP12160_NATIVE_FIRMWARE_MAJOR;
+            s->mailbox[2] = ISP12160_NATIVE_FIRMWARE_MINOR;
+            s->mailbox[3] = ISP12160_NATIVE_FIRMWARE_PATCH;
+        } else if (s->variant == ISP12160_VARIANT_SCSI) {
             s->mailbox[2] = 2;
         } else if (s->variant == ISP12160_VARIANT_QUEUE) {
             s->mailbox[2] = 1;
@@ -416,6 +509,31 @@ static uint16_t isp12160_run_mailbox(ISP12160State *s,
                isp12160_init_queue(s, mb, false, true) :
                ISP12160_MBS_INVALID_COMMAND;
 
+    case ISP12160_MBC_BUS_RESET:
+        if (!s->risc_running || s->risc_paused) {
+            return ISP12160_MBS_COMMAND_ERR;
+        }
+        isp12160_scsi_reset_transport(s);
+        return ISP12160_MBS_COMMAND_COMPLETE;
+
+    case ISP12160_MBC_SET_INITIATOR_ID:
+    case ISP12160_MBC_SET_SELECTION_TIMEOUT:
+    case ISP12160_MBC_SET_RETRY_COUNT:
+    case ISP12160_MBC_SET_TAG_AGE_LIMIT:
+    case ISP12160_MBC_SET_CLOCK_RATE:
+    case ISP12160_MBC_SET_ACTIVE_NEGATION:
+    case ISP12160_MBC_SET_ASYNC_DATA_SETUP:
+    case ISP12160_MBC_SET_PCI_CONTROL:
+    case ISP12160_MBC_SET_TARGET_PARAMETERS:
+    case ISP12160_MBC_SET_DEVICE_QUEUE:
+    case ISP12160_MBC_SET_RESET_DELAY:
+    case ISP12160_MBC_SET_SYSTEM_PARAMETER:
+    case ISP12160_MBC_SET_FIRMWARE_FEATURES:
+    case ISP12160_MBC_SET_DATA_OVERRUN_RECOVERY:
+        return s->native_firmware_loaded && s->risc_running &&
+               !s->risc_paused ? ISP12160_MBS_COMMAND_COMPLETE :
+                                 ISP12160_MBS_COMMAND_ERR;
+
     case ISP12160_MBC_EXECUTE_IOCB:
         /* EXECUTE_IOCB is not part of the mailbox command set. */
         return ISP12160_MBS_INVALID_COMMAND;
@@ -438,6 +556,15 @@ static void isp12160_mailbox_bh(void *opaque)
     memcpy(s->mailbox, s->pending_mailbox, sizeof(s->mailbox));
     s->mailbox_pending = false;
     status = isp12160_run_mailbox(s, s->pending_mailbox);
+
+    trace_isp12160_mailbox(s, s->pending_mailbox[0],
+                           s->pending_mailbox[1],
+                           s->pending_mailbox[2],
+                           s->pending_mailbox[3],
+                           s->pending_mailbox[4],
+                           s->pending_mailbox[5],
+                           s->pending_mailbox[6],
+                           s->pending_mailbox[7], status);
 
     s->mailbox[0] = status;
     s->semaphore = ISP12160_SEMAPHORE_LOCK;
@@ -529,6 +656,10 @@ static bool isp12160_scsi_queue_status(ISP12160State *s,
         s->dma_stalled = true;
         return false;
     }
+    trace_isp12160_iocb_status(s, status->handle,
+                               status->completion_status,
+                               status->state_flags,
+                               status->residual_length);
     tail = (s->pending_status_head + s->pending_status_count) %
            ISP12160_SCSI_MAX_OUTSTANDING;
     if (!isp12160_iocb_build_status(s->pending_status[tail],
@@ -803,6 +934,7 @@ static bool isp12160_scsi_flush_status(ISP12160State *s)
 
     if (!isp12160_scsi_transport_ready(s) ||
         !isp12160_scsi_mailboxes_available(s) ||
+        s->irq_ack_pending ||
         !(pdev->config[PCI_COMMAND] & PCI_COMMAND_MASTER)) {
         return false;
     }
@@ -825,6 +957,7 @@ static bool isp12160_scsi_flush_status(ISP12160State *s)
         posted = true;
     }
     if (posted) {
+        s->response_irq_unobserved = true;
         s->istatus |= ISP12160_ISTATUS_RISC_INT;
         isp12160_update_irq(s);
     }
@@ -837,6 +970,33 @@ static void isp12160_scsi_advance_request(ISP12160State *s, uint8_t count)
         s->request_queue.consumer = isp12160_ring_advance(
             s->request_queue.consumer, s->request_queue.count);
     }
+}
+
+static bool isp12160_scsi_marker_blocked(ISP12160State *s,
+                                         const uint8_t *entry)
+{
+    ISP12160SCSIRequest *request;
+    uint8_t raw_target = entry[ISP12160_IOCB_MARKER_TARGET_OFFSET];
+    uint8_t channel = raw_target >> 7;
+    uint8_t target = raw_target & 0x7f;
+    uint8_t lun = entry[ISP12160_IOCB_MARKER_LUN_OFFSET];
+    uint8_t modifier = entry[ISP12160_IOCB_MARKER_MODIFIER_OFFSET];
+
+    QTAILQ_FOREACH(request, &s->active_requests, next) {
+        const ISP12160IOCBCommand *command = &request->command;
+
+        if (command->channel != channel) {
+            continue;
+        }
+        if (modifier == ISP12160_IOCB_MARKER_SYNC_ALL ||
+            (modifier == ISP12160_IOCB_MARKER_SYNC_ID &&
+             command->target == target) ||
+            (modifier == ISP12160_IOCB_MARKER_SYNC_ID_LUN &&
+             command->target == target && command->lun == lun)) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool isp12160_scsi_direction_matches(const ISP12160IOCBCommand *command,
@@ -852,6 +1012,32 @@ static bool isp12160_scsi_direction_matches(const ISP12160IOCBCommand *command,
     default:
         return false;
     }
+}
+
+static bool isp12160_scsi_resolve_direction(ISP12160IOCBCommand *command,
+                                            const SCSIRequest *sreq)
+{
+    if (command->direction != ISP12160_IOCB_DIRECTION_UNKNOWN) {
+        return isp12160_scsi_direction_matches(command, sreq);
+    }
+
+    command->control_flags &= ~ISP12160_IOCB_CONTROL_DATA_UNKNOWN;
+    switch (sreq->cmd.mode) {
+    case SCSI_XFER_NONE:
+        command->direction = ISP12160_IOCB_DIRECTION_NONE;
+        break;
+    case SCSI_XFER_FROM_DEV:
+        command->direction = ISP12160_IOCB_DIRECTION_FROM_DEVICE;
+        command->control_flags |= ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE;
+        break;
+    case SCSI_XFER_TO_DEV:
+        command->direction = ISP12160_IOCB_DIRECTION_TO_DEVICE;
+        command->control_flags |= ISP12160_IOCB_CONTROL_DATA_TO_DEVICE;
+        break;
+    default:
+        return false;
+    }
+    return true;
 }
 
 static bool isp12160_scsi_handle_active(const ISP12160State *s,
@@ -903,8 +1089,8 @@ static void isp12160_scsi_submit(ISP12160State *s,
                         request->command.cdb_length, request);
     request->sreq = sreq;
 
-    if (!isp12160_scsi_direction_matches(command, sreq) ||
-        command->transfer_length != sreq->cmd.xfer) {
+    if (!isp12160_scsi_resolve_direction(&request->command, sreq) ||
+        request->command.transfer_length != sreq->cmd.xfer) {
         sreq->hba_private = NULL;
         request->sreq = NULL;
         scsi_req_unref(sreq);
@@ -940,14 +1126,11 @@ static bool isp12160_scsi_process_one(ISP12160State *s)
     uint16_t segment_count;
     uint8_t entry_count;
     uint32_t handle;
+    bool parsed;
     unsigned int i;
 
     available = isp12160_ring_distance(q->producer, q->consumer, q->count);
-    if (!available ||
-        s->active_request_count + s->pending_status_count >=
-        ISP12160_SCSI_MAX_OUTSTANDING ||
-        s->active_request_count + s->pending_status_count >=
-        isp12160_response_free(s)) {
+    if (!available) {
         return false;
     }
     if (!(pdev->config[PCI_COMMAND] & PCI_COMMAND_MASTER) ||
@@ -957,8 +1140,27 @@ static bool isp12160_scsi_process_one(ISP12160State *s)
         return false;
     }
 
+    trace_isp12160_iocb_request(s, q->consumer, q->producer, first[0],
+                                first[1], ldl_le_p(first + 4));
+
+    if (first[0] == ISP12160_IOCB_MARKER_TYPE && first[1] == 1) {
+        if (isp12160_scsi_marker_blocked(s, first)) {
+            return false;
+        }
+        isp12160_scsi_advance_request(s, 1);
+        return true;
+    }
+
+    if (s->active_request_count + s->pending_status_count >=
+        ISP12160_SCSI_MAX_OUTSTANDING ||
+        s->active_request_count + s->pending_status_count >=
+        isp12160_response_free(s)) {
+        return false;
+    }
+
     handle = ldl_le_p(first + 4);
-    if (first[0] != ISP12160_IOCB_COMMAND_A64_TYPE || !first[1]) {
+    if ((first[0] != ISP12160_IOCB_COMMAND_TYPE &&
+         first[0] != ISP12160_IOCB_COMMAND_A64_TYPE) || !first[1]) {
         isp12160_scsi_advance_request(s, 1);
         isp12160_scsi_queue_simple_status(
             s, handle, ISP12160_IOCB_CS_INVALID_ENTRY_TYPE, 0, 0);
@@ -1002,9 +1204,15 @@ static bool isp12160_scsi_process_one(ISP12160State *s)
     if (segment_count) {
         segments = g_new0(ISP12160IOCBSegment, segment_count);
     }
-    if (!isp12160_iocb_parse_a64(
-            entries, entry_count, &command, segments, segment_count,
-            &local_err) || command.transfer_length > UINT32_MAX) {
+    parsed = first[0] == ISP12160_IOCB_COMMAND_A64_TYPE ?
+        isp12160_iocb_parse_a64(entries, entry_count, &command, segments,
+                                segment_count, &local_err) :
+        isp12160_iocb_parse_32(entries, entry_count, &command, segments,
+                               segment_count, &local_err);
+    if (!parsed || command.transfer_length > UINT32_MAX) {
+        trace_isp12160_iocb_rejected(
+            s, handle, parsed ? "transfer length exceeds 32 bits" :
+            local_err ? error_get_pretty(local_err) : "invalid IOCB");
         error_free(local_err);
         g_free(segments);
         isp12160_scsi_advance_request(s, entry_count);
@@ -1013,13 +1221,11 @@ static bool isp12160_scsi_process_one(ISP12160State *s)
         return true;
     }
 
+    trace_isp12160_iocb_command(s, command.handle, command.channel,
+                                command.target, command.lun, command.cdb[0],
+                                command.control_flags, command.segment_count,
+                                command.transfer_length);
     isp12160_scsi_advance_request(s, entry_count);
-    if (command.timeout) {
-        g_free(segments);
-        isp12160_scsi_queue_simple_status(
-            s, handle, ISP12160_IOCB_CS_INVALID_ENTRY_TYPE, 0, 0);
-        return true;
-    }
     isp12160_scsi_submit(s, &command, segments);
     return true;
 }
@@ -1119,27 +1325,31 @@ static bool isp12160_scsi_loaded_request_valid(
     uint64_t total = 0;
     uint64_t cursor = 0;
     uint16_t direction_bits;
-    size_t expected_entries = 1;
+    size_t expected_entries_32 = 1;
+    size_t expected_entries_a64 = 1;
     unsigned int i;
 
     direction_bits = command->control_flags &
         (ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE |
          ISP12160_IOCB_CONTROL_DATA_TO_DEVICE);
+    if (command->segment_count > ISP12160_IOCB_COMMAND_SEGMENTS) {
+        expected_entries_32 += DIV_ROUND_UP(
+            command->segment_count - ISP12160_IOCB_COMMAND_SEGMENTS,
+            ISP12160_IOCB_CONTINUE_SEGMENTS);
+    }
     if (command->segment_count > ISP12160_IOCB_COMMAND_A64_SEGMENTS) {
-        expected_entries += DIV_ROUND_UP(
+        expected_entries_a64 += DIV_ROUND_UP(
             command->segment_count - ISP12160_IOCB_COMMAND_A64_SEGMENTS,
             ISP12160_IOCB_CONTINUE_A64_SEGMENTS);
     }
-    if (command->timeout || !command->cdb_length ||
+    if (!command->cdb_length ||
         command->cdb_length > ISP12160_IOCB_CDB_BYTES ||
-        command->entry_count != expected_entries ||
+        (command->entry_count != expected_entries_32 &&
+         command->entry_count != expected_entries_a64) ||
         command->segment_count > ISP12160_SCSI_MAX_SEGMENTS ||
         command->channel > 1 || command->target >= 16 || command->lun >= 8 ||
         command->direction > ISP12160_IOCB_DIRECTION_TO_DEVICE ||
-        command->control_flags &
-        ~(ISP12160_IOCB_CONTROL_SIMPLE_TAG |
-          ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE |
-          ISP12160_IOCB_CONTROL_DATA_TO_DEVICE) ||
+        command->control_flags & ~ISP12160_IOCB_CONTROL_SUPPORTED ||
         (command->direction == ISP12160_IOCB_DIRECTION_NONE &&
          direction_bits) ||
         (command->direction == ISP12160_IOCB_DIRECTION_FROM_DEVICE &&
@@ -1327,7 +1537,12 @@ static void isp12160_host_command_write(ISP12160State *s, uint16_t value)
 
     case ISP12160_HC_CLEAR_RISC_INT:
         s->istatus &= ~ISP12160_ISTATUS_RISC_INT;
+        s->irq_ack_pending = false;
+        if (s->response_irq_unobserved) {
+            s->istatus |= ISP12160_ISTATUS_RISC_INT;
+        }
         isp12160_update_irq(s);
+        isp12160_scsi_schedule_queue(s);
         break;
 
     case ISP12160_HC_DISABLE_BIOS:
@@ -1362,6 +1577,7 @@ static uint64_t isp12160_register_read(void *opaque, hwaddr address,
         }
         if (!s->mailbox_staging && index == 5 &&
             s->response_queue.valid) {
+            s->response_irq_unobserved = false;
             return s->response_queue.producer;
         }
         return s->mailbox[index];
@@ -1414,9 +1630,14 @@ static void isp12160_register_write(void *opaque, hwaddr address,
         }
         if (!s->mailbox_staging && index == 4 &&
             s->request_queue.valid) {
-            if (value < s->request_queue.count &&
+            bool accepted = value < s->request_queue.count &&
                 (!isp12160_has_scsi(s) ||
-                 isp12160_scsi_request_producer_valid(s, value))) {
+                 isp12160_scsi_request_producer_valid(s, value));
+
+            trace_isp12160_queue_index(s, 0, value, accepted,
+                                       s->request_queue.producer,
+                                       s->request_queue.consumer);
+            if (accepted) {
                 s->request_queue.producer = value;
                 isp12160_scsi_schedule_queue(s);
             }
@@ -1424,9 +1645,14 @@ static void isp12160_register_write(void *opaque, hwaddr address,
         }
         if (!s->mailbox_staging && index == 5 &&
             s->response_queue.valid) {
-            if (value < s->response_queue.count &&
+            bool accepted = value < s->response_queue.count &&
                 (!isp12160_has_scsi(s) ||
-                 isp12160_scsi_response_consumer_valid(s, value))) {
+                 isp12160_scsi_response_consumer_valid(s, value));
+
+            trace_isp12160_queue_index(s, 1, value, accepted,
+                                       s->response_queue.producer,
+                                       s->response_queue.consumer);
+            if (accepted) {
                 s->response_queue.consumer = value;
                 isp12160_scsi_schedule_queue(s);
             }
@@ -1455,6 +1681,9 @@ static void isp12160_register_write(void *opaque, hwaddr address,
     case ISP12160_REG_SEMAPHORE:
         s->semaphore = value & ISP12160_SEMAPHORE_LOCK;
         if (!(s->semaphore & ISP12160_SEMAPHORE_LOCK)) {
+            if (s->istatus & ISP12160_ISTATUS_RISC_INT) {
+                s->irq_ack_pending = true;
+            }
             isp12160_scsi_schedule_queue(s);
         }
         break;
@@ -1640,6 +1869,7 @@ static int isp12160_scsi_pre_save(void *opaque)
 static int isp12160_post_load(void *opaque, int version_id)
 {
     ISP12160State *s = opaque;
+    bool firmware_loaded;
     unsigned int i;
 
     (void)version_id;
@@ -1654,19 +1884,41 @@ static int isp12160_post_load(void *opaque, int version_id)
         s->semaphore & ~ISP12160_SEMAPHORE_LOCK ||
         (s->mailbox_pending && s->mailbox_staging) ||
         ((s->istatus & ISP12160_ISTATUS_PCI_INT) &&
-         !s->mailbox_pending)) {
+         !s->mailbox_pending) ||
+        (s->irq_ack_pending &&
+         !(s->istatus & ISP12160_ISTATUS_RISC_INT)) ||
+        (s->response_irq_unobserved &&
+         (!isp12160_has_scsi(s) || !s->response_queue.valid ||
+          !(s->istatus & ISP12160_ISTATUS_RISC_INT)))) {
         return -EINVAL;
     }
 
+    firmware_loaded = s->token_loaded || s->native_firmware_loaded;
+    if (s->token_loaded && s->native_firmware_loaded) {
+        return -EINVAL;
+    }
     if (s->token_loaded) {
         if ((uint32_t)s->token_address + ISP12160_QEMU_TOKEN_WORDS >
             ISP12160_RISC_WORDS ||
             !isp12160_token_ram_valid(s)) {
             return -EINVAL;
         }
+    } else if (s->native_firmware_loaded) {
+        if (!s->native_firmware_words ||
+            (uint32_t)s->native_firmware_start +
+                s->native_firmware_words > ISP12160_RISC_WORDS ||
+            s->token_address) {
+            return -EINVAL;
+        }
+        for (i = 0; i < ARRAY_SIZE(s->token_ram); i++) {
+            if (s->token_ram[i]) {
+                return -EINVAL;
+            }
+        }
     } else {
-        if (s->token_address || s->token_verified || s->risc_running ||
-            s->risc_paused) {
+        if (s->token_address || s->native_firmware_start ||
+            s->native_firmware_checksum || s->native_firmware_words ||
+            s->token_verified || s->risc_running || s->risc_paused) {
             return -EINVAL;
         }
         for (i = 0; i < ARRAY_SIZE(s->token_ram); i++) {
@@ -1680,7 +1932,7 @@ static int isp12160_post_load(void *opaque, int version_id)
         return -EINVAL;
     }
 
-    if ((s->token_verified && !s->token_loaded) ||
+    if ((s->token_verified && !firmware_loaded) ||
         (s->risc_running && !s->token_verified) ||
         (s->risc_paused && !s->risc_running)) {
         return -EINVAL;
@@ -1720,7 +1972,7 @@ static int isp12160_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_isp12160_mailbox = {
     .name = TYPE_ISP12160_MAILBOX,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = isp12160_post_load,
     .fields = (const VMStateField[]) {
@@ -1743,13 +1995,18 @@ static const VMStateDescription vmstate_isp12160_mailbox = {
         VMSTATE_BOOL(risc_running, ISP12160State),
         VMSTATE_BOOL(risc_paused, ISP12160State),
         VMSTATE_BOOL(mailbox_pending, ISP12160State),
+        VMSTATE_UINT16_V(native_firmware_start, ISP12160State, 2),
+        VMSTATE_UINT16_V(native_firmware_checksum, ISP12160State, 2),
+        VMSTATE_UINT32_V(native_firmware_words, ISP12160State, 2),
+        VMSTATE_BOOL_V(native_firmware_loaded, ISP12160State, 2),
+        VMSTATE_BOOL_V(irq_ack_pending, ISP12160State, 2),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_isp12160_queue = {
     .name = TYPE_ISP12160_QUEUE,
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = isp12160_post_load,
     .fields = (const VMStateField[]) {
@@ -1785,13 +2042,18 @@ static const VMStateDescription vmstate_isp12160_queue = {
         VMSTATE_BOOL(response_queue.valid, ISP12160State),
         VMSTATE_BOOL(response_queue.a64, ISP12160State),
         VMSTATE_BOOL(mailbox_staging, ISP12160State),
+        VMSTATE_UINT16_V(native_firmware_start, ISP12160State, 2),
+        VMSTATE_UINT16_V(native_firmware_checksum, ISP12160State, 2),
+        VMSTATE_UINT32_V(native_firmware_words, ISP12160State, 2),
+        VMSTATE_BOOL_V(native_firmware_loaded, ISP12160State, 2),
+        VMSTATE_BOOL_V(irq_ack_pending, ISP12160State, 2),
         VMSTATE_END_OF_LIST()
     },
 };
 
 static const VMStateDescription vmstate_isp12160_scsi = {
     .name = TYPE_ISP12160_SCSI,
-    .version_id = 1,
+    .version_id = 3,
     .minimum_version_id = 1,
     .pre_save = isp12160_scsi_pre_save,
     .post_load = isp12160_post_load,
@@ -1834,6 +2096,12 @@ static const VMStateDescription vmstate_isp12160_scsi = {
         VMSTATE_UINT16(pending_status_head, ISP12160State),
         VMSTATE_UINT16(pending_status_count, ISP12160State),
         VMSTATE_BOOL(dma_stalled, ISP12160State),
+        VMSTATE_UINT16_V(native_firmware_start, ISP12160State, 2),
+        VMSTATE_UINT16_V(native_firmware_checksum, ISP12160State, 2),
+        VMSTATE_UINT32_V(native_firmware_words, ISP12160State, 2),
+        VMSTATE_BOOL_V(native_firmware_loaded, ISP12160State, 2),
+        VMSTATE_BOOL_V(irq_ack_pending, ISP12160State, 2),
+        VMSTATE_BOOL_V(response_irq_unobserved, ISP12160State, 3),
         VMSTATE_END_OF_LIST()
     },
 };
@@ -1846,16 +2114,16 @@ static void isp12160_realize(PCIDevice *pdev, Error **errp)
 
     pci_config_set_interrupt_pin(pdev->config, 1);
 
-    /* Explicit writes prevent PCI core substitution of zero subsystem IDs. */
-    pci_set_word(pdev->config + PCI_SUBSYSTEM_VENDOR_ID, 0);
-    pci_set_word(pdev->config + PCI_SUBSYSTEM_ID, 0);
+    pci_set_word(pdev->config + PCI_SUBSYSTEM_VENDOR_ID,
+                 ISP12160_PCI_VENDOR_ID);
+    pci_set_word(pdev->config + PCI_SUBSYSTEM_ID, 0x0007);
 
     memory_region_init_io(&s->registers, OBJECT(s), &isp12160_register_ops,
-                          s, "isp12160-registers", ISP12160_REG_SIZE);
+                          s, "isp12160-registers", ISP12160_MMIO_BAR_SIZE);
     memory_region_init_alias(&s->io_bar, OBJECT(s), "isp12160-io",
                              &s->registers, 0, ISP12160_REG_SIZE);
     memory_region_init_alias(&s->mmio_bar, OBJECT(s), "isp12160-mmio",
-                             &s->registers, 0, ISP12160_REG_SIZE);
+                             &s->registers, 0, ISP12160_MMIO_BAR_SIZE);
     pci_register_bar(pdev, 0, PCI_BASE_ADDRESS_SPACE_IO, &s->io_bar);
     pci_register_bar(pdev, 1,
                      PCI_BASE_ADDRESS_SPACE_MEMORY |
@@ -1923,10 +2191,10 @@ static void isp12160_mailbox_class_init(ObjectClass *klass, const void *data)
     pc->config_write = isp12160_write_config;
     pc->vendor_id = ISP12160_PCI_VENDOR_ID;
     pc->device_id = ISP12160_PCI_DEVICE_ID;
-    pc->revision = 0;
+    pc->revision = 0x06;
     pc->class_id = PCI_CLASS_STORAGE_SCSI;
-    pc->subsystem_vendor_id = 0;
-    pc->subsystem_id = 0;
+    pc->subsystem_vendor_id = ISP12160_PCI_VENDOR_ID;
+    pc->subsystem_id = 0x0007;
     pc->romfile = NULL;
 
     dc->desc = "QEMU ISP12160 mailbox core";

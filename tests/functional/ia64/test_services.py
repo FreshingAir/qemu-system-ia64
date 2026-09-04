@@ -27,6 +27,7 @@ EXITBS_CASES = {
     "configuration-table-ranges", "configuration-tables-preserved",
     "legacy-text-handoff", "convert-pointer-reserved-bits",
     "runtime-get-time",
+    "set-virtual-address-map", "runtime-virtual-boot-variable",
 }
 
 

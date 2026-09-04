@@ -58,7 +58,8 @@ static int iommufd_cdev_map_file(const VFIOContainer *bcontainer,
 
 static int iommufd_cdev_unmap(const VFIOContainer *bcontainer,
                               hwaddr iova, uint64_t size,
-                              IOMMUTLBEntry *iotlb, bool unmap_all)
+                              IOMMUTLBEntry *iotlb, bool unmap_all,
+                              VFIODMAUnmapResult *result)
 {
     const VFIOIOMMUFDContainer *container = VFIO_IOMMU_IOMMUFD(bcontainer);
     IOMMUFDBackend *be = container->be;
@@ -82,7 +83,11 @@ static int iommufd_cdev_unmap(const VFIOContainer *bcontainer,
                 error_report_err(local_err);
             }
             /* Unmap stale mapping even if query dirty bitmap fails */
-            unmap_ret = iommufd_backend_unmap_dma(be, ioas_id, iova, size);
+            unmap_ret = iommufd_backend_unmap_dma(
+                be, ioas_id, iova, size, &result->unmapped_size,
+                &result->executed);
+            result->complete = result->executed &&
+                (unmap_all || result->unmapped_size == size);
 
             /*
              * If dirty tracking fails, return the failure to VFIO core to
@@ -95,7 +100,11 @@ static int iommufd_cdev_unmap(const VFIOContainer *bcontainer,
         need_dirty_sync = true;
     }
 
-    ret = iommufd_backend_unmap_dma(be, ioas_id, iova, size);
+    ret = iommufd_backend_unmap_dma(be, ioas_id, iova, size,
+                                    &result->unmapped_size,
+                                    &result->executed);
+    result->complete = result->executed &&
+        (unmap_all || result->unmapped_size == size);
     if (ret) {
         return ret;
     }

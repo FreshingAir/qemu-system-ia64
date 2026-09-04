@@ -637,11 +637,8 @@ static bool ia64_fp_compact_binary32_operand(const CPUIA64State *env,
 }
 
 /*
- * Use SoftFloat's host FMA path for the exact IEEE binary32 or binary64
- * computation model.  QEMU hardfloat deliberately requires I to be sticky,
- * because the host operation cannot cheaply report whether this operation
- * was inexact.  Seed only a local status and discard that sentinel afterward;
- * the selected architectural status field already contains I.
+ * Hardfloat requires a sticky inexact flag.  Seed a temporary status; the
+ * selected architectural status field already contains the inexact state.
  */
 static bool ia64_fp_try_ieee_muladd(CPUIA64State *env, uint32_t r1,
                                     uint32_t r2, uint32_t r3, uint32_t r4,
@@ -4709,7 +4706,7 @@ static void ia64_st10_atomic(CPUIA64State *env, uint64_t addr,
         }
         desired = int128_make128(low, high);
         observed = ia64_exec_cmpxchg_16(env, addr, expected, desired,
-                                        false, oi, ra);
+                                        false, 10, oi, ra);
         if (int128_eq(observed, expected)) {
             return;
         }

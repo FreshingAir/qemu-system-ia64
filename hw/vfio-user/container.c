@@ -39,9 +39,18 @@ static void vfio_user_listener_commit(VFIOContainer *bcontainer)
     vfio_user_wait_reqs(container->proxy);
 }
 
+static void vfio_user_release_external_writer(VFIOContainer *bcontainer)
+{
+    VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
+
+    g_assert(!container->proxy->external_writer);
+    container->proxy->external_writer = true;
+}
+
 static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
                                hwaddr iova, uint64_t size,
-                               IOMMUTLBEntry *iotlb, bool unmap_all)
+                               IOMMUTLBEntry *iotlb, bool unmap_all,
+                               VFIODMAUnmapResult *result)
 {
     VFIOUserContainer *container = VFIO_IOMMU_USER(bcontainer);
 
@@ -73,6 +82,11 @@ static int vfio_user_dma_unmap(const VFIOContainer *bcontainer,
 
         if (msgp->hdr.flags & VFIO_USER_ERROR) {
             ret = -msgp->hdr.error_reply;
+        }
+        if (!ret) {
+            result->unmapped_size = msgp->size;
+            result->executed = true;
+            result->complete = unmap_all || msgp->size == size;
         }
 
         g_free(msgp);
@@ -336,6 +350,8 @@ static void vfio_iommu_user_class_init(ObjectClass *klass, const void *data)
     vioc->listener_commit = vfio_user_listener_commit,
     vioc->dma_map = vfio_user_dma_map;
     vioc->dma_unmap = vfio_user_dma_unmap;
+    vioc->dma_mapping_deferred = true;
+    vioc->release_external_writer = vfio_user_release_external_writer;
     vioc->attach_device = vfio_user_device_attach;
     vioc->detach_device = vfio_user_device_detach;
     vioc->set_dirty_page_tracking = vfio_user_set_dirty_page_tracking;

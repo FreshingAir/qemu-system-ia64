@@ -38,6 +38,8 @@ typedef struct IA64MachineCpuConfig {
     void *boot_info_opaque;
 } IA64MachineCpuConfig;
 
+bool ia64_machine_effective_alat_full(const MachineState *machine,
+                                      bool configured_full);
 bool ia64_machine_create_cpus(MachineState *machine,
                               const IA64MachineCpuConfig *config,
                               Error **errp);

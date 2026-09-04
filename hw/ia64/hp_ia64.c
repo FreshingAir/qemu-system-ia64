@@ -32,7 +32,8 @@ bool hp_ia64_machine_install_platform_descriptor(
     ms = MACHINE(machine);
     platform_id = le32_to_cpu(header->PlatformId);
     if ((hmc->platform_id != IA64_PLATFORM_ID_HP_I2000 &&
-         hmc->platform_id != IA64_PLATFORM_ID_HP_ZX6000) ||
+         hmc->platform_id != IA64_PLATFORM_ID_HP_ZX6000 &&
+         hmc->platform_id != IA64_PLATFORM_ID_HP_RX2660) ||
         platform_id != hmc->platform_id) {
         error_setg(errp,
                    "HP IA-64 descriptor platform does not match the machine");
@@ -125,14 +126,42 @@ bool hp_ia64_machine_validate(HPIA64MachineState *machine, Error **errp)
         error_setg(errp, "Invalid RAM size, should be at most %s", size);
         return false;
     }
-    if (!ia64_machine_validate_socket_smp(ms, 2, errp)) {
-        return false;
-    }
-    if (machine->alat_full && ms->smp.cpus > 1) {
-        error_setg(errp, "full ALAT emulation is not SMP-safe");
+    if (hmc->validate_smp ? !hmc->validate_smp(ms, errp) :
+        !ia64_machine_validate_socket_smp(ms, 2, errp)) {
         return false;
     }
     return true;
+}
+
+static char *hp_ia64_machine_get_alat(Object *obj, Error **errp)
+{
+    HPIA64MachineState *s = HP_IA64_MACHINE(obj);
+    MachineState *machine = MACHINE(obj);
+
+    (void)errp;
+    return g_strdup(ia64_machine_effective_alat_full(machine, s->alat_full) ?
+                    "full" : "zero");
+}
+
+static void hp_ia64_machine_set_alat(Object *obj, const char *value,
+                                     Error **errp)
+{
+    HPIA64MachineState *s = HP_IA64_MACHINE(obj);
+
+    if (g_str_equal(value, "zero")) {
+        s->alat_full = false;
+    } else if (g_str_equal(value, "full")) {
+        s->alat_full = true;
+    } else {
+        error_setg(errp, "alat must be 'zero' or 'full'");
+    }
+}
+
+static void hp_ia64_machine_instance_init(Object *obj)
+{
+    HPIA64MachineState *s = HP_IA64_MACHINE(obj);
+
+    s->alat_full = false;
 }
 
 static void hp_ia64_machine_instance_finalize(Object *obj)
@@ -153,6 +182,11 @@ static void hp_ia64_machine_class_init(ObjectClass *oc, const void *data)
     mc->default_ram_size = 2 * GiB;
     mc->no_parallel = 1;
     mc->no_floppy = 1;
+    object_class_property_add_str(oc, "alat", hp_ia64_machine_get_alat,
+                                  hp_ia64_machine_set_alat);
+    object_class_property_set_description(oc, "alat",
+        "Set the IA-64 ALAT model to 'zero' (default) or 'full'; "
+        "'full' is limited to one CPU");
 }
 
 static const TypeInfo hp_ia64_machine_type = {
@@ -160,6 +194,7 @@ static const TypeInfo hp_ia64_machine_type = {
     .parent = TYPE_MACHINE,
     .abstract = true,
     .instance_size = sizeof(HPIA64MachineState),
+    .instance_init = hp_ia64_machine_instance_init,
     .instance_finalize = hp_ia64_machine_instance_finalize,
     .class_size = sizeof(HPIA64MachineClass),
     .class_init = hp_ia64_machine_class_init,

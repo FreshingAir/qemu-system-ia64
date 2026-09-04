@@ -7,6 +7,7 @@
 #include "qemu/osdep.h"
 
 #include "qemu/datadir.h"
+#include "qemu/error-report.h"
 #include "qapi/error.h"
 #include "hw/core/boards.h"
 #include "hw/core/loader.h"
@@ -148,11 +149,23 @@ bool ia64_machine_create_cpus(MachineState *machine,
     uint32_t threads = MAX(machine->smp.threads, 1U);
     uint32_t cores = MAX(machine->smp.cores, 1U);
     uint32_t per_socket = threads * cores;
+    bool alat_full;
     int i;
 
     if (config == NULL || config->boot_info == NULL) {
         error_setg(errp, "IA-64 CPU creation requires boot information");
         return false;
+    }
+
+    alat_full = ia64_machine_effective_alat_full(machine,
+                                                 config->alat_full);
+    if (config->alat_full && !alat_full) {
+        warn_report("full ALAT emulation is disabled with %u CPUs; "
+                    "using the zero-entry ALAT model",
+                    machine->smp.cpus);
+    } else if (alat_full) {
+        warn_report("full ALAT emulation does not track direct external "
+                    "writes to shared guest RAM");
     }
 
     for (i = 0; i < machine->smp.cpus; i++) {
@@ -162,7 +175,7 @@ bool ia64_machine_create_cpus(MachineState *machine,
         IA64CPU *cpu = IA64_CPU(object_new(machine->cpu_type));
 
         g_ptr_array_add(cpus, cpu);
-        cpu->alat_full = config->alat_full;
+        cpu->alat_full = alat_full;
         cpu->firmware_compat_flags = config->firmware_compat_flags;
         cpu->socket_id = i / per_socket;
         cpu->core_id = (i / threads) % cores;
@@ -187,6 +200,12 @@ bool ia64_machine_create_cpus(MachineState *machine,
     }
 
     return true;
+}
+
+bool ia64_machine_effective_alat_full(const MachineState *machine,
+                                      bool configured_full)
+{
+    return configured_full && machine->smp.cpus <= 1;
 }
 
 void ia64_machine_reset_cpus(void)

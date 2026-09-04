@@ -58,7 +58,11 @@ struct HPZX1MIOState {
     HPZX1MIOIOMMUResetConfig iommu_reset;
     HPZX1MIORootFrontend root_frontends[HP_ZX1_MIO_LBA_PORT_COUNT];
     bool iommu_configured;
+    bool zx2;
 };
+
+#define HP_ZX2_MIO_F0_ID_VALUE UINT64_C(0x4030103c)
+#define HP_ZX2_MIO_F1_ID_VALUE UINT64_C(0x4031103c)
 
 static const HPSBAIOMMUPurge hp_zx1_mio_full_unmap = {
     .iova = 0,
@@ -234,7 +238,13 @@ static MemTxResult hp_zx1_mio_read(void *opaque, hwaddr addr,
     bool ok;
 
     qemu_rec_mutex_lock(&s->iommu_lock);
-    if (hp_zx1_mio_is_iommu_address(addr)) {
+    if (s->zx2 && size == 8 && addr == HP_ZX1_MIO_F0_ID) {
+        *data = HP_ZX2_MIO_F0_ID_VALUE;
+        ok = true;
+    } else if (s->zx2 && size == 8 && addr == HP_ZX1_MIO_F1_ID) {
+        *data = HP_ZX2_MIO_F1_ID_VALUE;
+        ok = true;
+    } else if (hp_zx1_mio_is_iommu_address(addr)) {
         ok = hp_zx1_mio_iommu_read_locked(s, addr, size, data);
     } else {
         ok = hp_zx1_mio_regs_read(&s->regs, addr, size, data);
@@ -849,6 +859,18 @@ static void hp_zx1_mio_class_init(ObjectClass *klass, const void *data)
     rc->phases.hold = hp_zx1_mio_reset_hold;
 }
 
+static void hp_zx2_mio_init(Object *obj)
+{
+    HP_ZX1_MIO(obj)->zx2 = true;
+}
+
+static void hp_zx2_mio_class_init(ObjectClass *klass, const void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+
+    dc->desc = "HP zx2 MIOC/SBA CSR block (internal)";
+}
+
 static void hp_zx1_mio_iommu_memory_region_class_init(
     ObjectClass *klass, const void *data)
 {
@@ -874,10 +896,18 @@ static const TypeInfo hp_zx1_mio_info = {
     .class_init = hp_zx1_mio_class_init,
 };
 
+static const TypeInfo hp_zx2_mio_info = {
+    .name = TYPE_HP_ZX2_MIO,
+    .parent = TYPE_HP_ZX1_MIO,
+    .instance_init = hp_zx2_mio_init,
+    .class_init = hp_zx2_mio_class_init,
+};
+
 static void hp_zx1_mio_register_types(void)
 {
     type_register_static(&hp_zx1_mio_iommu_memory_region_info);
     type_register_static(&hp_zx1_mio_info);
+    type_register_static(&hp_zx2_mio_info);
 }
 
 type_init(hp_zx1_mio_register_types)

@@ -3,6 +3,7 @@
 # arch/exception.c
 ia64_exception_raise(int cpu_index, uint32_t exception, uint64_t ip, uint64_t immediate, uint32_t slot, uint64_t isr) "cpu=%d exception=%" PRIu32 " ip=0x%016" PRIx64 " imm=0x%016" PRIx64 " slot=%" PRIu32 " isr=0x%016" PRIx64
 ia64_exception_deliver(int cpu_index, uint32_t exception, uint64_t vector, uint64_t ip, uint64_t fault_address, uint32_t slot, uint64_t isr, bool collect) "cpu=%d exception=%" PRIu32 " vector=0x%04" PRIx64 " ip=0x%016" PRIx64 " fault=0x%016" PRIx64 " slot=%" PRIu32 " isr=0x%016" PRIx64 " collect=%d"
+ia64_unaligned_fault(int cpu_index, uint64_t ip, uint64_t address, uint32_t slot, uint64_t isr, uint64_t psr, bool collect) "cpu=%d ip=0x%016" PRIx64 " address=0x%016" PRIx64 " slot=%" PRIu32 " isr=0x%016" PRIx64 " psr=0x%016" PRIx64 " collect=%d"
 
 # arch/interrupt.c
 ia64_sapic_vector(int cpu_index, const char *operation, int vector) "cpu=%d operation=%s vector=%d"

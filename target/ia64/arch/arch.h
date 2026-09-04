@@ -177,6 +177,11 @@ void ia64_invalidate_alat_reg_range(CPUIA64State *env, uint32_t first,
                                     uint32_t last, bool fp);
 void ia64_invalidate_alat_store(CPUIA64State *env, uint64_t addr,
                                 uint32_t size);
+void ia64_alat_notify_store(CPUIA64State *env);
+void ia64_alat_write_begin(CPUIA64State *env);
+void ia64_alat_write_end(CPUIA64State *env, uint64_t addr, uint32_t size);
+void ia64_alat_write_cancel(CPUIA64State *env);
+void ia64_alat_write_abort(CPUIA64State *env);
 void ia64_invalidate_alat_phys_range(CPUIA64State *env, uint64_t pa,
                                      uint64_t size);
 uint64_t ia64_alat_chk_a(CPUIA64State *env, uint64_t va, uint32_t reg);

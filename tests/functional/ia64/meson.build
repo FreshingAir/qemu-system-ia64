@@ -95,7 +95,9 @@ tests_ia64_system_quick = [
     (config_all_devices.has_key('CONFIG_HP_I2000') ?
      ['hp_i2000'] : []) + \
     (config_all_devices.has_key('CONFIG_HP_ZX6000') ?
-     ['hp_zx6000'] : [])
+     ['hp_zx6000'] : []) + \
+    (config_all_devices.has_key('CONFIG_HP_RX2660') ?
+     ['hp_rx2660'] : [])
 
 tests_ia64_system_thorough = [
   'storage',
@@ -113,6 +115,7 @@ test_ia64_timeouts = {
   'zx6000_efi': 90,
   'hp_i2000': 120,
   'hp_zx6000': 120,
+  'hp_rx2660': 120,
   'storage': 300,
   'input': 120,
 }

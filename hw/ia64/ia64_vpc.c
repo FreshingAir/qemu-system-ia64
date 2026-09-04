@@ -105,13 +105,32 @@
 #define IA64_INT10_ROM_PCIR_OFFSET    0x0020U
 #define IA64_INT10_ROM_ATI_SIGNATURE_OFFSET 0x0074U
 #define IA64_INT10_ROM_ATI_HEADER_OFFSET 0x0080U
-#define IA64_INT10_ROM_ATI_PLL_OFFSET 0x00c0U
+#define IA64_INT10_ROM_ATI_HEADER_SIZE 0x0060U
+#define IA64_INT10_ROM_ATI_RAGE128_HEADER_SIZE 0x004aU
+#define IA64_INT10_ROM_ATI_INIT_OFFSET 0x00e0U
+#define IA64_INT10_ROM_ATI_INIT_READ_SIZE 10U
+#define IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET 0x00f0U
+#define IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE 12U
+#define IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET 0x00f0U
+#define IA64_INT10_ROM_ATI_RAGE128_MISC_SIZE 15U
+#define IA64_INT10_ROM_ATI_MISC_OFFSET 0x00fcU
+#define IA64_INT10_ROM_ATI_MISC_SIZE 2U
 #define IA64_INT10_ROM_HANDLER_OFFSET 0x0100U
 #define IA64_INT10_ROM_OEM_OFFSET     0x0180U
 #define IA64_INT10_ROM_VENDOR_OFFSET  0x0190U
 #define IA64_INT10_ROM_PRODUCT_OFFSET 0x01a0U
 #define IA64_INT10_ROM_REVISION_OFFSET 0x01c0U
 #define IA64_INT10_ROM_MODES_OFFSET   0x01d0U
+#define IA64_INT10_ROM_ATI_CONNECTOR_OFFSET 0x02e0U
+#define IA64_INT10_ROM_ATI_CONNECTOR_SIZE 6U
+#define IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET 0x02e0U
+#define IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE 30U
+#define IA64_INT10_ROM_ATI_PLL_OFFSET 0x0300U
+#define IA64_INT10_ROM_ATI_PLL_READ_SIZE 0x006eU
+#define IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET 0x0383U
+#define IA64_INT10_ROM_ATI_MEM_PREFIX_SIZE 3U
+#define IA64_INT10_ROM_ATI_MEM_RESET_OFFSET 3U
+#define IA64_INT10_ROM_ATI_MEM_RESET_SIZE 100U
 #define IA64_INT10_VECTOR_ADDR  (0x10U * 4U)
 #define IA64_INT10_IO_BASE      0x000001e0U
 #define IA64_INT10_IO_SIZE      0x00000010U
@@ -140,12 +159,8 @@
 #define IA64_BDA_VIDEO_CONTROL   0x00000487U
 #define IA64_BDA_VIDEO_SWITCHES  0x00000488U
 #define IA64_ATI_VENDOR_ID        0x1002U
+#define IA64_ATI_RAGE128_DEVICE_ID 0x5046U
 #define IA64_ATI_ES1000_DEVICE_ID 0x515eU
-#define IA64_ATI_PLL_XCLK         23000U
-#define IA64_ATI_PLL_REFERENCE_FREQ 2700U
-#define IA64_ATI_PLL_REFERENCE_DIV  4U
-#define IA64_ATI_PLL_MIN_FREQ     12000U
-#define IA64_ATI_PLL_MAX_FREQ     35000U
 #endif
 #define IA64_IOSAPIC_BASE       0x0000000080110000ULL
 #define IA64_IOSAPIC_SIZE       0x0000000000002000ULL
@@ -1525,47 +1540,136 @@ static const MemoryRegionOps ia64_int10_io_ops = {
     },
 };
 
-static void ia64_int10_install_ati_bios_info(uint8_t *rom, uint16_t vendor)
+static void ia64_int10_install_ati_clock_range(uint8_t *pll, size_t offset,
+                                                uint16_t reference,
+                                                uint16_t divider,
+                                                uint32_t minimum,
+                                                uint32_t maximum)
+{
+    stw_le_p(pll + offset, reference);
+    stw_le_p(pll + offset + 2, divider);
+    stl_le_p(pll + offset + 4, minimum);
+    stl_le_p(pll + offset + 8, maximum);
+}
+
+static void ia64_int10_install_ati_bios_info(uint8_t *rom, PCIDevice *vga,
+                                             uint32_t memory_size)
 {
     static const char ati_bios_signature[] = "761295520";
+    static const uint8_t ati_rage128_header[] = {
+        0x02, 0xa0, 0x01, 0x01, 0x03, 0x01,
+        IA64_INT10_ROM_ATI_RAGE128_HEADER_SIZE, 0x00,
+    };
+    static const char ati_rage128_misc[] = "R128AGP SGS1UN";
+    static const uint8_t
+        ati_rage128_crt[IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE] = {
+        0x12, 0x00, 0x80, 0x00, 0x00, 0x00, 0x63, 0x4f,
+        0x51, 0x8c, 0x0c, 0x02, 0xdf, 0x01, 0xe9, 0x01,
+        0x82, 0x00, 0xd6, 0x09,
+    };
+    static const uint8_t ati_vga_connector[] = {
+        0x11, 0x11, 0x00, 0x23, 0x00, 0x00,
+    };
+    uint8_t *header = rom + IA64_INT10_ROM_ATI_HEADER_OFFSET;
+    uint8_t *pll = rom + IA64_INT10_ROM_ATI_PLL_OFFSET;
+    uint16_t vendor = pci_get_word(vga->config + PCI_VENDOR_ID);
+    uint16_t device = pci_get_word(vga->config + PCI_DEVICE_ID);
+    bool rage128 = device == IA64_ATI_RAGE128_DEVICE_ID;
+    bool es1000 = device == IA64_ATI_ES1000_DEVICE_ID;
+    uint32_t memory_mb = MIN(memory_size / MiB, 256U);
+    uint32_t memory_step = memory_mb > UINT8_MAX ? 2 : 1;
+    uint32_t memory_units = memory_mb / memory_step;
 
     if (vendor != IA64_ATI_VENDOR_ID) {
         return;
     }
+    g_assert(memory_size % MiB == 0);
+    g_assert(memory_mb != 0 && memory_mb % memory_step == 0);
+    g_assert(memory_units != 0 && memory_units <= UINT8_MAX);
 
-    /*
-     * Native Rage128 and pre-ATOM RV100 drivers follow the legacy ATI BIOS
-     * pointer chain at 48h to obtain PLL limits.  A generic VBE ROM which
-     * only has a valid 55AAh header is otherwise mistaken for an ATI BIOS,
-     * and the driver interprets executable bytes as clock values.  Publish
-     * the small compatibility block while keeping all video services in the
-     * generic INT 10h implementation.
-     *
-     * Values use the units defined by the Rage128 BIOS interface: clocks
-     * are in 10 kHz units.  They match the range supported by QEMU's
-     * Rage128-compatible display model and its existing VGA BIOS.
-     *
-     * Early IA-64 Rage128 miniports also use VideoPortScanRom() to locate
-     * this ATI BIOS identifier in the first 256 bytes, then reject ROMs
-     * smaller than four 512-byte blocks.  Keep the identifier immediately
-     * before the ATI header; IA64_INT10_ROM_SIZE supplies the required
-     * minimum image length.
-     */
     memcpy(rom + IA64_INT10_ROM_ATI_SIGNATURE_OFFSET,
            ati_bios_signature, sizeof(ati_bios_signature));
     stw_le_p(rom + 0x48, IA64_INT10_ROM_ATI_HEADER_OFFSET);
-    stw_le_p(rom + IA64_INT10_ROM_ATI_HEADER_OFFSET + 0x30,
-             IA64_INT10_ROM_ATI_PLL_OFFSET);
-    stw_le_p(rom + IA64_INT10_ROM_ATI_PLL_OFFSET + 0x08,
-             IA64_ATI_PLL_XCLK);
-    stw_le_p(rom + IA64_INT10_ROM_ATI_PLL_OFFSET + 0x0e,
-             IA64_ATI_PLL_REFERENCE_FREQ);
-    stw_le_p(rom + IA64_INT10_ROM_ATI_PLL_OFFSET + 0x10,
-             IA64_ATI_PLL_REFERENCE_DIV);
-    stl_le_p(rom + IA64_INT10_ROM_ATI_PLL_OFFSET + 0x12,
-             IA64_ATI_PLL_MIN_FREQ);
-    stl_le_p(rom + IA64_INT10_ROM_ATI_PLL_OFFSET + 0x16,
-             IA64_ATI_PLL_MAX_FREQ);
+    if (rage128) {
+        memcpy(header, ati_rage128_header, sizeof(ati_rage128_header));
+    } else {
+        header[0] = 8;
+        header[1] = 0xa0;
+        stw_le_p(header + 0x06, IA64_INT10_ROM_ATI_HEADER_SIZE);
+    }
+    stw_le_p(header + 0x0c, IA64_INT10_ROM_ATI_INIT_OFFSET);
+    stw_le_p(header + 0x1c,
+             pci_get_word(vga->config + PCI_SUBSYSTEM_VENDOR_ID));
+    stw_le_p(header + 0x1e,
+             pci_get_word(vga->config + PCI_SUBSYSTEM_ID));
+    stw_le_p(header + 0x30, IA64_INT10_ROM_ATI_PLL_OFFSET);
+    if (rage128) {
+        stw_le_p(header + 0x14, IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET);
+        stw_le_p(header + 0x2e, IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET);
+        memcpy(rom + IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET,
+               ati_rage128_misc, sizeof(ati_rage128_misc));
+        memcpy(rom + IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET,
+               ati_rage128_crt, sizeof(ati_rage128_crt));
+    } else {
+        stw_le_p(header + 0x14, IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET);
+        stw_le_p(header + 0x46, IA64_INT10_ROM_ATI_INIT_OFFSET);
+        stw_le_p(header + 0x48, IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET);
+        stw_le_p(header + 0x4e, IA64_INT10_ROM_ATI_INIT_OFFSET);
+        /* One VGA/primary-DAC connector entry. */
+        stw_le_p(header + 0x50, IA64_INT10_ROM_ATI_CONNECTOR_OFFSET);
+        memcpy(rom + IA64_INT10_ROM_ATI_CONNECTOR_OFFSET,
+               ati_vga_connector, sizeof(ati_vga_connector));
+        stw_le_p(header + 0x52, IA64_INT10_ROM_ATI_INIT_OFFSET);
+        stw_le_p(header + 0x5e, IA64_INT10_ROM_ATI_MISC_OFFSET);
+    }
+
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET - 3] =
+        IA64_INT10_ROM_ATI_MEM_RESET_OFFSET;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET - 2] =
+        memory_step == 1 ? 0 : memory_step;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET - 1] = 0;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET] = (uint8_t)memory_units;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET + 1] =
+        memory_step == 1 ? 0x25 : 0x2d;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET + 2] = 0;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET + 3] = 1;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET + 4] = 0;
+    rom[IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET + 5] = 0xff;
+
+    pll[0] = rage128 ? 6 : 0x0a;
+    pll[1] = rage128 ? 0x32 : 0x46;
+    pll[2] = 3;
+    pll[3] = rage128 ? 2 : 3;
+    stw_le_p(pll + 0x04, rage128 ? 0x0600 :
+             (es1000 ? 0x05ee : 0x05a6));
+    stw_le_p(pll + 0x06, rage128 ? 0x05f8 :
+             (es1000 ? 0x05e6 : 0x059e));
+    stw_le_p(pll + 0x08, rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    stw_le_p(pll + 0x0a, rage128 ? 12000 : (es1000 ? 20000 : 16600));
+    pll[0x0c] = 3;
+    pll[0x0d] = 12;
+    if (rage128) {
+        ia64_int10_install_ati_clock_range(pll, 0x0e,
+                                           2950, 65, 12500, 40000);
+        ia64_int10_install_ati_clock_range(pll, 0x1a,
+                                           2950, 29, 12500, 26041);
+        ia64_int10_install_ati_clock_range(pll, 0x26,
+                                           2950, 29, 12500, 26041);
+    } else {
+        ia64_int10_install_ati_clock_range(pll, 0x0e,
+                                           2700, 60, 12000, 35000);
+        ia64_int10_install_ati_clock_range(pll, 0x1a,
+                                           2700, 12, 20000, 40000);
+        ia64_int10_install_ati_clock_range(pll, 0x26,
+                                           2700, 12, 20000, 40000);
+        pll[0x32] = 1;
+        pll[0x33] = 0x12;
+        stw_le_p(pll + 0x34, 2700);
+        stl_le_p(pll + 0x36, 40);
+        stl_le_p(pll + 0x3a, 3000);
+        stl_le_p(pll + 0x3e, 12000);
+        stl_le_p(pll + 0x42, 35000);
+    }
 }
 
 static void ia64_vpc_install_int10(IA64VpcMachineState *s)
@@ -1587,8 +1691,37 @@ static void ia64_vpc_install_int10(IA64VpcMachineState *s)
              IA64_INT10_ROM_REVISION_OFFSET);
     g_assert(IA64_INT10_ROM_REVISION_OFFSET + sizeof(ia64_vbe_revision) <=
              IA64_INT10_ROM_MODES_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_HEADER_OFFSET +
+             IA64_INT10_ROM_ATI_HEADER_SIZE <=
+             IA64_INT10_ROM_ATI_INIT_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_INIT_OFFSET +
+             IA64_INT10_ROM_ATI_INIT_READ_SIZE <=
+             IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_BIOS_SUPPORT_OFFSET +
+             IA64_INT10_ROM_ATI_BIOS_SUPPORT_SIZE <=
+             IA64_INT10_ROM_ATI_MISC_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_RAGE128_MISC_OFFSET +
+             IA64_INT10_ROM_ATI_RAGE128_MISC_SIZE <=
+             IA64_INT10_ROM_HANDLER_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_MISC_OFFSET +
+             IA64_INT10_ROM_ATI_MISC_SIZE <=
+             IA64_INT10_ROM_HANDLER_OFFSET);
     g_assert(IA64_INT10_ROM_MODES_OFFSET +
-             (s->vbe_mode_count + 1) * 2 < sizeof(rom));
+             (s->vbe_mode_count + 1) * 2 <=
+             IA64_INT10_ROM_ATI_CONNECTOR_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_CONNECTOR_OFFSET +
+             IA64_INT10_ROM_ATI_CONNECTOR_SIZE <=
+             IA64_INT10_ROM_ATI_PLL_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_RAGE128_CRT_OFFSET +
+             IA64_INT10_ROM_ATI_RAGE128_CRT_SIZE <=
+             IA64_INT10_ROM_ATI_PLL_OFFSET);
+    g_assert(IA64_INT10_ROM_ATI_PLL_OFFSET +
+             IA64_INT10_ROM_ATI_PLL_READ_SIZE <=
+             IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET -
+             IA64_INT10_ROM_ATI_MEM_PREFIX_SIZE);
+    g_assert(IA64_INT10_ROM_ATI_MEM_CONFIG_OFFSET +
+             IA64_INT10_ROM_ATI_MEM_RESET_OFFSET +
+             IA64_INT10_ROM_ATI_MEM_RESET_SIZE < sizeof(rom));
     rom[0] = 0x55;
     rom[1] = 0xaa;
     rom[2] = IA64_INT10_ROM_SIZE / 512;
@@ -1615,7 +1748,8 @@ static void ia64_vpc_install_int10(IA64VpcMachineState *s)
     rom[IA64_INT10_ROM_PCIR_OFFSET + 0x14] = 0;
     rom[IA64_INT10_ROM_PCIR_OFFSET + 0x15] = 0x80;
     memcpy(rom + 0x60, "QEMU IA64 VBE INT10", 20);
-    ia64_int10_install_ati_bios_info(rom, vendor);
+    ia64_int10_install_ati_bios_info(rom, s->vga_dev,
+                                     ia64_vbe_memory_size());
     memcpy(rom + IA64_INT10_ROM_HANDLER_OFFSET, ia64_int10_handler,
            sizeof(ia64_int10_handler));
     memcpy(rom + IA64_INT10_ROM_OEM_OFFSET,
@@ -2122,10 +2256,12 @@ static void ia64_vpc_set_firmware_console(Object *obj, const char *value,
 static char *ia64_vpc_get_alat(Object *obj, Error **errp)
 {
     IA64VpcMachineState *s = IA64_VPC_MACHINE(obj);
+    MachineState *machine = MACHINE(obj);
 
     (void)errp;
 
-    return g_strdup(s->alat_full ? "full" : "zero");
+    return g_strdup(ia64_machine_effective_alat_full(machine, s->alat_full) ?
+                    "full" : "zero");
 }
 
 static void ia64_vpc_set_alat(Object *obj, const char *value, Error **errp)
@@ -2881,10 +3017,6 @@ static bool ia64_vpc_validate_configuration(MachineState *machine,
         error_setg(errp, "Invalid RAM size, should be at most %s", size);
         return false;
     }
-    if (s->alat_full && machine->smp.cpus > 1) {
-        error_setg(errp, "full ALAT emulation is not SMP-safe");
-        return false;
-    }
     return true;
 }
 
@@ -3136,6 +3268,8 @@ static void ia64_vpc_machine_instance_init(Object *obj)
 {
     IA64VpcMachineState *s = IA64_VPC_MACHINE(obj);
 
+    s->alat_full = false;
+
 #ifdef CONFIG_IA64_VPC_PS2
     IA64VpcMachineClass *ivmc = IA64_VPC_MACHINE_GET_CLASS(obj);
 
@@ -3219,7 +3353,8 @@ static void ia64_vpc_machine_class_init(ObjectClass *oc, const void *data)
                                   ia64_vpc_get_alat,
                                   ia64_vpc_set_alat);
     object_class_property_set_description(oc, "alat",
-        "Set the IA-64 ALAT model to 'zero' (default) or 'full'");
+        "Set the IA-64 ALAT model to 'zero' (default) or 'full'; "
+        "'full' is limited to one CPU");
 }
 
 static void itanium_vpc_machine_class_init(ObjectClass *oc, const void *data)

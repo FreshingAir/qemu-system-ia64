@@ -1524,6 +1524,8 @@ struct IA64CPUClass {
     uint64_t implemented_pmd_mask;
     uint64_t perf_cycles_mask;
     uint64_t perf_retired_mask;
+    uint64_t pal_proc_feature_available;
+    uint64_t pal_proc_feature_controllable;
     bool rse_has_clean_partition;
     bool data_debug_cross_16byte;
     bool has_native_ia32;

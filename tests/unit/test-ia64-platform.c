@@ -88,7 +88,7 @@ static IA64PlatformDescriptor *test_descriptor_init(
     root = (void *)(storage->bytes + root_offset);
     root->Segment = cpu_to_le16(0);
     root->Bus = 0;
-    if (platform_id == IA64_PLATFORM_ID_HP_ZX6000) {
+    if (ia64_platform_is_hp_zx(platform_id)) {
         root->ConfigType = IA64_PLATFORM_PCI_CONFIG_ZX1_LBA;
         root->ConfigBase = cpu_to_le64(TEST_ZX1_CONFIG_BASE);
     } else {
@@ -224,6 +224,12 @@ static void test_valid(void)
     g_assert_true(ia64_platform_desc_validate(
         descriptor, sizeof(storage), IA64_PLATFORM_ID_HP_ZX6000, &err));
     g_assert_null(err);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    g_assert_true(ia64_platform_desc_validate(
+        descriptor, sizeof(storage), IA64_PLATFORM_ID_HP_RX2660, &err));
+    g_assert_null(err);
 }
 
 static void test_console_gsi_zero(void)
@@ -255,6 +261,12 @@ static void test_legacy_io_pal_contract(void)
         (1ULL << IA64_PLATFORM_ZX6000_PHYS_ADDR_BITS) - size, size));
     g_assert_false(ia64_platform_legacy_io_valid(
         IA64_PLATFORM_ID_HP_ZX6000,
+        1ULL << IA64_PLATFORM_ZX6000_PHYS_ADDR_BITS, size));
+    g_assert_true(ia64_platform_legacy_io_valid(
+        IA64_PLATFORM_ID_HP_RX2660,
+        (1ULL << IA64_PLATFORM_ZX6000_PHYS_ADDR_BITS) - size, size));
+    g_assert_false(ia64_platform_legacy_io_valid(
+        IA64_PLATFORM_ID_HP_RX2660,
         1ULL << IA64_PLATFORM_ZX6000_PHYS_ADDR_BITS, size));
     g_assert_false(ia64_platform_legacy_io_valid(
         IA64_PLATFORM_ID_HP_I2000, 0xfc000000ULL, size));
@@ -343,6 +355,64 @@ static void test_topology(void)
     descriptor->CoresPerSocket = cpu_to_le32(2);
     ia64_platform_desc_finalize(descriptor, sizeof(storage));
     assert_invalid(descriptor, IA64_PLATFORM_ID_HP_I2000);
+}
+
+static void test_rx2660_topology(void)
+{
+    IA64PlatformTestDescriptor storage;
+    IA64PlatformDescriptor *descriptor;
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(1);
+    descriptor->SocketCount = cpu_to_le32(1);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_valid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(8);
+    descriptor->SocketCount = cpu_to_le32(2);
+    descriptor->CoresPerSocket = cpu_to_le32(2);
+    descriptor->ThreadsPerCore = cpu_to_le32(2);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_valid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(7);
+    descriptor->CoresPerSocket = cpu_to_le32(2);
+    descriptor->ThreadsPerCore = cpu_to_le32(2);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(3);
+    descriptor->SocketCount = cpu_to_le32(3);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(6);
+    descriptor->CoresPerSocket = cpu_to_le32(3);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = cpu_to_le32(6);
+    descriptor->ThreadsPerCore = cpu_to_le32(3);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
+
+    descriptor = test_descriptor_init(&storage,
+                                      IA64_PLATFORM_ID_HP_RX2660);
+    descriptor->ProcessorCount = 0;
+    descriptor->SocketCount = 0;
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_RX2660);
 }
 
 static void test_console_clock(void)
@@ -1425,6 +1495,10 @@ static void test_i2000_profile_valid(void)
     g_assert_true(ia64_platform_desc_validate(
         descriptor, size, IA64_PLATFORM_ID_HP_I2000, &err));
     g_assert_null(err);
+
+    descriptor->Flags |= cpu_to_le32(IA64_PLATFORM_FLAG_IDE_DMA);
+    ia64_platform_desc_finalize(descriptor, sizeof(storage));
+    assert_valid(descriptor, IA64_PLATFORM_ID_HP_I2000);
 }
 
 static void test_i2000_runtime_resources(void)
@@ -1575,11 +1649,6 @@ static void test_i2000_profile_rejected(void)
     assert_invalid(descriptor, IA64_PLATFORM_ID_HP_I2000);
 
     descriptor = test_i2000_descriptor_init(&storage, &size);
-    descriptor->Flags |= cpu_to_le32(IA64_PLATFORM_FLAG_IDE_DMA);
-    ia64_platform_desc_finalize(descriptor, sizeof(storage));
-    assert_invalid(descriptor, IA64_PLATFORM_ID_HP_I2000);
-
-    descriptor = test_i2000_descriptor_init(&storage, &size);
     descriptor->ConsoleBase = cpu_to_le64(
         le64_to_cpu(descriptor->ConsoleBase) + 1U);
     ia64_platform_desc_finalize(descriptor, sizeof(storage));
@@ -1678,6 +1747,8 @@ int main(int argc, char **argv)
                     test_range_and_overlap);
     g_test_add_func("/ia64/platform/checksum", test_checksum);
     g_test_add_func("/ia64/platform/topology", test_topology);
+    g_test_add_func("/ia64/platform/rx2660-topology",
+                    test_rx2660_topology);
     g_test_add_func("/ia64/platform/console-clock", test_console_clock);
     g_test_add_func("/ia64/platform/array-alignment",
                     test_array_alignment);

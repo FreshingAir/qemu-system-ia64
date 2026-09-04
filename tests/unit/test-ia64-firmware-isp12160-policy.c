@@ -54,11 +54,13 @@ static int test_fixed_policy(void)
          ISP12160_QEMU_I2000_CAPABILITY_POLLING) == 0 ||
         (policy.Capabilities &
          ISP12160_QEMU_I2000_CAPABILITY_ONE_OUTSTANDING_ONE_SEGMENT) == 0 ||
-        policy.Segment != 0 || policy.Bus != 0x20 ||
-        policy.Device != 2 || policy.Function != 0 ||
+        policy.Segment != ISP12160_QEMU_I2000_SEGMENT ||
+        policy.Bus != ISP12160_QEMU_I2000_BUS ||
+        policy.Device != ISP12160_QEMU_I2000_DEVICE ||
+        policy.Function != ISP12160_QEMU_I2000_FUNCTION ||
         policy.VendorId != 0x1077 || policy.DeviceId != 0x1216 ||
         policy.Class != 0x0100 || policy.MmioBar != 1 ||
-        policy.MmioBase != 0xa0010000ULL || policy.MmioSize != 0x100 ||
+        policy.MmioBase != 0xa0010000ULL || policy.MmioSize != 0x1000 ||
         policy.Gsi != 20 || policy.InterruptPin != 1 ||
         policy.QueueEntries != 64 || policy.MaxOutstanding != 1 ||
         policy.MaxDataSegments != 1 ||
@@ -66,8 +68,8 @@ static int test_fixed_policy(void)
         policy.ResponseQueueBytes != 4096 || policy.TokenBytes != 8 ||
         policy.TokenAllocationBytes != 4096 ||
         policy.BounceBytes != 65536 || policy.DmaAlignment != 4096 ||
-        policy.DmaApertureBase != 0x00302000ULL ||
-        policy.DmaApertureSize != 0x7fcfe000ULL ||
+        policy.DmaApertureBase != 0 ||
+        policy.DmaApertureSize != 0x80000000ULL ||
         !policy.IdentityDma ||
         policy.DmaApertureBase + policy.DmaApertureSize !=
             0x80000000ULL) {

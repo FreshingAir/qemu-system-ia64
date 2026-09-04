@@ -71,7 +71,8 @@ static int vfio_ram_block_discard_disable(VFIOLegacyContainer *container,
 static int
 vfio_legacy_dma_unmap_get_dirty_bitmap(const VFIOLegacyContainer *container,
                                        hwaddr iova, uint64_t size,
-                                       IOMMUTLBEntry *iotlb)
+                                       IOMMUTLBEntry *iotlb,
+                                       VFIODMAUnmapResult *result)
 {
     const VFIOContainer *bcontainer = VFIO_IOMMU(container);
     struct vfio_iommu_type1_dma_unmap *unmap;
@@ -109,6 +110,9 @@ vfio_legacy_dma_unmap_get_dirty_bitmap(const VFIOLegacyContainer *container,
 
     ret = ioctl(container->fd, VFIO_IOMMU_UNMAP_DMA, unmap);
     if (!ret) {
+        result->unmapped_size = unmap->size;
+        result->executed = true;
+        result->complete = unmap->size == size;
         physical_memory_set_dirty_lebitmap(vbmap.bitmap,
                 iotlb->translated_addr, vbmap.pages);
     } else {
@@ -124,7 +128,8 @@ unmap_exit:
 
 static int vfio_legacy_dma_unmap_one(const VFIOLegacyContainer *container,
                                      hwaddr iova, uint64_t size,
-                                     uint32_t flags, IOMMUTLBEntry *iotlb)
+                                     uint32_t flags, IOMMUTLBEntry *iotlb,
+                                     VFIODMAUnmapResult *result)
 {
     const VFIOContainer *bcontainer = VFIO_IOMMU(container);
     struct vfio_iommu_type1_dma_unmap unmap = {
@@ -143,7 +148,7 @@ static int vfio_legacy_dma_unmap_one(const VFIOLegacyContainer *container,
         if (!vfio_container_devices_dirty_tracking_is_supported(bcontainer) &&
             bcontainer->dirty_pages_supported) {
             return vfio_legacy_dma_unmap_get_dirty_bitmap(container, iova, size,
-                                                          iotlb);
+                                                          iotlb, result);
         }
 
         need_dirty_sync = true;
@@ -152,6 +157,10 @@ static int vfio_legacy_dma_unmap_one(const VFIOLegacyContainer *container,
     if (ioctl(container->fd, VFIO_IOMMU_UNMAP_DMA, &unmap)) {
         return -errno;
     }
+    result->unmapped_size = unmap.size;
+    result->executed = true;
+    result->complete = (flags & VFIO_DMA_UNMAP_FLAG_ALL) ||
+                       unmap.size == size;
 
     if (need_dirty_sync) {
         ret = vfio_container_query_dirty_bitmap(bcontainer, iova, size, 0,
@@ -170,7 +179,8 @@ static int vfio_legacy_dma_unmap_one(const VFIOLegacyContainer *container,
  */
 static int vfio_legacy_dma_unmap(const VFIOContainer *bcontainer,
                                  hwaddr iova, uint64_t size,
-                                 IOMMUTLBEntry *iotlb, bool unmap_all)
+                                 IOMMUTLBEntry *iotlb, bool unmap_all,
+                                 VFIODMAUnmapResult *result)
 {
     const VFIOLegacyContainer *container = VFIO_IOMMU_LEGACY(bcontainer);
     uint32_t flags = 0;
@@ -182,18 +192,30 @@ static int vfio_legacy_dma_unmap(const VFIOContainer *bcontainer,
         } else {
             /* The unmap ioctl doesn't accept a full 64-bit span. */
             Int128 llsize = int128_rshift(int128_2_64(), 1);
+            VFIODMAUnmapResult first = { 0 };
+            VFIODMAUnmapResult second = { 0 };
+
             size = int128_get64(llsize);
 
-            ret = vfio_legacy_dma_unmap_one(container, 0, size, flags, iotlb);
+            ret = vfio_legacy_dma_unmap_one(container, 0, size, flags, iotlb,
+                                            &first);
             if (ret) {
                 return ret;
             }
 
             iova = size;
+            ret = vfio_legacy_dma_unmap_one(container, iova, size, flags,
+                                            iotlb, &second);
+            if (!ret) {
+                result->executed = first.executed && second.executed;
+                result->complete = first.complete && second.complete;
+            }
+            return ret;
         }
     }
 
-    return vfio_legacy_dma_unmap_one(container, iova, size, flags, iotlb);
+    return vfio_legacy_dma_unmap_one(container, iova, size, flags, iotlb,
+                                     result);
 }
 
 static int vfio_legacy_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
@@ -201,6 +223,7 @@ static int vfio_legacy_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
                                MemoryRegion *mr)
 {
     const VFIOLegacyContainer *container = VFIO_IOMMU_LEGACY(bcontainer);
+    VFIODMAUnmapResult unmap_result = { 0 };
     struct vfio_iommu_type1_dma_map map = {
         .argsz = sizeof(map),
         .flags = VFIO_DMA_MAP_FLAG_READ,
@@ -220,7 +243,8 @@ static int vfio_legacy_dma_map(const VFIOContainer *bcontainer, hwaddr iova,
      */
     if (ioctl(container->fd, VFIO_IOMMU_MAP_DMA, &map) == 0 ||
         (errno == EBUSY &&
-         vfio_legacy_dma_unmap(bcontainer, iova, size, NULL, false) == 0 &&
+         vfio_legacy_dma_unmap(bcontainer, iova, size, NULL, false,
+                               &unmap_result) == 0 &&
          ioctl(container->fd, VFIO_IOMMU_MAP_DMA, &map) == 0)) {
         return 0;
     }
@@ -710,10 +734,12 @@ fail:
     }
     if (new_container) {
         vfio_legacy_cpr_unregister_container(container);
-        object_unref(container);
     }
     if (fd >= 0) {
         close(fd);
+    }
+    if (new_container) {
+        object_unref(container);
     }
     vfio_address_space_put(space);
 

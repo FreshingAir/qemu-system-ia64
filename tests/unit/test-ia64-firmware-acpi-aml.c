@@ -5,6 +5,7 @@
  */
 
 #include "fw-acpi-aml.h"
+#include "ssdt-platform-devices.h"
 
 #define CHECK(condition) do { if (!(condition)) { return 1; } } while (0)
 
@@ -13,6 +14,8 @@
 #define ZX6000_PLATFORM_MMIO_SIZE 0x00002000ULL
 
 static UINT8 huge_aml[HUGE_RESOURCE_COUNT * 12U + 64U];
+
+static UINT8 ssdt_aml[IA64_SSDT_AML_SIZE];
 
 static UINT16 read_le16(const UINT8 *bytes)
 {
@@ -169,6 +172,36 @@ static UINTN count_bytes(const UINT8 *aml, UINTN aml_size,
         }
     }
     return count;
+}
+
+static int test_ssdt_legacy_device_parent(void)
+{
+    static const UINT8 pci0_path[] = {
+        0x5cU, 0x2eU, '_', 'S', 'B', '_', 'P', 'C', 'I', '0'
+    };
+    static const UINT8 sba0_path[] = {
+        0x5cU, 0x2eU, '_', 'S', 'B', '_', 'S', 'B', 'A', '0'
+    };
+    static const CHAR8 sba0[4] = { 'S', 'B', 'A', '0' };
+    static const CHAR8 bad_parent[4] = { 's', 'b', 'a', '0' };
+    UINTN i;
+
+    for (i = 0; i < sizeof(ssdt_aml); i++) {
+        ssdt_aml[i] = mSsdtAmlTemplate[i];
+    }
+    CHECK(count_bytes(ssdt_aml, sizeof(ssdt_aml),
+                      pci0_path, sizeof(pci0_path)) == 2U);
+    CHECK(fw_acpi_ssdt_reparent_legacy_devices(
+        ssdt_aml, sizeof(ssdt_aml), sba0));
+    CHECK(count_bytes(ssdt_aml, sizeof(ssdt_aml),
+                      pci0_path, sizeof(pci0_path)) == 0);
+    CHECK(count_bytes(ssdt_aml, sizeof(ssdt_aml),
+                      sba0_path, sizeof(sba0_path)) == 2U);
+    CHECK(!fw_acpi_ssdt_reparent_legacy_devices(
+        ssdt_aml, sizeof(ssdt_aml), sba0));
+    CHECK(!fw_acpi_ssdt_reparent_legacy_devices(
+        ssdt_aml, sizeof(ssdt_aml), bad_parent));
+    return 0;
 }
 
 static BOOLEAN resource_template(const UINT8 *aml, UINTN aml_size,
@@ -362,7 +395,7 @@ static int test_large_pkg_lengths(void)
 
 static int test_resource_descriptors(void)
 {
-    UINT8 aml[256];
+    UINT8 aml[512];
     FWAcpiAmlBuilder builder;
     UINTN length;
     UINTN data_offset;
@@ -375,6 +408,8 @@ static int test_resource_descriptors(void)
                                      0xfed00000U, 0x10000U));
     CHECK(fw_acpi_aml_io(&builder, 1, 0x1004U, 0x1004U, 1U, 0x14U));
     CHECK(fw_acpi_aml_word_bus_number(&builder, 0, 0x20, 0x2f, 0, 0x10));
+    CHECK(fw_acpi_aml_dword_memory(&builder, 0, 0xa0000U, 0xfffffU,
+                                   0, 0x60000U));
     CHECK(fw_acpi_aml_qword_memory(&builder, 0, 0, 0xffffff,
                                    0x90000000, 0x1000000));
     CHECK(fw_acpi_aml_qword_io(&builder, 0, 0x1000, 0x1fff,
@@ -389,7 +424,7 @@ static int test_resource_descriptors(void)
     CHECK(fw_acpi_aml_resource_template_end(&builder));
     CHECK(fw_acpi_aml_builder_finish(&builder, &length));
     CHECK(resource_template(aml, length, 0, &data_offset, &data_size));
-    CHECK(data_size == 222U);
+    CHECK(data_size == 248U);
     data = aml + data_offset;
 
     CHECK(data[0] == 0x86U && read_le16(data + 1U) == 9U &&
@@ -409,6 +444,14 @@ static int test_resource_descriptors(void)
           read_le16(data + 12U) == 0 &&
           read_le16(data + 14U) == 0x10U);
     data += 16U;
+    CHECK(data[0] == 0x87U && read_le16(data + 1U) == 23U &&
+          data[3] == 0 && data[4] == 0x0cU && data[5] == 1U &&
+          read_le32(data + 6U) == 0 &&
+          read_le32(data + 10U) == 0xa0000U &&
+          read_le32(data + 14U) == 0xfffffU &&
+          read_le32(data + 18U) == 0 &&
+          read_le32(data + 22U) == 0x60000U);
+    data += 26U;
     CHECK(data[0] == 0x8aU && read_le16(data + 1U) == 43U &&
           data[3] == 0 && data[4] == 0x0cU && data[5] == 1U &&
           read_le64(data + 6U) == 0 &&
@@ -447,6 +490,7 @@ static int test_zx6000_namespace(void)
 {
     static const UINT8 hwp0001[] = { 0x0c, 0x22, 0xf0, 0x00, 0x01 };
     static const UINT8 hwp0002[] = { 0x0c, 0x22, 0xf0, 0x00, 0x02 };
+    static const UINT8 hwp0003[] = { 0x0c, 0x22, 0xf0, 0x00, 0x03 };
     static const UINT8 pnp0a03[] = { 0x0c, 0x41, 0xd0, 0x0a, 0x03 };
     static const UINT8 pnp0a05[] = { 0x0c, 0x41, 0xd0, 0x0a, 0x05 };
     static const UINT8 pnp0c02[] = { 0x0c, 0x41, 0xd0, 0x0c, 0x02 };
@@ -479,7 +523,9 @@ static int test_zx6000_namespace(void)
     roots[1].Bus = 0x40;
     roots[1].BusEnd = 0x4f;
     roots[1].ConfigBase = 0xfed22000U;
-    roots[1].Flags = IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO;
+    roots[1].Flags = IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO |
+                     IA64_PLATFORM_PCI_ROOT_FLAG_AGP |
+                     IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY;
     roots[1].IoBase = 0x2000U;
     roots[1].IoSize = 0x2000U;
     roots[1].IoTranslationOffset = 0x00000ffffc000000ULL;
@@ -515,7 +561,8 @@ static int test_zx6000_namespace(void)
           bytes_equal(aml + offset + 1U, (const UINT8 *)"_SB_", 4U));
 
     CHECK(count_bytes(aml, length, hwp0001, sizeof(hwp0001)) == 1U &&
-          count_bytes(aml, length, hwp0002, sizeof(hwp0002)) == 2U &&
+          count_bytes(aml, length, hwp0002, sizeof(hwp0002)) == 1U &&
+          count_bytes(aml, length, hwp0003, sizeof(hwp0003)) == 1U &&
           count_bytes(aml, length, pnp0a03, sizeof(pnp0a03)) == 2U &&
           count_bytes(aml, length, pnp0a05, sizeof(pnp0a05)) == 1U &&
           count_bytes(aml, length, pnp0c02, sizeof(pnp0c02)) == 1U &&
@@ -593,7 +640,7 @@ static int test_zx6000_namespace(void)
     offset = find_name(aml, length, "_CRS", offset);
     CHECK(offset != ~(UINTN)0 &&
           resource_template(aml, length, offset, &data_offset, &data_size) &&
-          data_size == 146U);
+          data_size == 238U);
     data = aml + data_offset;
     CHECK(hp_ccsr_resource(data, roots[0].ConfigBase,
                            IA64_PLATFORM_ZX1_LBA_CONFIG_SIZE));
@@ -605,9 +652,21 @@ static int test_zx6000_namespace(void)
     data += 16U;
     CHECK(data[0] == 0x8aU && data[3] == 1U && data[5] == 0x33U &&
           read_le64(data + 14U) == 0 &&
+          read_le64(data + 22U) == 0x1cdU &&
+          read_le64(data + 30U) == 0x00000ffffc000000ULL &&
+          read_le64(data + 38U) == 0x1ceU);
+    data += 46U;
+    CHECK(data[0] == 0x8aU && data[3] == 1U && data[5] == 0x33U &&
+          read_le64(data + 14U) == 0x1d2U &&
+          read_le64(data + 22U) == 0x3afU &&
+          read_le64(data + 30U) == 0x00000ffffc000000ULL &&
+          read_le64(data + 38U) == 0x1deU);
+    data += 46U;
+    CHECK(data[0] == 0x8aU && data[3] == 1U && data[5] == 0x33U &&
+          read_le64(data + 14U) == 0x3e0U &&
           read_le64(data + 22U) == 0x1fffU &&
           read_le64(data + 30U) == 0x00000ffffc000000ULL &&
-          read_le64(data + 38U) == 0x2000U);
+          read_le64(data + 38U) == 0x1c20U);
     data += 46U;
     CHECK(data[0] == 0x8aU && data[3] == 0 &&
           read_le64(data + 14U) == 0 &&
@@ -619,7 +678,7 @@ static int test_zx6000_namespace(void)
     offset = find_name(aml, length, "_CRS", offset);
     CHECK(offset != ~(UINTN)0 &&
           resource_template(aml, length, offset, &data_offset, &data_size) &&
-          data_size == 146U);
+          data_size == 264U);
     data = aml + data_offset;
     CHECK(hp_ccsr_resource(data, roots[1].ConfigBase,
                            IA64_PLATFORM_ZX1_LBA_CONFIG_SIZE));
@@ -633,6 +692,25 @@ static int test_zx6000_namespace(void)
           read_le64(data + 30U) == 0x00000ffffc000000ULL &&
           read_le64(data + 38U) == 0x2000U);
     data += 46U;
+    CHECK(data[0] == 0x8aU && data[3] == 1U && data[5] == 0x33U &&
+          read_le64(data + 14U) == 0x1ceU &&
+          read_le64(data + 22U) == 0x1d1U &&
+          read_le64(data + 30U) == 0x00000ffffc000000ULL &&
+          read_le64(data + 38U) == 0x04U);
+    data += 46U;
+    CHECK(data[0] == 0x8aU && data[3] == 1U && data[5] == 0x33U &&
+          read_le64(data + 14U) == 0x3b0U &&
+          read_le64(data + 22U) == 0x3dfU &&
+          read_le64(data + 30U) == 0x00000ffffc000000ULL &&
+          read_le64(data + 38U) == 0x30U);
+    data += 46U;
+    CHECK(data[0] == 0x87U && read_le16(data + 1U) == 23U &&
+          data[3] == 0 && data[4] == 0x0cU && data[5] == 1U &&
+          read_le32(data + 10U) == 0xa0000U &&
+          read_le32(data + 14U) == 0xfffffU &&
+          read_le32(data + 18U) == 0 &&
+          read_le32(data + 22U) == 0x60000U);
+    data += 26U;
     CHECK(data[0] == 0x8aU && data[3] == 0 &&
           read_le64(data + 14U) == 0 &&
           read_le64(data + 22U) == 0xffffffU &&
@@ -747,7 +825,8 @@ static int test_failure_paths(void)
 {
     UINT8 storage[10];
     FWAcpiAmlBuilder builder;
-    IA64PlatformPciRoot root = { 0 };
+    IA64PlatformPciRoot roots[2] = { 0 };
+    IA64PlatformPciRoot *root = &roots[0];
     IA64PlatformPciRoute route = { 0 };
     UINTN length = 1;
     UINTN before;
@@ -762,47 +841,55 @@ static int test_failure_paths(void)
           fw_acpi_aml_builder_length(&builder) == before &&
           storage[8] == 0x5aU && storage[9] == 0x5aU);
 
-    root.BusEnd = 0;
+    root->BusEnd = 0;
     route.Bus = 1;
     CHECK(!fw_acpi_build_zx6000_dsdt(storage, sizeof(storage),
-                                     &root, 1, &route, 1,
+                                     root, 1, &route, 1,
                                      ZX6000_PLATFORM_MMIO_BASE,
                                      ZX6000_PLATFORM_MMIO_SIZE, &length) &&
           length == 0);
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root,
+        storage, sizeof(storage), root,
         IA64_PLATFORM_MAX_PCI_ROOTS + 1U, NULL, 0,
         ZX6000_PLATFORM_MMIO_BASE, ZX6000_PLATFORM_MMIO_SIZE, &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, &route,
+        storage, sizeof(storage), root, 1, &route,
         IA64_PLATFORM_MAX_PCI_ROUTES + 1U,
         ZX6000_PLATFORM_MMIO_BASE, ZX6000_PLATFORM_MMIO_SIZE, &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), root, 1, NULL, 0,
         ZX6000_PLATFORM_MMIO_BASE, 0, &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), root, 1, NULL, 0,
         0, ZX6000_PLATFORM_MMIO_SIZE, &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), root, 1, NULL, 0,
         ZX6000_PLATFORM_MMIO_BASE, ZX6000_PLATFORM_MMIO_SIZE / 2U,
         &length));
+    roots[0].Flags = IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY;
+    roots[1].Flags = IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY;
+    roots[1].Bus = 1;
+    roots[1].BusEnd = 1;
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), roots, 2, NULL, 0,
+        ZX6000_PLATFORM_MMIO_BASE, ZX6000_PLATFORM_MMIO_SIZE, &length));
+    CHECK(!fw_acpi_build_zx6000_dsdt(
+        storage, sizeof(storage), root, 1, NULL, 0,
         ZX6000_PLATFORM_MMIO_BASE + 1U, ZX6000_PLATFORM_MMIO_SIZE,
         &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), root, 1, NULL, 0,
         0x100000000ULL, ZX6000_PLATFORM_MMIO_SIZE, &length));
     CHECK(!fw_acpi_build_zx6000_dsdt(
-        storage, sizeof(storage), &root, 1, NULL, 0,
+        storage, sizeof(storage), root, 1, NULL, 0,
         0xfffff000ULL, ZX6000_PLATFORM_MMIO_SIZE, &length));
     return 0;
 }
 
 int main(void)
 {
-    return test_named_objects() || test_pkg_length_compaction() ||
+    return test_ssdt_legacy_device_parent() || test_named_objects() ||
+        test_pkg_length_compaction() ||
         test_large_pkg_lengths() || test_resource_descriptors() ||
         test_zx6000_namespace() || test_optional_root_apertures() ||
         test_maximum_descriptor_arrays() || test_failure_paths();

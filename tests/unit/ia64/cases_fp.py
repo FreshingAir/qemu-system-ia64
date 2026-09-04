@@ -147,6 +147,8 @@ from .encoding import (
     ld1,
     ld2,
     ld4,
+    ld4_a,
+    ld4_c_nc,
     ld8,
     ld8_c_nc,
     ld8_fill_postinc,
@@ -377,6 +379,19 @@ test_ldfe_a_alat_tracks_ten_byte_operand = require_registers(
         (0x200, 0x00, 0x123456789abcdef0, 0x1234,
          0),
     ], {"ip": 0x50, "r31": 0x56, "exception": IA64_EXCP_NONE},
+    entry=0x10)
+
+test_stfe_preserves_padding_alat_entry = require_registers(
+    "stfe_preserves_padding_alat_entry", [
+        (0x10, 0x00, addl(3, 0x20c, 0), addl(4, 0x200, 0),
+         addl(5, 0x1234, 0)),
+        (0x20, 0x00, ld4_a(6, 3), nop_i(), nop_i()),
+        (0x30, 0x09, setf_sig(7, 5), nop_i(), nop_i()),
+        (0x40, 0x00, stfe(4, 7), adds(6, 0x55, 0), nop_i()),
+        (0x50, 0x00, ld4_c_nc(6, 3), nop_i(), nop_i()),
+        (0x60, 0x10, nop_m(), nop_i(), br_cond(0x60, 0x60)),
+        (0x200, 0x00, 0x0123456789abcdef, 0x8877665544332211, 0),
+    ], {"ip": 0x60, "r6": 0x55, "exception": IA64_EXCP_NONE},
     entry=0x10)
 
 test_ldf8_c_nc_hit_preserves_target = require_registers(
@@ -6418,6 +6433,7 @@ CASE_NAMES = (
     'stf_spill_preserves_natval',
     'stfd_natval_consumption',
     'stfe_natval_consumption',
+    'stfe_preserves_padding_alat_entry',
     'stfe_stores_extended_float',
     'stfs_natval_consumption',
     'stfs_stfd_convert_register_format',

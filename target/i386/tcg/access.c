@@ -23,6 +23,12 @@
 #ifndef X86_ACCESS_ADDRESS
 #define X86_ACCESS_ADDRESS(env, addr) (addr)
 #endif
+#ifndef X86_ACCESS_NOTIFY_STORE
+#define X86_ACCESS_NOTIFY_STORE(env) ((void)0)
+#endif
+#ifndef X86_ACCESS_ENSURE_EXCLUSIVE
+#define X86_ACCESS_ENSURE_EXCLUSIVE(env, ra) ((void)0)
+#endif
 
 
 void access_prepare_mmu(X86Access *ret, CPUX86State *env,
@@ -33,6 +39,10 @@ void access_prepare_mmu(X86Access *ret, CPUX86State *env,
     void *haddr1, *haddr2;
 
     assert(size > 0 && size <= TARGET_PAGE_SIZE);
+
+    if (type == MMU_DATA_STORE) {
+        X86_ACCESS_ENSURE_EXCLUSIVE(env, ra);
+    }
 
     size1 = MIN(size, -(vaddr | TARGET_PAGE_MASK)),
     size2 = size - size1;
@@ -169,6 +179,7 @@ void access_stb(X86Access *ac, vaddr addr, uint8_t val)
                           X86_ACCESS_ADDRESS(ac->env, addr), val,
                           ac->mmu_idx, ac->ra);
     }
+    X86_ACCESS_NOTIFY_STORE(ac->env);
 }
 
 void access_stw(X86Access *ac, vaddr addr, uint16_t val)
@@ -183,6 +194,7 @@ void access_stw(X86Access *ac, vaddr addr, uint16_t val)
                              X86_ACCESS_ADDRESS(ac->env, addr), val,
                              ac->mmu_idx, ac->ra);
     }
+    X86_ACCESS_NOTIFY_STORE(ac->env);
 }
 
 void access_stl(X86Access *ac, vaddr addr, uint32_t val)
@@ -197,6 +209,7 @@ void access_stl(X86Access *ac, vaddr addr, uint32_t val)
                              X86_ACCESS_ADDRESS(ac->env, addr), val,
                              ac->mmu_idx, ac->ra);
     }
+    X86_ACCESS_NOTIFY_STORE(ac->env);
 }
 
 void access_stq(X86Access *ac, vaddr addr, uint64_t val)
@@ -211,4 +224,5 @@ void access_stq(X86Access *ac, vaddr addr, uint64_t val)
                              X86_ACCESS_ADDRESS(ac->env, addr), val,
                              ac->mmu_idx, ac->ra);
     }
+    X86_ACCESS_NOTIFY_STORE(ac->env);
 }

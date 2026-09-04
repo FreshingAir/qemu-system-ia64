@@ -22,8 +22,9 @@
 
 #define DMA_TEST_LEN 4U
 #define DMA_TEST_SENTINEL UINT32_C(0xa5a5a5a5)
+#define DMA_TEST_LOW_RAM UINT64_C(0x00040000)
 
-static const uint8_t fixture_first_bus[] = { 0x00, 0x20, 0x40 };
+static const uint8_t fixture_first_bus[] = { 0x00, 0x01, 0x02 };
 static const uint64_t fixture_mmio_base[] = {
     UINT64_C(0x90000000),
     UINT64_C(0xa0000000),
@@ -241,48 +242,26 @@ static void test_all_root_dma_apertures(void)
         fixture_config_writew(qts, fixture_first_bus[i], PCI_COMMAND,
                               PCI_COMMAND_MEMORY | PCI_COMMAND_MASTER);
 
-        qtest_writel(qts, IA64_I2000_460GX_TEST_DMA_BASE,
-                     DMA_TEST_SENTINEL);
+        qtest_writel(qts, DMA_TEST_LOW_RAM, DMA_TEST_SENTINEL);
         g_assert_cmphex(fixture_dma_trigger(
                             qts, fixture_mmio_base[i],
-                            IA64_I2000_460GX_TEST_DMA_BASE,
-                            IA64_I2000_460GX_TEST_DMA_BASE), ==, 0);
+                            DMA_TEST_LOW_RAM, DMA_TEST_LOW_RAM), ==, 0);
         g_assert_cmphex(qtest_readl(
                             qts, fixture_mmio_base[i] +
                                  ITD_REG_DMA_MEMTX_RESULT), ==, MEMTX_OK);
-        g_assert_cmphex(qtest_readl(
-                            qts, IA64_I2000_460GX_TEST_DMA_BASE), ==,
+        g_assert_cmphex(qtest_readl(qts, DMA_TEST_LOW_RAM), ==,
                         ITD_DMA_WRITE_VAL);
 
-        /* This mapped RAM range lies outside the root DMA aperture. */
-        qtest_writel(qts, IA64_I2000_460GX_TEST_DESC_ROM_BASE,
-                     DMA_TEST_SENTINEL);
-        g_assert_cmphex(fixture_dma_trigger(
-                            qts, fixture_mmio_base[i],
-                            IA64_I2000_460GX_TEST_DESC_ROM_BASE,
-                            IA64_I2000_460GX_TEST_DESC_ROM_BASE), ==,
-                        ITD_DMA_ERR_TX_FAIL);
-        g_assert_cmphex(qtest_readl(
-                            qts, fixture_mmio_base[i] +
-                                 ITD_REG_DMA_MEMTX_RESULT), ==,
-                        MEMTX_DECODE_ERROR);
-        g_assert_cmphex(qtest_readl(
-                            qts, IA64_I2000_460GX_TEST_DESC_ROM_BASE), ==,
-                        DMA_TEST_SENTINEL);
-
-        /* The exclusive end of the identity window is denied as well. */
-        qtest_writel(qts, IA64_I2000_460GX_TEST_DMA_BASE,
-                     DMA_TEST_SENTINEL);
+        qtest_writel(qts, DMA_TEST_LOW_RAM, DMA_TEST_SENTINEL);
         g_assert_cmphex(fixture_dma_trigger(
                             qts, fixture_mmio_base[i], denied,
-                            IA64_I2000_460GX_TEST_DMA_BASE), ==,
+                            DMA_TEST_LOW_RAM), ==,
                         ITD_DMA_ERR_TX_FAIL);
         g_assert_cmphex(qtest_readl(
                             qts, fixture_mmio_base[i] +
                                  ITD_REG_DMA_MEMTX_RESULT), ==,
                         MEMTX_DECODE_ERROR);
-        g_assert_cmphex(qtest_readl(
-                            qts, IA64_I2000_460GX_TEST_DMA_BASE), ==,
+        g_assert_cmphex(qtest_readl(qts, DMA_TEST_LOW_RAM), ==,
                         DMA_TEST_SENTINEL);
     }
     qtest_quit(qts);

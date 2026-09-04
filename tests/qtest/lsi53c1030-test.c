@@ -53,6 +53,19 @@ static void *mptspi_create(void *pci_bus, QGuestAllocator *alloc, void *addr)
     return &mpt->obj;
 }
 
+static uint32_t mptspi_probe_rom_size(QPCIDevice *dev)
+{
+    uint32_t saved_rom = qpci_config_readl(dev, PCI_ROM_ADDRESS);
+    uint32_t rom_mask;
+
+    qpci_config_writel(dev, PCI_ROM_ADDRESS, UINT32_MAX);
+    rom_mask = qpci_config_readl(dev, PCI_ROM_ADDRESS);
+    qpci_config_writel(dev, PCI_ROM_ADDRESS, saved_rom);
+
+    rom_mask &= PCI_ROM_ADDRESS_MASK;
+    return rom_mask ? ~rom_mask + 1 : 0;
+}
+
 static void mptspi_handshake(QMptSpi *mpt, const void *request,
                              size_t request_size, void *reply,
                              size_t reply_size)
@@ -146,6 +159,7 @@ static void mptspi_test_facts(void *obj, void *data,
                               QGuestAllocator *alloc)
 {
     QMptSpi *mpt = obj;
+    QPCIBar diag_bar;
     MPIMsgIOCFacts facts_request = { 0 };
     MPIMsgIOCFactsReply facts_reply;
     MPIMsgPortFacts port_request = { 0 };
@@ -153,12 +167,28 @@ static void mptspi_test_facts(void *obj, void *data,
     uint16_t product_id = MPI_FW_HEADER_PID_TYPE_SCSI |
                           MPI_FW_HEADER_PID_PROD_INITIATOR_SCSI |
                           MPI_FW_HEADER_PID_FAMILY_1030C0_SCSI;
+    uint64_t diag_size;
 
     g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_VENDOR_ID), ==,
                     PCI_VENDOR_ID_LSI_LOGIC);
     g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_DEVICE_ID), ==,
                     PCI_DEVICE_ID_LSI_53C1030);
-    g_assert_cmphex(qpci_config_readb(&mpt->dev, PCI_REVISION_ID), ==, 0x08);
+    g_assert_cmphex(qpci_config_readb(&mpt->dev, PCI_REVISION_ID), ==, 0x07);
+    g_assert_cmphex(qpci_config_readw(&mpt->dev,
+                                      PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    PCI_VENDOR_ID_LSI_LOGIC);
+    g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_SUBSYSTEM_ID), ==,
+                    0x1000);
+    g_assert_cmphex(qpci_config_readl(&mpt->dev, PCI_BASE_ADDRESS_1) &
+                    PCI_BASE_ADDRESS_MEM_TYPE_MASK, ==,
+                    PCI_BASE_ADDRESS_MEM_TYPE_32);
+    g_assert_cmphex(qpci_config_readl(&mpt->dev, PCI_BASE_ADDRESS_2) &
+                    PCI_BASE_ADDRESS_MEM_TYPE_MASK, ==,
+                    PCI_BASE_ADDRESS_MEM_TYPE_32);
+    diag_bar = qpci_iomap(&mpt->dev, 2, &diag_size);
+    g_assert_cmpuint(diag_size, ==, 0x10000);
+    qpci_iounmap(&mpt->dev, diag_bar);
+    g_assert_cmpuint(mptspi_probe_rom_size(&mpt->dev), ==, 0);
     g_assert_cmphex(qpci_io_readl(&mpt->dev, mpt->bar,
                                   MPI_DOORBELL_OFFSET) &
                     MPI_IOC_STATE_READY, ==, MPI_IOC_STATE_READY);
@@ -757,6 +787,7 @@ static void mptsas1068_test_compat(void *obj, void *data,
                                    QGuestAllocator *alloc)
 {
     QMptSpi *mpt = obj;
+    QPCIBar diag_bar;
     MPIMsgIOCFacts facts_request = { 0 };
     MPIMsgIOCFactsReply facts_reply;
     MPIMsgPortFacts port_request = { 0 };
@@ -765,9 +796,29 @@ static void mptsas1068_test_compat(void *obj, void *data,
     uint16_t product_id = MPI_FW_HEADER_PID_TYPE_SAS |
                           MPI_FW_HEADER_PID_PROD_INITIATOR_SCSI |
                           MPI_FW_HEADER_PID_FAMILY_1068_SAS;
+    uint64_t diag_size;
 
+    g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_VENDOR_ID), ==,
+                    PCI_VENDOR_ID_LSI_LOGIC);
     g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_DEVICE_ID), ==,
                     PCI_DEVICE_ID_LSI_SAS1068);
+    g_assert_cmphex(qpci_config_readb(&mpt->dev, PCI_REVISION_ID), ==, 0x01);
+    g_assert_cmphex(qpci_config_readw(&mpt->dev,
+                                      PCI_SUBSYSTEM_VENDOR_ID), ==,
+                    PCI_VENDOR_ID_LSI_LOGIC);
+    g_assert_cmphex(qpci_config_readw(&mpt->dev, PCI_SUBSYSTEM_ID), ==,
+                    0x8000);
+    g_assert_cmphex(qpci_config_readl(&mpt->dev, PCI_BASE_ADDRESS_1) &
+                    PCI_BASE_ADDRESS_MEM_TYPE_MASK, ==,
+                    PCI_BASE_ADDRESS_MEM_TYPE_64);
+    g_assert_cmphex(qpci_config_readl(&mpt->dev, PCI_BASE_ADDRESS_3) &
+                    PCI_BASE_ADDRESS_MEM_TYPE_MASK, ==,
+                    PCI_BASE_ADDRESS_MEM_TYPE_64);
+    diag_bar = qpci_iomap(&mpt->dev, 3, &diag_size);
+    g_assert_cmpuint(diag_size, ==, 0x10000);
+    qpci_iounmap(&mpt->dev, diag_bar);
+    g_assert_cmpuint(mptspi_probe_rom_size(&mpt->dev), ==,
+                     4U * 1024U * 1024U);
 
     /* The host may advertise more targets than this eight-PHY model. */
     mptspi_ioc_init(mpt);
@@ -859,7 +910,8 @@ static void mptspi_register_nodes(void)
         .extra_device_opts = "addr=04.0,id=mptspi",
     };
     QOSGraphEdgeOptions sas_opts = {
-        .extra_device_opts = "addr=05.0,id=mptsas",
+        .extra_device_opts = "addr=05.0,id=mptsas,x-pci-64bit-bars=on,"
+                             "x-pci-rom-size=4194304",
     };
     QOSGraphTestOptions snapshot_opts = {
         .before = mptspi_snapshot_setup,

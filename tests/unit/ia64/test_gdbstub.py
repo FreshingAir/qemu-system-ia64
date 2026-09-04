@@ -8,6 +8,7 @@ import socket
 import struct
 import subprocess
 import sys
+import tempfile
 
 from process import connect_tcp, terminate_process
 from qmp import QmpClient
@@ -38,6 +39,14 @@ RSE_CLEAN_PROGRAM = bytes.fromhex(
 # between allocation and lookup of a full-model ALAT entry.
 ALAT_EXTERNAL_WRITE_PROGRAM = bytes.fromhex(
     "00b000065a1000000002000000000400"
+    "00b00006381100000002000000000400"
+)
+
+# ld8.a r22=[r3]; adds r22=0x55,r0; ld8.c.nc r22=[r3].  The middle
+# instruction changes the destination without invalidating its ALAT entry.
+ALAT_MIGRATION_PROGRAM = bytes.fromhex(
+    "00b000065a1000000002000000000400"
+    "00000000010060a90200420000000400"
     "00b00006381100000002000000000400"
 )
 
@@ -155,11 +164,25 @@ def _rse_state(qmp: QmpClient) -> tuple[int, ...]:
     return tuple(int(value) for value in match.groups())
 
 
-def test_gdbstub(qemu: str) -> None:
+def test_gdbstub(qemu: str, qemu_img: str | None) -> None:
+    snapshot_tmp = None
+    snapshot_args: list[str] = []
+    if qemu_img is not None:
+        snapshot_tmp = tempfile.TemporaryDirectory(
+            prefix="ia64-alat-migration-")
+        snapshot_disk = snapshot_tmp.name + "/snapshot.qcow2"
+        subprocess.run(
+            [qemu_img, "create", "-q", "-f", "qcow2", snapshot_disk,
+             "64M"], check=True)
+        snapshot_args = [
+            "-drive", f"file={snapshot_disk},format=qcow2,if=none",
+        ]
+
     proc = subprocess.Popen([
         qemu,
         "-machine", "ia64-vpc,alat=full,nvram=none",
         "-nodefaults",
+        *snapshot_args,
         "-display", "none",
         "-monitor", "none",
         "-qmp", "stdio",
@@ -287,6 +310,48 @@ def test_gdbstub(qemu: str) -> None:
                 raise RuntimeError(
                     "external RAM write left a stale full-model ALAT entry")
 
+            if qemu_img is not None:
+                # Snapshot load discards ALAT entries because generations are
+                # not migrated.
+                initial = struct.pack("<Q", 0x1122334455667788)
+                sentinel = struct.pack("<Q", 0x55)
+                if rsp.request(
+                        f"M3000,{len(ALAT_MIGRATION_PROGRAM):x}:"
+                        f"{ALAT_MIGRATION_PROGRAM.hex()}") != "OK" or \
+                        rsp.request(f"M5000,8:{initial.hex()}") != "OK":
+                    raise RuntimeError(
+                        "GDB memory write for ALAT migration probe failed")
+                _write_reg(rsp, 3, struct.pack("<Q", 0x5000))
+                _write_reg(rsp, 331, struct.pack("<Q", 0x3000))
+                _write_reg(rsp, 332, bytes(8))
+                for target_ip in (0x3010, 0x3020):
+                    step = rsp.request("s")
+                    if not step.startswith("T05") or \
+                            struct.unpack("<Q", _read_reg(rsp, 331, 8))[0] \
+                            != target_ip:
+                        raise RuntimeError(
+                            "ALAT migration setup did not single-step to "
+                            f"0x{target_ip:x}: {step!r}")
+                if _read_reg(rsp, 22, 8) != sentinel:
+                    raise RuntimeError(
+                        "ALAT migration setup did not overwrite r22")
+                if qmp.hmp("savevm alat-migration") != "":
+                    raise RuntimeError("failed to save ALAT migration state")
+
+                step = rsp.request("s")
+                if not step.startswith("T05") or \
+                        _read_reg(rsp, 22, 8) != sentinel:
+                    raise RuntimeError(
+                        "source ALAT entry was not live before migration")
+                if qmp.hmp("loadvm alat-migration") != "":
+                    raise RuntimeError("failed to load ALAT migration state")
+                step = rsp.request("s")
+                if not step.startswith("T05") or \
+                        _read_reg(rsp, 22, 8) != initial:
+                    raise RuntimeError(
+                        "migration resurrected a source ALAT entry")
+                qmp.hmp("delvm alat-migration")
+
             gr_value = struct.pack("<Q", 0x1122334455667788)
             _expect_round_trip(rsp, 2, gr_value)
 
@@ -371,16 +436,18 @@ def test_gdbstub(qemu: str) -> None:
                 raise RuntimeError("GDB write modified reserved AR112")
     finally:
         terminate_process(proc)
+        if snapshot_tmp is not None:
+            snapshot_tmp.cleanup()
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print("Bail out! usage: test_gdbstub.py QEMU_SYSTEM_IA64")
+    if len(sys.argv) not in (2, 3):
+        print("Bail out! usage: test_gdbstub.py QEMU_SYSTEM_IA64 [QEMU_IMG]")
         return 1
     print("TAP version 13")
     print("1..1")
     try:
-        test_gdbstub(sys.argv[1])
+        test_gdbstub(sys.argv[1], sys.argv[2] if len(sys.argv) == 3 else None)
         print("ok 1 - IA-64 -s GDB register protocol")
         return 0
     except Exception as exc:

@@ -165,26 +165,19 @@ static int test_i2000_dsdt_contract(void)
     static const UINT8 pci0[] = { 'P', 'C', 'I', '0' };
     static const UINT8 pci1[] = { 'P', 'C', 'I', '1' };
     static const UINT8 pci2[] = { 'P', 'C', 'I', '2' };
-    static const UINT8 pci0_device[] = {
-        0x5b, 0x82, 0x41, 0x1a, 'P', 'C', 'I', '0',
-    };
-    static const UINT8 ifb0_device[] = {
-        0x5b, 0x82, 0x4c, 0x08, 'I', 'F', 'B', '0',
-    };
-    static const UINT8 ps2k_device[] = {
-        0x5b, 0x82, 0x2d, 'P', 'S', '2', 'K',
-    };
-    static const UINT8 ps2m_device[] = {
-        0x5b, 0x82, 0x1d, 'P', 'S', '2', 'M',
-    };
-    static const UINT8 pci1_device[] = {
-        0x5b, 0x82, 0x43, 0x0d, 'P', 'C', 'I', '1',
-    };
-    static const UINT8 pci2_device[] = {
-        0x5b, 0x82, 0x4c, 0x0b, 'P', 'C', 'I', '2',
+    static const UINT8 pci3[] = { 'P', 'C', 'I', '3' };
+    static const UINT8 ifb0[] = { 'I', 'F', 'B', '0' };
+    static const UINT8 ps2k[] = { 'P', 'S', '2', 'K' };
+    static const UINT8 ps2m[] = { 'P', 'S', '2', 'M' };
+    static const UINT8 ifb_address[] = {
+        0x08, '_', 'A', 'D', 'R', 0x0c, 0x00, 0x00, 0x03, 0x00,
     };
     static const UINT8 empty_prt[] = {
         0x08, '_', 'P', 'R', 'T', 0x12, 0x02, 0x00,
+    };
+    static const UINT8 audio_prt[] = {
+        0x12, 0x0b, 0x04, 0x0c, 0xff, 0xff, 0x04, 0x00,
+        0x00, 0x00, 0x0a, 0x10,
     };
     static const UINT8 hid[] = {
         0x08, '_', 'H', 'I', 'D', 0x0c, 0x41, 0xd0, 0x05, 0x01,
@@ -206,27 +199,30 @@ static int test_i2000_dsdt_contract(void)
     static const UINT8 mouse_irq[] = { 0x22, 0x00, 0x10 };
     UINTN pci0_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        pci0_device, sizeof(pci0_device));
+        pci0, sizeof(pci0));
     UINTN ifb0_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        ifb0_device, sizeof(ifb0_device));
+        ifb0, sizeof(ifb0));
     UINTN ps2k_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        ps2k_device, sizeof(ps2k_device));
+        ps2k, sizeof(ps2k));
     UINTN ps2m_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        ps2m_device, sizeof(ps2m_device));
+        ps2m, sizeof(ps2m));
     UINTN pci1_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        pci1_device, sizeof(pci1_device));
+        pci1, sizeof(pci1));
     UINTN pci2_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
-        pci2_device, sizeof(pci2_device));
+        pci2, sizeof(pci2));
+    UINTN pci3_offset = byte_sequence_offset(
+        mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
+        pci3, sizeof(pci3));
     UINTN empty_prt_offset = byte_sequence_offset(
         mI2000DsdtAmlTemplate, sizeof(mI2000DsdtAmlTemplate),
         empty_prt, sizeof(empty_prt));
 
-    if (IA64_I2000_DSDT_AML_SIZE != 843U ||
+    if (IA64_I2000_DSDT_AML_SIZE != 1186U ||
         !byte_sequence_present(mI2000DsdtAmlTemplate,
                                sizeof(mI2000DsdtAmlTemplate),
                                pci_hid, sizeof(pci_hid)) ||
@@ -239,13 +235,24 @@ static int test_i2000_dsdt_contract(void)
         !byte_sequence_present(mI2000DsdtAmlTemplate,
                                sizeof(mI2000DsdtAmlTemplate),
                                pci2, sizeof(pci2)) ||
+        !byte_sequence_present(mI2000DsdtAmlTemplate,
+                               sizeof(mI2000DsdtAmlTemplate),
+                               pci3, sizeof(pci3)) ||
+        !byte_sequence_present(mI2000DsdtAmlTemplate,
+                               sizeof(mI2000DsdtAmlTemplate),
+                               audio_prt, sizeof(audio_prt)) ||
         pci0_offset == ~(UINTN)0 || ifb0_offset == ~(UINTN)0 ||
         ps2k_offset == ~(UINTN)0 ||
         ps2m_offset == ~(UINTN)0 || pci1_offset == ~(UINTN)0 ||
-        pci2_offset == ~(UINTN)0 || empty_prt_offset == ~(UINTN)0 ||
+        pci2_offset == ~(UINTN)0 || pci3_offset == ~(UINTN)0 ||
+        empty_prt_offset == ~(UINTN)0 ||
         ifb0_offset <= pci0_offset || ps2k_offset <= ifb0_offset ||
         ps2m_offset <= ps2k_offset ||
-        pci1_offset <= ps2m_offset || empty_prt_offset <= pci2_offset ||
+        pci1_offset <= ps2m_offset || pci2_offset <= pci1_offset ||
+        empty_prt_offset <= pci2_offset || pci3_offset <= empty_prt_offset ||
+        !byte_sequence_present(mI2000DsdtAmlTemplate,
+                               sizeof(mI2000DsdtAmlTemplate),
+                               ifb_address, sizeof(ifb_address)) ||
         !byte_sequence_present(mI2000DsdtAmlTemplate,
                                sizeof(mI2000DsdtAmlTemplate),
                                hid, sizeof(hid)) ||

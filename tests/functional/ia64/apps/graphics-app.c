@@ -4,7 +4,10 @@
 
 #define ATI_RAGE128_ID        0x50461002U
 #define ATI_RV100_ID          0x51591002U
-#define I2000_FRAMEBUFFER     0x0000000090000000ULL
+#define NVIDIA_QUADRO2_ID     0x015310deU
+#define NEC_OHCI_ID           0x00351033U
+#define I2000_ATI_FRAMEBUFFER 0x00000000e8000000ULL
+#define I2000_QUADRO2_FRAMEBUFFER 0x00000000e8000000ULL
 #define ZX6000_FRAMEBUFFER    0x00000000a0000000ULL
 #define ZX6000_ACPI_PM_BASE   0x00000000ff5c0000ULL
 #define ZX6000_ACPI_PM_SIZE   0x0000000000002000ULL
@@ -16,10 +19,27 @@
 #define ZX6000_CONTROL_SIZE   0x0000000000002000ULL
 #define ACPI_HID_PNP0A03      0x0a0341d0U
 #define ACPI_HID_HWP0002      0x000222f0U
+#define ACPI_HID_HWP0003      0x000322f0U
+#define ACPI_UID_ANY          0xffffffffU
 #define VGA_LEGACY_BASE       0x00000000000a0000ULL
 #define VGA_LEGACY_SIZE       0x0000000000020000ULL
+#define VGA_DECODE_MEMORY_END 0x00000000000fffffULL
+#define VGA_ROM_BASE          0x00000000000c0000ULL
+#define VGA_DECODE_IO_BASE    0x03b0U
+#define VGA_DECODE_IO_END     0x03dfU
+#define VGA_COLOR_IO_BASE     0x03c0U
 #define PCI_COMMAND_OFFSET    0x04U
 #define PCI_COMMAND_MASTER    0x0004U
+#define PCI_ROOT_DESCRIPTOR_SIZE 46U
+#define PCI_ROOT_DESCRIPTOR_MAX  9U
+#define GRAPHICS_ROOT_MAX         16U
+#define EFI_PCI_ATTRIBUTE_VGA_MEMORY 0x0008ULL
+#define EFI_PCI_ATTRIBUTE_VGA_IO     0x0010ULL
+#define EFI_PCI_ATTRIBUTE_VGA_IO_16  0x40000ULL
+#define EFI_PCI_ATTRIBUTE_VGA_DECODE \
+    (EFI_PCI_ATTRIBUTE_VGA_MEMORY | EFI_PCI_ATTRIBUTE_VGA_IO_16)
+#define EFI_PCI_ATTRIBUTE_VGA_ALL \
+    (EFI_PCI_ATTRIBUTE_VGA_DECODE | EFI_PCI_ATTRIBUTE_VGA_IO)
 #define VBE_INDEX_PORT        0x01ceU
 #define VBE_DATA_PORT         0x01d0U
 #define VBE_INDEX_XRES        0x0001U
@@ -30,30 +50,61 @@
 #define GRAPHICS_PROTOCOLS    6U
 
 typedef struct {
-    UINT8 Type;
-    UINT8 SubType;
-    UINT16 Length;
-} __attribute__((packed)) GRAPHICS_DEVICE_PATH_NODE;
+    UINT64 BusMinimum;
+    UINT64 BusMaximum;
+    UINTN LegacyIoCount;
+    UINTN LegacyMemoryCount;
+} GRAPHICS_ROOT_RESOURCES;
 
 typedef struct {
-    GRAPHICS_DEVICE_PATH_NODE Acpi;
-    UINT32 Hid;
-    UINT32 Uid;
-    GRAPHICS_DEVICE_PATH_NODE Pci;
-    UINT8 Function;
-    UINT8 Device;
-    GRAPHICS_DEVICE_PATH_NODE End;
-} __attribute__((packed)) GRAPHICS_DEVICE_PATH;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *Protocol;
+    GRAPHICS_ROOT_RESOURCES Resources;
+    BOOLEAN Owner;
+} GRAPHICS_ROOT;
+
+typedef struct {
+    GRAPHICS_ROOT Root[GRAPHICS_ROOT_MAX];
+    UINTN Count;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *Owner;
+} GRAPHICS_ROOT_SET;
 
 static UINT8 gop_guid[16] = IA64_GUID_GOP;
 static UINT8 uga_guid[16] = IA64_GUID_UGA_DRAW;
 static UINT8 uga_io_guid[16] = IA64_GUID_UGA_IO;
 static UINT8 pci_io_guid[16] = IA64_GUID_PCI_IO;
+static UINT8 pci_root_guid[16] = IA64_GUID_PCI_ROOT_IO;
 static UINT8 device_path_guid[16] = IA64_GUID_DEVICE_PATH;
 static UINT8 text_output_guid[16] = IA64_GUID_TEXT_OUTPUT;
 static UINT8 pci_dma_buffer[64] __attribute__((aligned(64)));
 
 static UINT32 framebuffer_read(UINT64 Address);
+
+static UINT16 graphics_get_u16(const VOID *Address)
+{
+    const UINT8 *p = Address;
+
+    return (UINT16)p[0] | ((UINT16)p[1] << 8);
+}
+
+static UINT32 graphics_get_u32(const VOID *Address)
+{
+    const UINT8 *p = Address;
+
+    return (UINT32)p[0] | ((UINT32)p[1] << 8) |
+        ((UINT32)p[2] << 16) | ((UINT32)p[3] << 24);
+}
+
+static UINT64 graphics_get_u64(const VOID *Address)
+{
+    const UINT8 *p = Address;
+    UINT64 value = 0;
+    UINTN i;
+
+    for (i = 0; i < 8U; i++) {
+        value |= (UINT64)p[i] << (i * 8U);
+    }
+    return value;
+}
 
 static BOOLEAN guid_equal(const VOID *Left, const VOID *Right)
 {
@@ -297,8 +348,485 @@ out:
     return valid;
 }
 
+static BOOLEAN graphics_pci_vga_attributes_valid(
+    EFI_PCI_IO_PROTOCOL *Pci, EFI_STATUS *Result)
+{
+    UINT64 supported = 0;
+    UINT64 attributes = 0;
+    EFI_STATUS status;
+
+    if (Pci->Attributes == NULL) {
+        *Result = EFI_UNSUPPORTED;
+        return 0;
+    }
+    status = Pci->Attributes(Pci, EfiPciIoAttributeOperationSupported,
+                             0, &supported);
+    if (status == EFI_SUCCESS) {
+        status = Pci->Attributes(Pci, EfiPciIoAttributeOperationGet,
+                                 0, &attributes);
+    }
+    if (status == EFI_SUCCESS &&
+        ((supported & EFI_PCI_ATTRIBUTE_VGA_ALL) !=
+             EFI_PCI_ATTRIBUTE_VGA_DECODE ||
+         (attributes & EFI_PCI_ATTRIBUTE_VGA_ALL) !=
+             EFI_PCI_ATTRIBUTE_VGA_DECODE)) {
+        status = EFI_DEVICE_ERROR;
+    }
+    *Result = status;
+    return status == EFI_SUCCESS;
+}
+
+static BOOLEAN graphics_ranges_overlap(UINT64 Minimum, UINT64 Maximum,
+                                       UINT64 OtherMinimum,
+                                       UINT64 OtherMaximum)
+{
+    return Minimum <= OtherMaximum && OtherMinimum <= Maximum;
+}
+
+static EFI_STATUS graphics_root_configuration(
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *Root,
+    GRAPHICS_ROOT_RESOURCES *Resources)
+{
+    UINT8 *descriptor;
+    VOID *resources = NULL;
+    UINTN index;
+    BOOLEAN bus_found = 0;
+    EFI_STATUS status;
+
+    if (Root == NULL || Root->Configuration == NULL ||
+        Resources == NULL) {
+        return EFI_UNSUPPORTED;
+    }
+    Resources->BusMinimum = 0;
+    Resources->BusMaximum = 0;
+    Resources->LegacyIoCount = 0;
+    Resources->LegacyMemoryCount = 0;
+    status = Root->Configuration(Root, &resources);
+    if (status != EFI_SUCCESS || resources == NULL) {
+        return status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
+    }
+    descriptor = resources;
+    for (index = 0; index <= PCI_ROOT_DESCRIPTOR_MAX; index++) {
+        UINT8 type;
+        UINT64 granularity;
+        UINT64 minimum;
+        UINT64 maximum;
+        UINT64 translation;
+        UINT64 length;
+
+        if (descriptor[0] == 0x79U) {
+            return descriptor[1] == 0 && bus_found ?
+                EFI_SUCCESS : EFI_DEVICE_ERROR;
+        }
+        if (index == PCI_ROOT_DESCRIPTOR_MAX || descriptor[0] != 0x8aU ||
+            graphics_get_u16(descriptor + 1U) != 0x2bU ||
+            descriptor[4] != 0 || descriptor[5] != 0) {
+            return EFI_DEVICE_ERROR;
+        }
+        type = descriptor[3];
+        granularity = graphics_get_u64(descriptor + 6U);
+        minimum = graphics_get_u64(descriptor + 14U);
+        maximum = graphics_get_u64(descriptor + 22U);
+        translation = graphics_get_u64(descriptor + 30U);
+        length = graphics_get_u64(descriptor + 38U);
+        if (type > 2U || maximum < minimum || length == 0 ||
+            length - 1U != maximum - minimum) {
+            return EFI_DEVICE_ERROR;
+        }
+        if (type == 2U) {
+            if (bus_found || granularity != 0 || translation != 0 ||
+                maximum > 0xffU) {
+                return EFI_DEVICE_ERROR;
+            }
+            Resources->BusMinimum = minimum;
+            Resources->BusMaximum = maximum;
+            bus_found = 1;
+        } else if (type == 1U) {
+            if (granularity != 0 || translation != 0) {
+                return EFI_DEVICE_ERROR;
+            }
+            if (graphics_ranges_overlap(minimum, maximum,
+                                        VGA_DECODE_IO_BASE,
+                                        VGA_DECODE_IO_END)) {
+                if (minimum != VGA_DECODE_IO_BASE ||
+                    maximum != VGA_DECODE_IO_END) {
+                    return EFI_DEVICE_ERROR;
+                }
+                Resources->LegacyIoCount++;
+            }
+        } else {
+            if (granularity != 32U && granularity != 64U) {
+                return EFI_DEVICE_ERROR;
+            }
+            if (graphics_ranges_overlap(minimum, maximum,
+                                        VGA_LEGACY_BASE,
+                                        VGA_DECODE_MEMORY_END)) {
+                if (granularity != 32U || minimum != VGA_LEGACY_BASE ||
+                    maximum != VGA_DECODE_MEMORY_END || translation != 0) {
+                    return EFI_DEVICE_ERROR;
+                }
+                Resources->LegacyMemoryCount++;
+            }
+        }
+        descriptor += PCI_ROOT_DESCRIPTOR_SIZE;
+    }
+    return EFI_DEVICE_ERROR;
+}
+
+static UINT8 *graphics_pci_path_node(VOID *DevicePath)
+{
+    UINT8 *node = DevicePath;
+    UINT16 length;
+
+    if (node == NULL || node[0] != 0x02U ||
+        (node[1] != 0x01U && node[1] != 0x02U)) {
+        return NULL;
+    }
+    length = graphics_get_u16(node + 2U);
+    if ((node[1] == 0x01U && length != 12U) ||
+        (node[1] == 0x02U && (length < 19U || length > 64U))) {
+        return NULL;
+    }
+    node += length;
+    if (node[0] != 0x01U || node[1] != 0x01U ||
+        graphics_get_u16(node + 2U) != 6U) {
+        return NULL;
+    }
+    if (node[6] != 0x7fU || node[7] != 0xffU ||
+        graphics_get_u16(node + 8U) != 4U) {
+        return NULL;
+    }
+    return node;
+}
+
+static BOOLEAN graphics_device_path_valid(
+    VOID *DevicePath, UINT32 ExpectedHid, UINT32 ExpectedUid,
+    UINT32 ExpectedCid, UINT8 ExpectedDevice)
+{
+    UINT8 *acpi = DevicePath;
+    UINT8 *pci = graphics_pci_path_node(DevicePath);
+    UINT16 acpi_length;
+
+    if (pci == NULL) {
+        return 0;
+    }
+    acpi_length = graphics_get_u16(acpi + 2U);
+    if (ExpectedCid != 0) {
+        if (acpi[1] != 0x02U || acpi_length != 19U ||
+            graphics_get_u32(acpi + 4U) != ExpectedHid ||
+            (ExpectedUid != ACPI_UID_ANY &&
+             graphics_get_u32(acpi + 8U) != ExpectedUid) ||
+            graphics_get_u32(acpi + 12U) != ExpectedCid ||
+            acpi[16] != 0 || acpi[17] != 0 || acpi[18] != 0) {
+            return 0;
+        }
+    } else if (acpi[1] != 0x01U || acpi_length != 12U ||
+               graphics_get_u32(acpi + 4U) != ExpectedHid ||
+               (ExpectedUid != ACPI_UID_ANY &&
+                graphics_get_u32(acpi + 8U) != ExpectedUid)) {
+        return 0;
+    }
+    return pci[4] == 0 && pci[5] == ExpectedDevice;
+}
+
+static BOOLEAN graphics_find_vga_roots(
+    EFI_BOOT_SERVICES *BootServices, VOID *DevicePath, UINTN Segment,
+    UINTN Bus, GRAPHICS_ROOT_SET *Roots, EFI_STATUS *Result)
+{
+    EFI_HANDLE *handles = NULL;
+    EFI_HANDLE owner_handle = NULL;
+    VOID *remaining = DevicePath;
+    UINT8 *pci_node;
+    UINTN count = 0;
+    UINTN i;
+    UINTN owner_count = 0;
+    UINTN bus_match_count = 0;
+    EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *bus_root = NULL;
+    EFI_STATUS status = EFI_DEVICE_ERROR;
+    BOOLEAN valid = 0;
+
+    if (Result == NULL) {
+        return 0;
+    }
+    if (BootServices == NULL || Roots == NULL) {
+        *Result = EFI_INVALID_PARAMETER;
+        return 0;
+    }
+    Roots->Count = 0;
+    Roots->Owner = NULL;
+    for (i = 0; i < GRAPHICS_ROOT_MAX; i++) {
+        Roots->Root[i].Protocol = NULL;
+        Roots->Root[i].Owner = 0;
+    }
+    pci_node = graphics_pci_path_node(DevicePath);
+    if (BootServices->LocateDevicePath == NULL ||
+        BootServices->LocateHandleBuffer == NULL ||
+        BootServices->HandleProtocol == NULL ||
+        BootServices->FreePool == NULL || pci_node == NULL) {
+        status = EFI_UNSUPPORTED;
+        goto out;
+    }
+    status = BootServices->LocateDevicePath(
+        pci_root_guid, &remaining, &owner_handle);
+    if (status != EFI_SUCCESS || owner_handle == NULL ||
+        remaining != (VOID *)pci_node) {
+        if (status == EFI_SUCCESS) {
+            status = EFI_DEVICE_ERROR;
+        }
+        goto out;
+    }
+    status = BootServices->LocateHandleBuffer(
+        EFI_LOCATE_BY_PROTOCOL, pci_root_guid, NULL, &count, &handles);
+    if (status != EFI_SUCCESS || handles == NULL || count == 0 ||
+        count > GRAPHICS_ROOT_MAX) {
+        if (status == EFI_SUCCESS) {
+            status = EFI_DEVICE_ERROR;
+        }
+        goto out;
+    }
+    for (i = 0; i < count; i++) {
+        EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *root = NULL;
+        UINTN j;
+
+        status = BootServices->HandleProtocol(
+            handles[i], pci_root_guid, (VOID **)&root);
+        if (status != EFI_SUCCESS || root == NULL) {
+            goto out;
+        }
+        for (j = 0; j < i; j++) {
+            if (Roots->Root[j].Protocol == root) {
+                status = EFI_DEVICE_ERROR;
+                goto out;
+            }
+        }
+        Roots->Root[i].Protocol = root;
+        status = graphics_root_configuration(
+            root, &Roots->Root[i].Resources);
+        if (status != EFI_SUCCESS) {
+            goto out;
+        }
+        Roots->Root[i].Owner = handles[i] == owner_handle;
+        if (Roots->Root[i].Owner) {
+            owner_count++;
+            Roots->Owner = root;
+        }
+        if ((UINTN)root->SegmentNumber == Segment &&
+            (UINT64)Bus >= Roots->Root[i].Resources.BusMinimum &&
+            (UINT64)Bus <= Roots->Root[i].Resources.BusMaximum) {
+            bus_match_count++;
+            bus_root = root;
+        }
+    }
+    Roots->Count = count;
+    valid = owner_count == 1U && bus_match_count == 1U &&
+        Roots->Owner == bus_root;
+    status = valid ? EFI_SUCCESS : EFI_DEVICE_ERROR;
+
+out:
+    if (handles != NULL && BootServices->FreePool(handles) != EFI_SUCCESS) {
+        valid = 0;
+        status = EFI_DEVICE_ERROR;
+    }
+    *Result = status;
+    return valid;
+}
+
+static BOOLEAN graphics_controller_paths_valid(
+    EFI_BOOT_SERVICES *BootServices, EFI_STATUS *Result)
+{
+    EFI_HANDLE *handles = NULL;
+    UINTN count = 0;
+    UINTN found = 0;
+    UINTN i;
+    EFI_STATUS status;
+    BOOLEAN valid = 0;
+
+    if (BootServices == NULL || Result == NULL ||
+        BootServices->LocateHandleBuffer == NULL ||
+        BootServices->HandleProtocol == NULL ||
+        BootServices->LocateDevicePath == NULL ||
+        BootServices->FreePool == NULL) {
+        if (Result != NULL) {
+            *Result = EFI_UNSUPPORTED;
+        }
+        return 0;
+    }
+    status = BootServices->LocateHandleBuffer(
+        EFI_LOCATE_BY_PROTOCOL, pci_io_guid, NULL, &count, &handles);
+    if (status != EFI_SUCCESS || handles == NULL) {
+        goto out;
+    }
+    for (i = 0; i < count; i++) {
+        EFI_PCI_IO_PROTOCOL *pci = NULL;
+        EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *root = NULL;
+        GRAPHICS_ROOT_RESOURCES resources;
+        EFI_HANDLE root_handle = NULL;
+        VOID *path = NULL;
+        VOID *remaining;
+        UINT8 *pci_node;
+        UINTN segment;
+        UINTN bus;
+        UINTN device;
+        UINTN function;
+        UINT32 identifier;
+
+        status = BootServices->HandleProtocol(
+            handles[i], pci_io_guid, (VOID **)&pci);
+        if (status != EFI_SUCCESS || pci == NULL || pci->Pci.Read == NULL ||
+            pci->GetLocation == NULL) {
+            goto out;
+        }
+        status = pci->Pci.Read(
+            pci, EfiPciWidthUint32, 0, 1, &identifier);
+        if (status != EFI_SUCCESS) {
+            goto out;
+        }
+        if (identifier != NEC_OHCI_ID) {
+            continue;
+        }
+        found++;
+        status = pci->GetLocation(
+            pci, &segment, &bus, &device, &function);
+        if (status == EFI_SUCCESS) {
+            status = BootServices->HandleProtocol(
+                handles[i], device_path_guid, &path);
+        }
+        pci_node = graphics_pci_path_node(path);
+        if (status != EFI_SUCCESS || pci_node == NULL ||
+            !graphics_device_path_valid(
+                path, ACPI_HID_HWP0002, ACPI_UID_ANY,
+                ACPI_HID_PNP0A03, (UINT8)device) ||
+            pci_node[4] != (UINT8)function) {
+            status = EFI_DEVICE_ERROR;
+            goto out;
+        }
+        remaining = path;
+        status = BootServices->LocateDevicePath(
+            pci_root_guid, &remaining, &root_handle);
+        if (status == EFI_SUCCESS && remaining == (VOID *)pci_node) {
+            status = BootServices->HandleProtocol(
+                root_handle, pci_root_guid, (VOID **)&root);
+        } else if (status == EFI_SUCCESS) {
+            status = EFI_DEVICE_ERROR;
+        }
+        if (status == EFI_SUCCESS) {
+            status = graphics_root_configuration(root, &resources);
+        }
+        if (status != EFI_SUCCESS || root == NULL ||
+            root->SegmentNumber != (UINT32)segment ||
+            (UINT64)bus < resources.BusMinimum ||
+            (UINT64)bus > resources.BusMaximum) {
+            status = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
+            goto out;
+        }
+    }
+    valid = found == 1U;
+    status = valid ? EFI_SUCCESS : EFI_NOT_FOUND;
+
+out:
+    if (handles != NULL && BootServices->FreePool(handles) != EFI_SUCCESS) {
+        valid = 0;
+        status = EFI_DEVICE_ERROR;
+    }
+    *Result = status;
+    return valid;
+}
+
+static BOOLEAN graphics_root_vga_attributes_valid(
+    const GRAPHICS_ROOT_SET *Roots, EFI_STATUS *Result)
+{
+    UINTN i;
+    EFI_STATUS status = EFI_SUCCESS;
+
+    if (Roots == NULL || Roots->Count == 0 || Roots->Owner == NULL) {
+        *Result = EFI_UNSUPPORTED;
+        return 0;
+    }
+    for (i = 0; i < Roots->Count; i++) {
+        EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *root = Roots->Root[i].Protocol;
+        UINT64 supported = 0;
+        UINT64 attributes = 0;
+        UINT64 expected = Roots->Root[i].Owner ?
+            EFI_PCI_ATTRIBUTE_VGA_DECODE : 0;
+
+        if (root == NULL || root->GetAttributes == NULL) {
+            status = EFI_UNSUPPORTED;
+            break;
+        }
+        status = root->GetAttributes(root, &supported, &attributes);
+        if (status != EFI_SUCCESS) {
+            break;
+        }
+        if ((supported & EFI_PCI_ATTRIBUTE_VGA_ALL) != expected ||
+            (attributes & EFI_PCI_ATTRIBUTE_VGA_ALL) != expected) {
+            status = EFI_DEVICE_ERROR;
+            break;
+        }
+    }
+    *Result = status;
+    return status == EFI_SUCCESS;
+}
+
+static BOOLEAN graphics_vga_root_resources_valid(
+    const GRAPHICS_ROOT_SET *Roots, EFI_STATUS *Result)
+{
+    UINTN i;
+
+    if (Roots == NULL || Roots->Count == 0 || Roots->Owner == NULL) {
+        *Result = EFI_UNSUPPORTED;
+        return 0;
+    }
+    for (i = 0; i < Roots->Count; i++) {
+        UINTN expected = Roots->Root[i].Owner ? 1U : 0U;
+
+        if (Roots->Root[i].Resources.LegacyIoCount != expected ||
+            Roots->Root[i].Resources.LegacyMemoryCount != expected) {
+            *Result = EFI_DEVICE_ERROR;
+            return 0;
+        }
+    }
+    *Result = EFI_SUCCESS;
+    return 1;
+}
+
+static BOOLEAN graphics_pci_vga_passthrough_valid(
+    EFI_PCI_IO_PROTOCOL *Pci, EFI_STATUS *Result)
+{
+    static const UINT64 memory_address[] = {
+        VGA_LEGACY_BASE,
+        VGA_ROM_BASE,
+    };
+    static const UINT64 io_address[] = {
+        VGA_DECODE_IO_BASE,
+        VGA_COLOR_IO_BASE,
+    };
+    UINT8 value = 0;
+    UINTN i;
+    EFI_STATUS status = EFI_SUCCESS;
+
+    if (Pci->Mem.Read == NULL || Pci->Io.Read == NULL) {
+        *Result = EFI_UNSUPPORTED;
+        return 0;
+    }
+    for (i = 0; status == EFI_SUCCESS &&
+         i < sizeof(memory_address) / sizeof(memory_address[0]); i++) {
+        status = Pci->Mem.Read(Pci, EfiPciWidthUint8,
+                               EFI_PCI_IO_PASS_THROUGH_BAR,
+                               memory_address[i], 1, &value);
+    }
+    for (i = 0; status == EFI_SUCCESS &&
+         i < sizeof(io_address) / sizeof(io_address[0]); i++) {
+        status = Pci->Io.Read(Pci, EfiPciWidthUint8,
+                              EFI_PCI_IO_PASS_THROUGH_BAR,
+                              io_address[i], 1, &value);
+    }
+    *Result = status;
+    return status == EFI_SUCCESS;
+}
+
 static BOOLEAN graphics_pci_bars_valid(EFI_BOOT_SERVICES *BootServices,
                                        EFI_PCI_IO_PROTOCOL *Pci,
+                                       UINT32 Identifier,
                                        EFI_STATUS *Result)
 {
     UINT32 io_value = 0;
@@ -311,6 +839,46 @@ static BOOLEAN graphics_pci_bars_valid(EFI_BOOT_SERVICES *BootServices,
         Pci->GetBarAttributes == NULL) {
         *Result = EFI_UNSUPPORTED;
         return 0;
+    }
+    if (Identifier == NVIDIA_QUADRO2_ID) {
+        status = Pci->Mem.Read(Pci, EfiPciWidthUint32, 0, 0, 1,
+                               &memory_value);
+        if (status == EFI_SUCCESS) {
+            status = Pci->Mem.Read(Pci, EfiPciWidthUint32, 1, 0, 1,
+                                   &io_value);
+        }
+        if (status != EFI_SUCCESS) {
+            *Result = status;
+            return 0;
+        }
+        status = Pci->GetBarAttributes(Pci, 0, &supports, &resources);
+        if (status != EFI_SUCCESS ||
+            supports != EFI_PCI_ATTRIBUTE_MEMORY || resources == NULL) {
+            if (resources != NULL) {
+                (void)BootServices->FreePool(resources);
+            }
+            *Result = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
+            return 0;
+        }
+        status = BootServices->FreePool(resources);
+        resources = NULL;
+        if (status != EFI_SUCCESS) {
+            *Result = status;
+            return 0;
+        }
+        supports = 0;
+        status = Pci->GetBarAttributes(Pci, 1, &supports, &resources);
+        if (status != EFI_SUCCESS ||
+            supports != EFI_PCI_ATTRIBUTE_MEMORY || resources == NULL) {
+            if (resources != NULL) {
+                (void)BootServices->FreePool(resources);
+            }
+            *Result = status == EFI_SUCCESS ? EFI_DEVICE_ERROR : status;
+            return 0;
+        }
+        status = BootServices->FreePool(resources);
+        *Result = status;
+        return status == EFI_SUCCESS;
     }
     status = Pci->Io.Read(Pci, EfiPciWidthUint32, 1, 0, 1, &io_value);
     if (status == EFI_SUCCESS) {
@@ -554,7 +1122,7 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     EFI_GRAPHICS_OUTPUT_PROTOCOL *gop = NULL;
     EFI_UGA_DRAW_PROTOCOL *uga = NULL;
     EFI_PCI_IO_PROTOCOL *pci = NULL;
-    GRAPHICS_DEVICE_PATH *path = NULL;
+    VOID *path = NULL;
     EFI_GRAPHICS_OUTPUT_MODE_INFORMATION *info = NULL;
     UINTN info_size = 0;
     UINTN handle_count = 0;
@@ -564,13 +1132,16 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     UINTN function = ~(UINTN)0;
     UINTN expected_bus = ~(UINTN)0;
     UINTN expected_device = ~(UINTN)0;
+    UINT8 framebuffer_bar = 0;
     UINT32 identifier = 0;
     UINT32 expected_hid = 0;
     UINT32 expected_uid = 0;
+    UINT32 expected_cid = 0;
     UINT64 framebuffer = 0;
     UINT32 written = 0x00112233U;
     UINT32 readback = 0;
     EFI_GRAPHICS_OUTPUT_BLT_PIXEL pixel = { 0x66, 0x55, 0x44, 0 };
+    GRAPHICS_ROOT_SET vga_roots;
     EFI_STATUS status;
     BOOLEAN protocols_ready;
     BOOLEAN operation_valid;
@@ -616,13 +1187,21 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
             framebuffer = ZX6000_FRAMEBUFFER;
             expected_bus = 0x80;
             expected_device = 0;
-            expected_hid = ACPI_HID_HWP0002;
+            expected_hid = ACPI_HID_HWP0003;
             expected_uid = 0x400;
+            expected_cid = ACPI_HID_PNP0A03;
         } else if (identifier == ATI_RAGE128_ID) {
-            framebuffer = I2000_FRAMEBUFFER;
+            framebuffer = I2000_ATI_FRAMEBUFFER;
             expected_bus = 0;
             expected_device = 5;
             expected_hid = ACPI_HID_PNP0A03;
+        } else if (identifier == NVIDIA_QUADRO2_ID) {
+            framebuffer = I2000_QUADRO2_FRAMEBUFFER;
+            framebuffer_bar = 1;
+            expected_bus = 3;
+            expected_device = 0;
+            expected_hid = ACPI_HID_PNP0A03;
+            expected_uid = 3;
         }
     }
     ia64_test_check(
@@ -644,21 +1223,55 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
     ia64_test_check(&context, "pci-attributes", operation_valid,
                     status, "bus-master-command");
 
+    if (identifier == ATI_RV100_ID) {
+        EFI_STATUS root_status;
+        BOOLEAN roots_ready;
+
+        status = protocols_ready ? EFI_SUCCESS : EFI_NOT_FOUND;
+        operation_valid = protocols_ready &&
+            graphics_pci_vga_attributes_valid(pci, &status);
+        ia64_test_check(&context, "pci-vga-attributes", operation_valid,
+                        status, "vga-memory-io16");
+
+        root_status = protocols_ready ? EFI_SUCCESS : EFI_NOT_FOUND;
+        roots_ready = protocols_ready && graphics_find_vga_roots(
+            boot_services, path, segment, bus, &vga_roots, &root_status);
+        status = root_status;
+        operation_valid = roots_ready &&
+            graphics_root_vga_attributes_valid(&vga_roots, &status);
+        ia64_test_check(&context, "pci-vga-root-attributes", operation_valid,
+                        status, "owner-and-all-nonowners");
+
+        status = roots_ready ? EFI_SUCCESS : root_status;
+        operation_valid = roots_ready &&
+            graphics_vga_root_resources_valid(&vga_roots, &status);
+        ia64_test_check(&context, "pci-vga-root-resources", operation_valid,
+                        status, "legacy-owner-all-nonowners");
+
+        status = protocols_ready ? EFI_SUCCESS : EFI_NOT_FOUND;
+        operation_valid = protocols_ready &&
+            graphics_controller_paths_valid(boot_services, &status);
+        ia64_test_check(&context, "pci-controller-paths", operation_valid,
+                        status, "expanded-root-prefix");
+
+        status = protocols_ready ? EFI_SUCCESS : EFI_NOT_FOUND;
+        operation_valid = protocols_ready &&
+            graphics_pci_vga_passthrough_valid(pci, &status);
+        ia64_test_check(&context, "pci-vga-passthrough", operation_valid,
+                        status, "memory-rom-io-read");
+    }
+
     status = protocols_ready ? EFI_SUCCESS : EFI_NOT_FOUND;
     operation_valid = protocols_ready &&
-        graphics_pci_bars_valid(boot_services, pci, &status);
+        graphics_pci_bars_valid(boot_services, pci, identifier, &status);
     ia64_test_check(&context, "pci-bars", operation_valid,
                     status, "io-bar1-memory-bar2");
 
     ia64_test_check(
         &context, "device-path",
-        protocols_ready && path->Acpi.Type == 0x02 &&
-            path->Acpi.SubType == 0x01 && path->Acpi.Length == 12 &&
-            path->Hid == expected_hid && path->Uid == expected_uid &&
-            path->Pci.Type == 0x01 && path->Pci.SubType == 0x01 &&
-            path->Pci.Length == 6 && path->Function == 0 &&
-            path->Device == expected_device && path->End.Type == 0x7f &&
-            path->End.SubType == 0xff && path->End.Length == 4,
+        protocols_ready && graphics_device_path_valid(
+            path, expected_hid, expected_uid, expected_cid,
+            (UINT8)expected_device),
         EFI_DEVICE_ERROR, "acpi-pci-path");
 
     status = protocols_ready && gop->QueryMode != NULL ?
@@ -694,10 +1307,12 @@ EFI_STATUS efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable)
 
     status = protocols_ready && framebuffer != 0 && pci->Mem.Write != NULL &&
              pci->Mem.Read != NULL && gop->Blt != NULL ?
-        pci->Mem.Write(pci, EfiPciWidthUint32, 0, 0, 1, &written) :
+        pci->Mem.Write(pci, EfiPciWidthUint32, framebuffer_bar,
+                       0, 1, &written) :
         EFI_NOT_FOUND;
     if (status == EFI_SUCCESS) {
-        status = pci->Mem.Read(pci, EfiPciWidthUint32, 0, 0, 1, &readback);
+        status = pci->Mem.Read(pci, EfiPciWidthUint32, framebuffer_bar,
+                               0, 1, &readback);
     }
     if (status == EFI_SUCCESS) {
         status = gop->Blt(gop, &pixel, EfiBltVideoFill,

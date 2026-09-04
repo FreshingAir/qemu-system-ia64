@@ -38,7 +38,7 @@
 #define I82559_PCI_BUS 0U
 #define I82559_MMIO_BASE UINT32_C(0x90010000)
 #define I82559_IO_BASE UINT32_C(0x00001000)
-#define I82559_FLASH_BASE UINT32_C(0x90020000)
+#define I82559_FLASH_BASE UINT32_C(0x90100000)
 
 #define E100_SCB_ACK 0x01
 #define E100_SCB_STATUS 0x00
@@ -46,6 +46,7 @@
 #define E100_SCB_INTMASK 0x03
 #define E100_SCB_POINTER 0x04
 #define E100_SCB_PORT 0x08
+#define E100_SCB_FLASH 0x0c
 #define E100_SCB_EEPROM 0x0e
 #define E100_SCB_MDI 0x10
 #define E100_SWI_REQUEST BIT(1)
@@ -83,12 +84,14 @@
 #define E100_TEST_MCAST_CB UINT64_C(0x00501000)
 #define E100_TEST_SUSPEND_CB UINT64_C(0x00502000)
 #define E100_TEST_MIG_TX_CB UINT64_C(0x00502100)
+#define E100_TEST_MIG_POISON_CB UINT64_C(0x00502200)
 #define E100_TEST_RX_RFD UINT64_C(0x00503000)
 #define E100_TEST_RESET_RFD UINT64_C(0x00504000)
 #define E100_MDI_READY BIT(28)
 #define E100_MDI_OPCODE_READ (2U << 26)
 #define E100_MDI_PHY_1 (1U << 21)
-#define E100_MDI_BMSR (1U << 16)
+#define E100_MDI_BMSR 1U
+#define E100_MDI_VENDOR_REGISTER 16U
 #define E100_MII_BMSR_LINK_STATUS 0x0004U
 #define E100_MII_BMSR_AUTONEG_COMPLETE 0x0020U
 
@@ -510,12 +513,16 @@ static void io_test_i82559_eeprom_clock_out(QTestState *qts, bool bit)
 
 static bool io_test_i82559_eeprom_clock_in(QTestState *qts)
 {
+    uint32_t combined;
     bool bit;
 
     io_test_i82559_eeprom_set_lines(qts, E100_EEPROM_CS);
     io_test_i82559_eeprom_set_lines(qts, E100_EEPROM_CS | E100_EEPROM_SK);
+    combined = qtest_readl(qts, I82559_MMIO_BASE + E100_SCB_FLASH);
     bit = qtest_readw(qts, I82559_MMIO_BASE + E100_SCB_EEPROM) &
           E100_EEPROM_DO;
+    g_assert_cmphex((combined >> 16) & E100_EEPROM_DO, ==,
+                    bit ? E100_EEPROM_DO : 0);
     io_test_i82559_eeprom_set_lines(qts, E100_EEPROM_CS);
     return bit;
 }
@@ -598,11 +605,12 @@ static uint16_t io_test_i82559_eeprom_checksum(QTestState *qts)
     return sum & UINT16_MAX;
 }
 
-static uint16_t io_test_i82559_read_bmsr(QTestState *qts)
+static uint16_t io_test_i82559_read_mdi(QTestState *qts, unsigned reg)
 {
     uint32_t mdi = E100_MDI_OPCODE_READ | E100_MDI_PHY_1 |
-                   E100_MDI_BMSR;
+                   (reg << 16);
 
+    g_assert_cmpuint(reg, <, 32);
     qtest_writel(qts, I82559_MMIO_BASE + E100_SCB_MDI, mdi);
     mdi = qtest_readl(qts, I82559_MMIO_BASE + E100_SCB_MDI);
     g_assert_cmphex(mdi & E100_MDI_READY, ==, E100_MDI_READY);
@@ -763,8 +771,7 @@ static void test_i82559(void)
     io_test_i82559_config_writew(qts, PCI_COMMAND, 0);
     io_test_i82559_config_writel(qts, PCI_BASE_ADDRESS_0, UINT32_MAX);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_0), ==,
-                    ~(IA64_I2000_IO_TEST_I82559_MMIO_BAR_SIZE - 1) |
-                    PCI_BASE_ADDRESS_MEM_PREFETCH);
+                    ~(IA64_I2000_IO_TEST_I82559_MMIO_BAR_SIZE - 1));
     io_test_i82559_config_writel(qts, PCI_BASE_ADDRESS_1, UINT32_MAX);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_1), ==,
                     ~(IA64_I2000_IO_TEST_I82559_IO_BAR_SIZE - 1) |
@@ -779,7 +786,7 @@ static void test_i82559(void)
 
     io_test_i82559_program_bars(qts);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_0), ==,
-                    I82559_MMIO_BASE | PCI_BASE_ADDRESS_MEM_PREFETCH);
+                    I82559_MMIO_BASE);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_1), ==,
                     I82559_IO_BASE | PCI_BASE_ADDRESS_SPACE_IO);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_2), ==,
@@ -790,7 +797,7 @@ static void test_i82559(void)
                     PCI_COMMAND_IO | PCI_COMMAND_MEMORY |
                     PCI_COMMAND_MASTER);
 
-    g_assert_cmphex(io_test_i82559_read_bmsr(qts) &
+    g_assert_cmphex(io_test_i82559_read_mdi(qts, E100_MDI_BMSR) &
                     (E100_MII_BMSR_LINK_STATUS |
                      E100_MII_BMSR_AUTONEG_COMPLETE), ==,
                     E100_MII_BMSR_LINK_STATUS |
@@ -798,25 +805,27 @@ static void test_i82559(void)
     qtest_qmp_assert_success(
         qts, "{'execute':'set_link','arguments':"
              "{'name':'i82559c.0','up':false}}");
-    g_assert_cmphex(io_test_i82559_read_bmsr(qts) &
+    g_assert_cmphex(io_test_i82559_read_mdi(qts, E100_MDI_BMSR) &
                     (E100_MII_BMSR_LINK_STATUS |
                      E100_MII_BMSR_AUTONEG_COMPLETE), ==, 0);
 
     /* A device reset must preserve the externally selected backend link. */
     qtest_system_reset(qts);
     io_test_i82559_program_bars(qts);
-    g_assert_cmphex(io_test_i82559_read_bmsr(qts) &
+    g_assert_cmphex(io_test_i82559_read_mdi(qts, E100_MDI_BMSR) &
                     (E100_MII_BMSR_LINK_STATUS |
                      E100_MII_BMSR_AUTONEG_COMPLETE), ==, 0);
 
     qtest_qmp_assert_success(
         qts, "{'execute':'set_link','arguments':"
              "{'name':'i82559c.0','up':true}}");
-    g_assert_cmphex(io_test_i82559_read_bmsr(qts) &
+    g_assert_cmphex(io_test_i82559_read_mdi(qts, E100_MDI_BMSR) &
                     (E100_MII_BMSR_LINK_STATUS |
                      E100_MII_BMSR_AUTONEG_COMPLETE), ==,
                     E100_MII_BMSR_LINK_STATUS |
                     E100_MII_BMSR_AUTONEG_COMPLETE);
+    g_assert_cmphex(io_test_i82559_read_mdi(
+                        qts, E100_MDI_VENDOR_REGISTER), ==, 0x0003);
 
     g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 0), ==,
                     IA64_I2000_IO_TEST_I82559_MAC_WORD0);
@@ -824,6 +833,18 @@ static void test_i82559(void)
                     IA64_I2000_IO_TEST_I82559_MAC_WORD1);
     g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 2), ==,
                     IA64_I2000_IO_TEST_I82559_MAC_WORD2);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 3), ==,
+                    IA64_I2000_IO_TEST_I82559_EEPROM_COMPATIBILITY);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 5), ==,
+                    IA64_I2000_IO_TEST_I82559_EEPROM_CONTROLLER);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 6), ==,
+                    IA64_I2000_IO_TEST_I82559_EEPROM_PHY);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 0x0a), ==,
+                    IA64_I2000_IO_TEST_I82559_EEPROM_ID);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 0x0b), ==,
+                    IA64_I2000_IO_TEST_I82559_SUBSYSTEM_ID);
+    g_assert_cmphex(io_test_i82559_eeprom_read_word(qts, 0x0c), ==,
+                    IA64_I2000_IO_TEST_I82559_SUBSYSTEM_VENDOR_ID);
     g_assert_cmphex(io_test_i82559_eeprom_checksum(qts), ==,
                     IA64_I2000_IO_TEST_I82559_EEPROM_CHECKSUM);
 
@@ -1250,7 +1271,7 @@ static void test_io_test_migration(void)
 
     /* PCI decode, EEPROM contents, and the asserted SWI all migrate. */
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_0), ==,
-                    I82559_MMIO_BASE | PCI_BASE_ADDRESS_MEM_PREFETCH);
+                    I82559_MMIO_BASE);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_1), ==,
                     I82559_IO_BASE | PCI_BASE_ADDRESS_SPACE_IO);
     g_assert_cmphex(io_test_i82559_config_readl(qts, PCI_BASE_ADDRESS_2), ==,
@@ -1397,8 +1418,16 @@ static void test_i82559_traffic_migration(void)
     io_test_i82559_assert_irq_state(qts, E100_ACK_CNA);
     io_test_i82559_ack_irq(qts, E100_ACK_CNA);
 
+    /* Migration preserves the saved link instead of rereading the CB. */
+    qtest_memset(qts, E100_TEST_MIG_POISON_CB, 0,
+                 E100_CB_PAYLOAD_OFFSET);
+    qtest_writew(qts, E100_TEST_MIG_POISON_CB + 2, E100_CB_COMMAND_S);
+    qtest_writel(qts, E100_TEST_SUSPEND_CB + E100_CB_LINK_OFFSET,
+                 E100_TEST_MIG_POISON_CB);
+    qtest_writew(qts, E100_TEST_SUSPEND_CB + 2, 0);
     qtest_writeb(qts, I82559_MMIO_BASE + E100_SCB_COMMAND,
                  E100_CU_RESUME);
+    g_assert_cmphex(qtest_readw(qts, E100_TEST_MIG_POISON_CB), ==, 0);
     status = io_test_i82559_wait_descriptor(qts, E100_TEST_MIG_TX_CB);
     g_assert_cmphex(status, ==, E100_CB_STATUS_COMPLETE);
     io_test_i82559_assert_irq_state(qts, E100_ACK_CX | E100_ACK_CNA);

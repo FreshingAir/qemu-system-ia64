@@ -139,9 +139,6 @@ uint64_t ia64_memory_cmpxchg(CPUIA64State *env, uint64_t addr,
         } else {
             old = ia64_exec_load_data(env, addr, 1, false, ra);
         }
-        if (old == cmp) {
-            ia64_invalidate_alat_store(env, addr, size);
-        }
         return old;
     case 2:
         if (cmp_representable) {
@@ -152,9 +149,6 @@ uint64_t ia64_memory_cmpxchg(CPUIA64State *env, uint64_t addr,
                                     ia64_data_big_endian(env), oi, ra);
         } else {
             old = ia64_lduw_data_ra(env, addr, ra);
-        }
-        if (old == cmp) {
-            ia64_invalidate_alat_store(env, addr, size);
         }
         return old;
     case 4:
@@ -167,9 +161,6 @@ uint64_t ia64_memory_cmpxchg(CPUIA64State *env, uint64_t addr,
         } else {
             old = ia64_ldl_data_ra(env, addr, ra);
         }
-        if (old == cmp) {
-            ia64_invalidate_alat_store(env, addr, size);
-        }
         return old;
     case 8: {
         MemOpIdx oi = make_memop_idx(ia64_runtime_data_memop(env, MO_LEUQ),
@@ -177,9 +168,6 @@ uint64_t ia64_memory_cmpxchg(CPUIA64State *env, uint64_t addr,
 
         old = ia64_exec_cmpxchg(env, addr, cmp, val, 8,
                                 ia64_data_big_endian(env), oi, ra);
-        if (old == cmp) {
-            ia64_invalidate_alat_store(env, addr, size);
-        }
         return old;
     }
     default:
@@ -219,9 +207,8 @@ uint64_t ia64_memory_cmp8xchg16(CPUIA64State *env, uint64_t addr,
                 return old;
             }
             observed = ia64_exec_cmpxchg_16(env, base, expected, desired,
-                                            big_endian, oi, ra);
+                                            big_endian, 16, oi, ra);
             if (int128_eq(observed, expected)) {
-                ia64_invalidate_alat_store(env, base, 16);
                 return old;
             }
         }
@@ -234,7 +221,6 @@ uint64_t ia64_memory_cmp8xchg16(CPUIA64State *env, uint64_t addr,
     if (old == cmp) {
         ia64_stq_data_ra(env, base, val, ra);
         ia64_stq_data_ra(env, base + 8, csd, ra);
-        ia64_invalidate_alat_store(env, base, 16);
     }
     return old;
 }

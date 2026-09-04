@@ -49,11 +49,11 @@ static void test_fixed_layout(void)
     g_assert_cmphex(layout.roots[2].pci_mmio32_base, ==,
                     UINT64_C(0xb0000000));
     g_assert_cmpuint(layout.roots[0].first_bus, ==, 0x00);
-    g_assert_cmpuint(layout.roots[0].last_bus, ==, 0x1f);
-    g_assert_cmpuint(layout.roots[1].first_bus, ==, 0x20);
-    g_assert_cmpuint(layout.roots[1].last_bus, ==, 0x3f);
-    g_assert_cmpuint(layout.roots[2].first_bus, ==, 0x40);
-    g_assert_cmpuint(layout.roots[2].last_bus, ==, 0x5f);
+    g_assert_cmpuint(layout.roots[0].last_bus, ==, 0x00);
+    g_assert_cmpuint(layout.roots[1].first_bus, ==, 0x01);
+    g_assert_cmpuint(layout.roots[1].last_bus, ==, 0x01);
+    g_assert_cmpuint(layout.roots[2].first_bus, ==, 0x02);
+    g_assert_cmpuint(layout.roots[2].last_bus, ==, 0x02);
     g_assert_cmpuint(layout.roots[0].io_base, ==, 0x0000);
     g_assert_cmpuint(layout.roots[1].io_base, ==, 0x4000);
     g_assert_cmpuint(layout.roots[2].io_base, ==, 0x8000);
@@ -76,10 +76,9 @@ static void test_fixed_layout(void)
                     UINT64_C(0x0000000ffc000000));
     g_assert_cmphex(layout.cf8_pa, ==, UINT64_C(0x0000000ffc33ecf8));
     g_assert_cmphex(layout.cfc_pa, ==, UINT64_C(0x0000000ffc33fcfc));
-    g_assert_cmphex(layout.roots[0].dma_base, ==, UINT64_C(0x00302000));
-    g_assert_cmphex(layout.roots[0].dma_size, ==, UINT64_C(0x7fcfe000));
-    g_assert_cmphex(layout.roots[0].dma_target_offset, ==,
-                    UINT64_C(0x00302000));
+    g_assert_cmphex(layout.roots[0].dma_base, ==, 0);
+    g_assert_cmphex(layout.roots[0].dma_size, ==, UINT64_C(0x80000000));
+    g_assert_cmphex(layout.roots[0].dma_target_offset, ==, 0);
     g_assert_cmpuint(layout.cbn, ==, 0xff);
     g_assert_cmphex(layout.chipset_present, ==, 0);
     g_assert_cmpuint(layout.pid_id, ==, 0);
@@ -221,7 +220,7 @@ static void test_root_apertures(void)
     assert_invalid(&layout);
 
     layout = fixture_layout();
-    layout.roots[0].dma_target_offset = 0;
+    layout.roots[0].dma_target_offset++;
     assert_invalid(&layout);
 }
 

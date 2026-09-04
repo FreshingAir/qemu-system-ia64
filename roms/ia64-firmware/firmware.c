@@ -101,6 +101,8 @@
 #define PCI_VGA_STD_FB_SIZE           0x01000000ULL
 #define PCI_NEC_OHCI_ID               0x00351033U
 #define PCI_NEC_OHCI_MMIO_SIZE        0x00001000ULL
+#define PCI_82468GX_UHCI_ID            0x76028086U
+#define PCI_82468GX_UHCI_IO_SIZE       0x20U
 #define VGA_FB_BASE                   ((UINT64)PCI_VGA_FB_BAR)
 #define VGA_MMIO_BASE                 ((UINT64)PCI_VGA_MMIO_BAR)
 #define ACPI_RECLAIM_BASE 0x0000000000800000ULL
@@ -241,6 +243,7 @@
 #define VGA_AR_ENABLE_DISPLAY         0x20U
 #define VGA_LEGACY_FB_BASE            0x00000000000a0000ULL
 #define VGA_LEGACY_FB_SIZE            0x00020000ULL
+#define VGA_LEGACY_MEMORY_SIZE        0x00060000ULL
 #define VGA_TEXT_FB_BASE              (VGA_LEGACY_FB_BASE + 0x18000ULL)
 #define VBE_DISPI_INDEX_ID            0x0U
 #define VBE_DISPI_INDEX_XRES          0x1U
@@ -1757,7 +1760,7 @@ typedef struct {
 } __attribute__((packed)) FW_PCI_ROOT_BRIDGE_RESOURCES;
 
 typedef struct {
-    ACPI_QWORD_ADDRESS_DESCRIPTOR Address[4];
+    ACPI_QWORD_ADDRESS_DESCRIPTOR Address[9];
     ACPI_END_TAG_DESCRIPTOR End;
 } __attribute__((packed)) FW_PCI_ROOT_CONFIGURATION;
 
@@ -1880,7 +1883,7 @@ FW_STATIC_ASSERT(sizeof(ACPI_QWORD_ADDRESS_DESCRIPTOR) == 46,
                  acpi_qword_address_descriptor_size);
 FW_STATIC_ASSERT(sizeof(FW_PCI_ROOT_BRIDGE_RESOURCES) == 140,
                  pci_root_bridge_resources_size);
-FW_STATIC_ASSERT(sizeof(FW_PCI_ROOT_CONFIGURATION) == 186,
+FW_STATIC_ASSERT(sizeof(FW_PCI_ROOT_CONFIGURATION) == 416,
                  pci_root_configuration_size);
 FW_STATIC_ASSERT(sizeof(FW_PCI_HOST_RESOURCES) == 140,
                  pci_host_resources_size);
@@ -2598,7 +2601,7 @@ static BOOLEAN fw_platform_zx1_io_sapic_embedded(
 {
     UINTN i;
 
-    if (Descriptor->PlatformId != IA64_PLATFORM_ID_HP_ZX6000) {
+    if (!ia64_platform_is_hp_zx(Descriptor->PlatformId)) {
         return 0;
     }
     for (i = 0; i < Descriptor->PciRootCount; i++) {
@@ -2618,6 +2621,7 @@ static BOOLEAN fw_platform_root_config_io_sapics_valid(
     const IA64PlatformDescriptor *Descriptor,
     const IA64PlatformPciRoot *Root)
 {
+    BOOLEAN hp_zx = ia64_platform_is_hp_zx(Descriptor->PlatformId);
     UINTN i;
 
     for (i = 0; i < Descriptor->IoSapicCount; i++) {
@@ -2631,8 +2635,10 @@ static BOOLEAN fw_platform_root_config_io_sapics_valid(
                 efi_base, IA64_PLATFORM_RESOURCE_ALIGNMENT)) {
             continue;
         }
-        if (Descriptor->PlatformId != IA64_PLATFORM_ID_HP_ZX6000 ||
-            Root->ConfigType != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA ||
+        if (!hp_zx) {
+            return 0;
+        }
+        if (Root->ConfigType != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA ||
             !ia64_platform_zx1_embedded_io_sapic(Root->ConfigBase,
                                                   sapic->Base)) {
             return 0;
@@ -2731,7 +2737,7 @@ static BOOLEAN fw_platform_pci_root_valid(
     /* Each platform has one PCI configuration mechanism. */
     if ((Descriptor->PlatformId == IA64_PLATFORM_ID_HP_I2000 &&
          root->ConfigType != IA64_PLATFORM_PCI_CONFIG_CF8_CFC) ||
-        (Descriptor->PlatformId == IA64_PLATFORM_ID_HP_ZX6000 &&
+        (ia64_platform_is_hp_zx(Descriptor->PlatformId) &&
          root->ConfigType != IA64_PLATFORM_PCI_CONFIG_ZX1_LBA)) {
         return 0;
     }
@@ -2757,7 +2763,7 @@ static BOOLEAN fw_platform_pci_root_valid(
          (!fw_platform_u64_range_valid(root->IoBase, root->IoSize) ||
           root->IoBase + root->IoSize > IA64_LEGACY_IO_PORTS_SIZE)) ||
         ((root->Flags & IA64_PLATFORM_PCI_ROOT_FLAG_SPARSE_IO) != 0 ?
-         (Descriptor->PlatformId != IA64_PLATFORM_ID_HP_ZX6000 ||
+         (!ia64_platform_is_hp_zx(Descriptor->PlatformId) ||
           root->IoSize == 0 ||
           root->IoTranslationOffset != Descriptor->LegacyIoBase) :
          root->IoTranslationOffset != 0) ||
@@ -3099,7 +3105,6 @@ static BOOLEAN fw_platform_i2000_profile_valid(
     return Descriptor->PlatformId == IA64_PLATFORM_ID_HP_I2000 &&
         (Descriptor->Flags & IA64_PLATFORM_HP_I2000_REQUIRED_FLAGS) ==
             IA64_PLATFORM_HP_I2000_REQUIRED_FLAGS &&
-        (Descriptor->Flags & IA64_PLATFORM_FLAG_IDE_DMA) == 0 &&
         Descriptor->NvramBase == IA64_I2000_PROFILE_NVRAM_BASE &&
         Descriptor->NvramSize == IA64_I2000_PROFILE_NVRAM_SIZE &&
         Descriptor->RtcBase == 0 && Descriptor->RtcSize == 0 &&
@@ -3147,6 +3152,7 @@ static BOOLEAN fw_platform_entries_valid(
 {
     UINT64 ram_total = 0;
     UINT64 previous_end = 0;
+    UINTN legacy_vga_roots = 0;
     UINTN i;
 
     if (Descriptor->RamRangeCount == 0 ||
@@ -3207,6 +3213,13 @@ static BOOLEAN fw_platform_entries_valid(
         if (!fw_platform_pci_root_valid(Descriptor, i)) {
             return 0;
         }
+        if ((fw_platform_source_pci_root(Descriptor, i)->Flags &
+             IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) != 0) {
+            legacy_vga_roots++;
+        }
+    }
+    if (legacy_vga_roots > 1U) {
+        return 0;
     }
     for (i = 0; i < Descriptor->IoSapicCount; i++) {
         if (!fw_platform_io_sapic_valid(Descriptor, i)) {
@@ -3251,6 +3264,34 @@ static BOOLEAN fw_platform_descriptor_in_ram(
     return 0;
 }
 
+static BOOLEAN fw_platform_processor_topology_valid(
+    const IA64PlatformDescriptor *Descriptor)
+{
+    UINT32 processor_count;
+
+    if (Descriptor->PlatformId == IA64_PLATFORM_ID_HP_RX2660) {
+        if (Descriptor->ProcessorCount == 0 ||
+            Descriptor->ProcessorCount > 8 ||
+            Descriptor->SocketCount == 0 || Descriptor->SocketCount > 2 ||
+            Descriptor->CoresPerSocket == 0 ||
+            Descriptor->CoresPerSocket > 2 ||
+            Descriptor->ThreadsPerCore == 0 ||
+            Descriptor->ThreadsPerCore > 2) {
+            return 0;
+        }
+        processor_count = Descriptor->SocketCount;
+        processor_count *= Descriptor->CoresPerSocket;
+        processor_count *= Descriptor->ThreadsPerCore;
+        return Descriptor->ProcessorCount == processor_count;
+    }
+
+    return Descriptor->ProcessorCount >= 1 &&
+        Descriptor->ProcessorCount <= 2 &&
+        Descriptor->SocketCount >= 1 && Descriptor->SocketCount <= 2 &&
+        Descriptor->CoresPerSocket == 1 && Descriptor->ThreadsPerCore == 1 &&
+        Descriptor->ProcessorCount == Descriptor->SocketCount;
+}
+
 /*
  * Copy the validated machine descriptor passed in r8-r10.  All-zero
  * arguments select the VPC handoff; partial or malformed arguments fail.
@@ -3281,7 +3322,7 @@ BOOLEAN fw_platform_descriptor_init(UINT64 DescriptorGpa,
         DescriptorGpa + DescriptorSize >
             ~(UINT64)0 - (IA64_EFI_MEMORY_ALIGN - 1U) ||
         (PlatformId != IA64_PLATFORM_ID_HP_I2000 &&
-         PlatformId != IA64_PLATFORM_ID_HP_ZX6000)) {
+         !ia64_platform_is_hp_zx(PlatformId))) {
         return 0;
     }
 
@@ -3372,7 +3413,7 @@ BOOLEAN fw_platform_descriptor_init(UINT64 DescriptorGpa,
           source->ControlValue == 0 || source->ControlValue > 0xffU)) ||
         ((source->AcpiPmBase | source->AcpiPmSize |
           source->AcpiSciGsi) != 0 &&
-         (source->PlatformId != IA64_PLATFORM_ID_HP_ZX6000 ||
+         (!ia64_platform_is_hp_zx(source->PlatformId) ||
           source->AcpiPmBase == 0 ||
           source->AcpiPmSize != IA64_PLATFORM_ACPI_PM_SIZE ||
           source->AcpiSciGsi == 0 || source->AcpiSciGsi > 0xffffU ||
@@ -3487,10 +3528,7 @@ BOOLEAN fw_platform_descriptor_init(UINT64 DescriptorGpa,
           fw_platform_u64_ranges_overlap(source->ConsoleBase, console_size,
                                          source->FirmwareBase,
                                          source->FirmwareSize))) ||
-        source->ProcessorCount == 0 || source->ProcessorCount > 2 ||
-        source->SocketCount == 0 || source->SocketCount > 2 ||
-        source->CoresPerSocket != 1 || source->ThreadsPerCore != 1 ||
-        source->ProcessorCount != source->SocketCount) {
+        !fw_platform_processor_topology_valid(source)) {
         return 0;
     }
     if (!fw_platform_entries_valid(source) ||
@@ -3583,8 +3621,8 @@ BOOLEAN fw_i2000_profile_enabled(void)
 static BOOLEAN fw_zx6000_profile_enabled(VOID)
 {
     return mPlatformProfile.Present &&
-        mPlatformProfile.Descriptor.PlatformId ==
-            IA64_PLATFORM_ID_HP_ZX6000;
+        ia64_platform_is_hp_zx(
+            mPlatformProfile.Descriptor.PlatformId);
 }
 
 static BOOLEAN fw_variable_services_available(void)
@@ -4153,6 +4191,9 @@ static UINT64                 mGraphicsFramebufferBase = VGA_FB_BASE;
 static UINT64                 mGraphicsFramebufferApertureSize =
     PCI_VGA_ATI_FB_SIZE;
 static UINT64                 mUsbOhciMmioBase = PCI_OHCI_MMIO_BAR;
+static UINT32                 mUsbUhciIoBase;
+static UINT64                 mUsbUhciDmaBase;
+static UINT64                 mUsbUhciDmaSize;
 static FW_CONIN_KEY_NOTIFY_RECORD mConInKeyNotifyRecords[FW_CONIN_KEY_NOTIFY_MAX];
 static BOOLEAN                mConInBufferedKeyValid;
 static EFI_INPUT_KEY          mConInBufferedKey;
@@ -4181,6 +4222,73 @@ static UINT8                  mUsbOhciDataBuffer[64] __attribute__((aligned(16))
 static UINT8                  mUsbKeyboardReport[OHCI_USB_KEYBOARD_REPORT_SIZE]
     __attribute__((aligned(16)));
 UINT8                         mUsbKeyboardPreviousReport[OHCI_USB_KEYBOARD_REPORT_SIZE];
+
+#define UHCI_REG_COMMAND             0x00U
+#define UHCI_REG_STATUS              0x02U
+#define UHCI_REG_INTERRUPT_ENABLE    0x04U
+#define UHCI_REG_FRAME_NUMBER        0x06U
+#define UHCI_REG_FRAME_LIST_BASE     0x08U
+#define UHCI_REG_PORT0               0x10U
+#define UHCI_PCI_COMMAND_OFFSET      0x04U
+#define UHCI_PCI_COMMAND_IO_MASTER   0x0005U
+#define UHCI_CMD_RUN                 (1U << 0)
+#define UHCI_CMD_HOST_RESET          (1U << 1)
+#define UHCI_CMD_CONFIGURED          (1U << 6)
+#define UHCI_CMD_MAX_PACKET_64       (1U << 7)
+#define UHCI_PORT_CONNECTED          (1U << 0)
+#define UHCI_PORT_ENABLE             (1U << 2)
+#define UHCI_PORT_LOW_SPEED          (1U << 8)
+#define UHCI_PORT_RESET              (1U << 9)
+#define UHCI_LINK_TERMINATE          1U
+#define UHCI_LINK_QUEUE_HEAD         2U
+#define UHCI_LINK_DEPTH_FIRST        4U
+#define UHCI_TD_ACTIVE               (1U << 23)
+#define UHCI_TD_LOW_SPEED            (1U << 26)
+#define UHCI_TD_ERROR_COUNT_3        (3U << 27)
+#define UHCI_TD_ERROR_MASK           0x00760000U
+#define UHCI_TOKEN_TOGGLE            (1U << 19)
+#define UHCI_PID_IN                  0x69U
+#define UHCI_PID_SETUP               0x2dU
+#define UHCI_SCHEDULE_PAGES          2U
+
+typedef struct {
+    UINT32 Link;
+    UINT32 Status;
+    UINT32 Token;
+    UINT32 Buffer;
+} __attribute__((aligned(16))) FW_UHCI_TD;
+
+typedef struct {
+    UINT32 Link;
+    UINT32 Element;
+} __attribute__((aligned(16))) FW_UHCI_QH;
+
+typedef struct {
+    UINT32 FrameList[1024];
+    FW_UHCI_QH ControlQh;
+    FW_UHCI_QH InterruptQh;
+    FW_UHCI_TD ControlTd[2];
+    FW_UHCI_TD InterruptTd;
+    UINT8 SetupPacket[8];
+    UINT8 KeyboardReport[OHCI_USB_KEYBOARD_REPORT_SIZE];
+} FW_UHCI_SCHEDULE;
+
+FW_STATIC_ASSERT(sizeof(FW_UHCI_TD) == 16, uhci_td_size);
+FW_STATIC_ASSERT(sizeof(FW_UHCI_QH) == 16, uhci_qh_size);
+FW_STATIC_ASSERT(__builtin_offsetof(FW_UHCI_SCHEDULE, ControlQh) % 16 == 0,
+                 uhci_control_qh_alignment);
+FW_STATIC_ASSERT(__builtin_offsetof(FW_UHCI_SCHEDULE, InterruptQh) % 16 == 0,
+                 uhci_interrupt_qh_alignment);
+FW_STATIC_ASSERT(__builtin_offsetof(FW_UHCI_SCHEDULE, ControlTd) % 16 == 0,
+                 uhci_control_td_alignment);
+FW_STATIC_ASSERT(__builtin_offsetof(FW_UHCI_SCHEDULE, InterruptTd) % 16 == 0,
+                 uhci_interrupt_td_alignment);
+FW_STATIC_ASSERT(sizeof(FW_UHCI_SCHEDULE) <=
+                 UHCI_SCHEDULE_PAGES * EFI_PAGE_SIZE,
+                 uhci_schedule_size);
+
+static FW_UHCI_SCHEDULE *mUsbUhciSchedule;
+static BOOLEAN mUsbUhciInterruptToggle;
 static CHAR16                 mTextChars[VGA_TEXT_ROWS][VGA_TEXT_COLUMNS];
 static UINT8                  mTextAttrs[VGA_TEXT_ROWS][VGA_TEXT_COLUMNS];
 static BOOLEAN                mTextWrapPending;
@@ -4489,6 +4597,8 @@ static const UINT8 mFpswaProtocolGuid[16];
 static const UINT8 mPciHostBridgeResourceAllocationProtocolGuid[16];
 static const UINT8 mPciRootBridgeIoProtocolGuid[16];
 static const UINT8 mPciIoProtocolGuid[16];
+static UINT64 pci_mmio_read(UINT64 Address, UINTN Size);
+static void pci_mmio_write(UINT64 Address, UINTN Size, UINT64 Value);
 static VOID pci_dma_exit_boot_services(VOID);
 static const UINT8 mDriverBindingProtocolGuid[16];
 static const UINT8 mComponentNameProtocolGuid[16];
@@ -5275,8 +5385,8 @@ static BOOLEAN pci_config_zx1_prepare(UINT64 Segment, UINT64 Bus,
 
     if (SelectorAddress == NULL || DataAddress == NULL || Selector == NULL ||
         !mPlatformProfile.Present ||
-        mPlatformProfile.Descriptor.PlatformId !=
-            IA64_PLATFORM_ID_HP_ZX6000 ||
+        !ia64_platform_is_hp_zx(
+            mPlatformProfile.Descriptor.PlatformId) ||
         !fw_pci_zx1_config_prepare(
             mPlatformProfile.PciRoot, mPlatformProfile.PciRootCount,
             Segment, Bus, Device, Function, Offset, Size, &access)) {
@@ -5415,8 +5525,8 @@ static UINT64 pci_config_read_value(UINT64 Segment, UINT64 Bus, UINT64 Device,
             return pci_config_cf8_read_value(Segment, Bus, Device, Function,
                                              Offset, Size);
         }
-        if (mPlatformProfile.Descriptor.PlatformId ==
-            IA64_PLATFORM_ID_HP_ZX6000) {
+        if (ia64_platform_is_hp_zx(
+                mPlatformProfile.Descriptor.PlatformId)) {
             return pci_config_zx1_read_value(Segment, Bus, Device, Function,
                                              Offset, Size);
         }
@@ -5456,8 +5566,8 @@ static void pci_config_write_value(UINT64 Segment, UINT64 Bus, UINT64 Device,
             IA64_PLATFORM_ID_HP_I2000) {
             pci_config_cf8_write_value(Segment, Bus, Device, Function,
                                        Offset, Size, Value);
-        } else if (mPlatformProfile.Descriptor.PlatformId ==
-                   IA64_PLATFORM_ID_HP_ZX6000) {
+        } else if (ia64_platform_is_hp_zx(
+                       mPlatformProfile.Descriptor.PlatformId)) {
             pci_config_zx1_write_value(Segment, Bus, Device, Function,
                                        Offset, Size, Value);
         }
@@ -7597,7 +7707,7 @@ static BOOLEAN usb_ohci_enable_keyboard_port(void)
     return 0;
 }
 
-void usb_keyboard_submit_interrupt_td(void)
+static void usb_ohci_keyboard_submit_interrupt_td(void)
 {
     UINT32 carry = usb_ohci_ed_head(&mUsbOhciInterruptEd) & OHCI_ED_C;
 
@@ -7621,23 +7731,13 @@ void usb_keyboard_submit_interrupt_td(void)
     usb_dma_barrier();
 }
 
-BOOLEAN __attribute__((noinline, used)) usb_keyboard_init(void)
+static BOOLEAN usb_ohci_keyboard_init(void)
 {
     UINTN i;
 
-    if (mUsbKeyboardReady) {
-        return 1;
-    }
-    if (mUsbKeyboardTried) {
-        return 0;
-    }
-    mUsbKeyboardTried = 1;
-    mUsbKeyboardLowSpeed = 0;
     fw_set_mem(&mUsbOhciHcca, sizeof(mUsbOhciHcca), 0);
     fw_set_mem(&mUsbOhciControlEd, sizeof(mUsbOhciControlEd), 0);
     fw_set_mem(&mUsbOhciInterruptEd, sizeof(mUsbOhciInterruptEd), 0);
-    fw_set_mem(mUsbKeyboardPreviousReport,
-               sizeof(mUsbKeyboardPreviousReport), 0);
 
     if (!usb_ohci_controller_present() ||
         !usb_ohci_reset_controller()) {
@@ -7677,8 +7777,301 @@ BOOLEAN __attribute__((noinline, used)) usb_keyboard_init(void)
     }
     usb_dma_barrier();
     mUsbKeyboardReady = 1;
-    usb_keyboard_submit_interrupt_td();
+    usb_ohci_keyboard_submit_interrupt_td();
     return 1;
+}
+
+static UINT64 usb_uhci_reg(UINTN Offset)
+{
+    return fw_platform_legacy_io_port(mUsbUhciIoBase + Offset);
+}
+
+static UINT16 usb_uhci_read16(UINTN Offset)
+{
+    if (mPciUhciHandle == NULL || mUsbUhciIoBase == 0) {
+        return 0xffffU;
+    }
+    return (UINT16)pci_mmio_read(usb_uhci_reg(Offset), sizeof(UINT16));
+}
+
+static void usb_uhci_write16(UINTN Offset, UINT16 Value)
+{
+    if (mPciUhciHandle != NULL && mUsbUhciIoBase != 0) {
+        pci_mmio_write(usb_uhci_reg(Offset), sizeof(UINT16), Value);
+    }
+}
+
+static UINT32 usb_uhci_dma_read32(const UINT32 *Value)
+{
+    usb_dma_barrier();
+    return __atomic_load_n(Value, __ATOMIC_RELAXED);
+}
+
+static UINT32 usb_uhci_phys(const VOID *Pointer)
+{
+    return (UINT32)(UINTN)Pointer;
+}
+
+static UINT32 usb_uhci_token(UINT8 Pid, UINT8 Address, UINT8 Endpoint,
+                             UINTN Length, BOOLEAN Toggle)
+{
+    UINT32 encoded_length = Length == 0 ? 0x7ffU : (UINT32)Length - 1U;
+
+    return Pid | ((UINT32)Address << 8) | ((UINT32)Endpoint << 15) |
+        (Toggle ? UHCI_TOKEN_TOGGLE : 0) | (encoded_length << 21);
+}
+
+static void usb_uhci_init_td(FW_UHCI_TD *Td, FW_UHCI_TD *Next,
+                             UINT32 Token, VOID *Buffer, BOOLEAN LowSpeed)
+{
+    Td->Link = Next != NULL ?
+        usb_uhci_phys(Next) | UHCI_LINK_DEPTH_FIRST : UHCI_LINK_TERMINATE;
+    Td->Status = UHCI_TD_ACTIVE | UHCI_TD_ERROR_COUNT_3 |
+        (LowSpeed ? UHCI_TD_LOW_SPEED : 0);
+    Td->Token = Token;
+    Td->Buffer = Buffer != NULL ? usb_uhci_phys(Buffer) : 0;
+}
+
+static BOOLEAN usb_uhci_allocate_schedule(void)
+{
+    EFI_PHYSICAL_ADDRESS allocation;
+    UINT64 allocation_size = UHCI_SCHEDULE_PAGES * EFI_PAGE_SIZE;
+    UINT64 dma_end;
+
+    if (mUsbUhciSchedule != NULL) {
+        return 1;
+    }
+    if (mUsbUhciDmaSize == 0 ||
+        mUsbUhciDmaBase > ~0ULL - (mUsbUhciDmaSize - 1U)) {
+        return 0;
+    }
+    dma_end = mUsbUhciDmaBase + mUsbUhciDmaSize - 1U;
+    allocation = dma_end < 0xffffffffU ? dma_end : 0xffffffffU;
+    if (mBootServices.AllocatePages == NULL ||
+        mBootServices.AllocatePages(AllocateMaxAddress, EfiBootServicesData,
+                                    UHCI_SCHEDULE_PAGES,
+                                    &allocation) != EFI_SUCCESS) {
+        return 0;
+    }
+    if (allocation < mUsbUhciDmaBase ||
+        allocation > dma_end || allocation_size - 1U > dma_end - allocation) {
+        if (mBootServices.FreePages != NULL) {
+            (void)mBootServices.FreePages(allocation, UHCI_SCHEDULE_PAGES);
+        }
+        return 0;
+    }
+    mUsbUhciSchedule = (FW_UHCI_SCHEDULE *)(UINTN)allocation;
+    fw_set_mem(mUsbUhciSchedule, allocation_size, 0);
+    return 1;
+}
+
+static BOOLEAN usb_uhci_reset_controller(void)
+{
+    FW_PCI_IO_DEVICE *uhci = &mPciIoDevices[3];
+    UINTN spin;
+
+    pci_config_write_value(uhci->Segment, uhci->Bus, uhci->Device,
+                           uhci->Function, UHCI_PCI_COMMAND_OFFSET, 2,
+                           UHCI_PCI_COMMAND_IO_MASTER);
+    usb_uhci_write16(UHCI_REG_INTERRUPT_ENABLE, 0);
+    usb_uhci_write16(UHCI_REG_COMMAND, UHCI_CMD_HOST_RESET);
+    for (spin = 0; spin < 1000U; spin++) {
+        if ((usb_uhci_read16(UHCI_REG_COMMAND) & UHCI_CMD_HOST_RESET) == 0) {
+            usb_uhci_write16(UHCI_REG_STATUS, 0xffffU);
+            return 1;
+        }
+        (void)bs_stall(10);
+    }
+    return 0;
+}
+
+static BOOLEAN usb_uhci_enable_keyboard_port(void)
+{
+    UINT16 status;
+
+    status = usb_uhci_read16(UHCI_REG_PORT0);
+    if ((status & UHCI_PORT_CONNECTED) == 0) {
+        return 0;
+    }
+    usb_uhci_write16(UHCI_REG_PORT0, UHCI_PORT_RESET);
+    (void)bs_stall(50000);
+    usb_uhci_write16(UHCI_REG_PORT0, 0);
+    (void)bs_stall(10);
+    status = usb_uhci_read16(UHCI_REG_PORT0);
+    if ((status & UHCI_PORT_CONNECTED) == 0) {
+        return 0;
+    }
+    usb_uhci_write16(UHCI_REG_PORT0, UHCI_PORT_ENABLE);
+    (void)bs_stall(10000);
+    status = usb_uhci_read16(UHCI_REG_PORT0);
+    if ((status & (UHCI_PORT_CONNECTED | UHCI_PORT_ENABLE)) !=
+        (UHCI_PORT_CONNECTED | UHCI_PORT_ENABLE)) {
+        return 0;
+    }
+    mUsbKeyboardLowSpeed = (status & UHCI_PORT_LOW_SPEED) != 0;
+    mUsbKeyboardPort = 0;
+    return 1;
+}
+
+static BOOLEAN usb_uhci_wait_control_done(void)
+{
+    UINT64 start = fw_read_itc();
+    UINT64 timeout = 100000ULL * FW_ITC_TICKS_PER_MICROSECOND;
+
+    while (fw_read_itc() - start < timeout) {
+        UINT32 first = usb_uhci_dma_read32(
+            &mUsbUhciSchedule->ControlTd[0].Status);
+        UINT32 last = usb_uhci_dma_read32(
+            &mUsbUhciSchedule->ControlTd[1].Status);
+        UINT32 element = usb_uhci_dma_read32(
+            &mUsbUhciSchedule->ControlQh.Element);
+
+        if ((first & UHCI_TD_ACTIVE) == 0 &&
+            (first & UHCI_TD_ERROR_MASK) != 0) {
+            return 0;
+        }
+        if ((last & UHCI_TD_ACTIVE) == 0) {
+            usb_dma_barrier();
+            if ((last & UHCI_TD_ERROR_MASK) != 0) {
+                return 0;
+            }
+            if ((element & UHCI_LINK_TERMINATE) != 0) {
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static BOOLEAN usb_uhci_control_transfer(UINT8 Address, UINT8 RequestType,
+                                         UINT8 Request, UINT16 Value,
+                                         UINT16 Index)
+{
+    FW_UHCI_SCHEDULE *schedule = mUsbUhciSchedule;
+
+    schedule->SetupPacket[0] = RequestType;
+    schedule->SetupPacket[1] = Request;
+    schedule->SetupPacket[2] = (UINT8)Value;
+    schedule->SetupPacket[3] = (UINT8)(Value >> 8);
+    schedule->SetupPacket[4] = (UINT8)Index;
+    schedule->SetupPacket[5] = (UINT8)(Index >> 8);
+    schedule->SetupPacket[6] = 0;
+    schedule->SetupPacket[7] = 0;
+    usb_uhci_init_td(&schedule->ControlTd[0], &schedule->ControlTd[1],
+                     usb_uhci_token(UHCI_PID_SETUP, Address, 0, 8, 0),
+                     schedule->SetupPacket, mUsbKeyboardLowSpeed);
+    usb_uhci_init_td(&schedule->ControlTd[1], NULL,
+                     usb_uhci_token(UHCI_PID_IN, Address, 0, 0, 1),
+                     NULL, mUsbKeyboardLowSpeed);
+    usb_dma_barrier();
+    schedule->ControlQh.Element = usb_uhci_phys(&schedule->ControlTd[0]);
+    usb_dma_barrier();
+    return usb_uhci_wait_control_done();
+}
+
+static void usb_uhci_keyboard_submit_interrupt_td(void)
+{
+    FW_UHCI_SCHEDULE *schedule = mUsbUhciSchedule;
+
+    fw_set_mem(schedule->KeyboardReport, sizeof(schedule->KeyboardReport), 0);
+    usb_uhci_init_td(
+        &schedule->InterruptTd, NULL,
+        usb_uhci_token(UHCI_PID_IN, OHCI_USB_KEYBOARD_ADDRESS,
+                       OHCI_USB_KEYBOARD_ENDPOINT,
+                       OHCI_USB_KEYBOARD_REPORT_SIZE,
+                       mUsbUhciInterruptToggle),
+        schedule->KeyboardReport, mUsbKeyboardLowSpeed);
+    usb_dma_barrier();
+    schedule->InterruptQh.Element = usb_uhci_phys(&schedule->InterruptTd);
+    usb_dma_barrier();
+}
+
+static void usb_uhci_prepare_os_handoff(void)
+{
+    if (mPciUhciHandle != NULL && mUsbUhciSchedule != NULL) {
+        usb_uhci_write16(UHCI_REG_COMMAND, 0);
+    }
+}
+
+static BOOLEAN usb_uhci_keyboard_init(void)
+{
+    FW_UHCI_SCHEDULE *schedule;
+    UINT32 control_qh;
+    UINTN i;
+
+    if (!usb_uhci_allocate_schedule() || !usb_uhci_reset_controller()) {
+        return 0;
+    }
+    schedule = mUsbUhciSchedule;
+    fw_set_mem(schedule, UHCI_SCHEDULE_PAGES * EFI_PAGE_SIZE, 0);
+    schedule->ControlQh.Link =
+        usb_uhci_phys(&schedule->InterruptQh) | UHCI_LINK_QUEUE_HEAD;
+    schedule->ControlQh.Element = UHCI_LINK_TERMINATE;
+    schedule->InterruptQh.Link = UHCI_LINK_TERMINATE;
+    schedule->InterruptQh.Element = UHCI_LINK_TERMINATE;
+    control_qh = usb_uhci_phys(&schedule->ControlQh) |
+        UHCI_LINK_QUEUE_HEAD;
+    for (i = 0; i < FW_ARRAY_SIZE(schedule->FrameList); i++) {
+        schedule->FrameList[i] = control_qh;
+    }
+    usb_dma_barrier();
+    usb_uhci_write16(UHCI_REG_FRAME_LIST_BASE,
+                     (UINT16)usb_uhci_phys(schedule->FrameList));
+    usb_uhci_write16(UHCI_REG_FRAME_LIST_BASE + 2U,
+                     (UINT16)(usb_uhci_phys(schedule->FrameList) >> 16));
+    usb_uhci_write16(UHCI_REG_FRAME_NUMBER, 0);
+    usb_uhci_write16(UHCI_REG_COMMAND,
+                     UHCI_CMD_RUN | UHCI_CMD_CONFIGURED |
+                     UHCI_CMD_MAX_PACKET_64);
+
+    if (!usb_uhci_enable_keyboard_port() ||
+        !usb_uhci_control_transfer(0, 0, USB_REQ_SET_ADDRESS,
+                                   OHCI_USB_KEYBOARD_ADDRESS, 0)) {
+        return 0;
+    }
+    (void)bs_stall(2000);
+    if (!usb_uhci_control_transfer(OHCI_USB_KEYBOARD_ADDRESS, 0,
+                                   USB_REQ_SET_CONFIGURATION, 1, 0) ||
+        !usb_uhci_control_transfer(OHCI_USB_KEYBOARD_ADDRESS,
+                                   USB_TYPE_CLASS_INTERFACE_OUT,
+                                   USB_REQ_HID_SET_IDLE, 0, 0) ||
+        !usb_uhci_control_transfer(OHCI_USB_KEYBOARD_ADDRESS,
+                                   USB_TYPE_CLASS_INTERFACE_OUT,
+                                   USB_REQ_HID_SET_PROTOCOL, 0, 0)) {
+        return 0;
+    }
+    mUsbUhciInterruptToggle = 0;
+    mUsbKeyboardReady = 1;
+    usb_uhci_keyboard_submit_interrupt_td();
+    return 1;
+}
+
+void usb_keyboard_submit_interrupt_td(void)
+{
+    if (mPciOhciHandle != NULL) {
+        usb_ohci_keyboard_submit_interrupt_td();
+    } else if (mPciUhciHandle != NULL && mUsbUhciSchedule != NULL) {
+        usb_uhci_keyboard_submit_interrupt_td();
+    }
+}
+
+BOOLEAN __attribute__((noinline, used)) usb_keyboard_init(void)
+{
+    if (mUsbKeyboardReady) {
+        return 1;
+    }
+    if (mUsbKeyboardTried) {
+        return 0;
+    }
+    mUsbKeyboardTried = 1;
+    mUsbKeyboardLowSpeed = 0;
+    fw_set_mem(mUsbKeyboardPreviousReport,
+               sizeof(mUsbKeyboardPreviousReport), 0);
+
+    if (mPciOhciHandle != NULL) {
+        return usb_ohci_keyboard_init();
+    }
+    return mPciUhciHandle != NULL && usb_uhci_keyboard_init();
 }
 
 static BOOLEAN usb_keyboard_report_has_usage(const UINT8 *Report, UINT8 Usage)
@@ -7824,6 +8217,36 @@ usb_keyboard_read_key(EFI_INPUT_KEY *Key)
 
     if (!usb_keyboard_init()) {
         return EFI_NOT_READY;
+    }
+
+    if (mPciOhciHandle == NULL) {
+        UINT32 td_status;
+
+        if (mUsbUhciSchedule == NULL) {
+            return EFI_NOT_READY;
+        }
+        td_status = usb_uhci_dma_read32(
+            &mUsbUhciSchedule->InterruptTd.Status);
+        if ((td_status & UHCI_TD_ACTIVE) != 0) {
+            return EFI_NOT_READY;
+        }
+        usb_dma_barrier();
+        if ((td_status & UHCI_TD_ERROR_MASK) == 0) {
+            fw_copy_mem(mUsbKeyboardReport,
+                        mUsbUhciSchedule->KeyboardReport,
+                        sizeof(mUsbKeyboardReport));
+            mUsbUhciInterruptToggle = !mUsbUhciInterruptToggle;
+            if (usb_keyboard_report_to_key(Key)) {
+                status = EFI_SUCCESS;
+            }
+            fw_copy_mem(mUsbKeyboardPreviousReport, mUsbKeyboardReport,
+                        sizeof(mUsbKeyboardPreviousReport));
+        } else {
+            fw_set_mem(mUsbKeyboardPreviousReport,
+                       sizeof(mUsbKeyboardPreviousReport), 0);
+        }
+        usb_uhci_keyboard_submit_interrupt_td();
+        return status;
     }
 
     head = usb_ohci_ed_head(&mUsbOhciInterruptEd) & OHCI_DPTR_MASK;
@@ -12253,6 +12676,7 @@ EFI_STATUS bs_exit_boot_services(EFI_HANDLE ImageHandle, UINTN MapKey)
     fw_debug_support_exit_boot_services();
     (void)bs_set_watchdog_timer(0, 0, 0, NULL);
     ahci_stop_all_ports();
+    usb_uhci_prepare_os_handoff();
     pci_dma_exit_boot_services();
     graphics_prepare_os_handoff(fw_handoff_vga_console_primary());
     /* Preserve the loader's RR/TR state across ExitBootServices(). */
@@ -12951,8 +13375,8 @@ static BOOLEAN efi_platform_io_sapic_embedded(
 {
     UINTN i;
 
-    if (mPlatformProfile.Descriptor.PlatformId !=
-        IA64_PLATFORM_ID_HP_ZX6000) {
+    if (!ia64_platform_is_hp_zx(
+            mPlatformProfile.Descriptor.PlatformId)) {
         return 0;
     }
     for (i = 0; i < mPlatformProfile.PciRootCount; i++) {
@@ -14446,9 +14870,7 @@ static BOOLEAN efi_init_platform_tables(void)
     BOOLEAN vpc_profile = !mPlatformProfile.Present;
     const FW_UART_POLICY *i2000_uart = fw_i2000_uart_policy();
     BOOLEAN i2000_profile = i2000_uart != NULL;
-    BOOLEAN zx6000_profile = mPlatformProfile.Present &&
-        mPlatformProfile.Descriptor.PlatformId ==
-        IA64_PLATFORM_ID_HP_ZX6000;
+    BOOLEAN zx6000_profile = fw_zx6000_profile_enabled();
     BOOLEAN zx6000_acpi_pm = zx6000_profile &&
         mPlatformProfile.Descriptor.AcpiPmSize != 0;
     BOOLEAN acpi_pm_present = vpc_profile || i2000_profile ||
@@ -14652,8 +15074,14 @@ static BOOLEAN efi_init_platform_tables(void)
     {
         static const UINT8 ps2_enabled_name[4] = { 'P', '2', 'E', 'N' };
         static const UINT8 uart_enabled_name[4] = { 'U', '0', 'E', 'N' };
+        static const CHAR8 zx_legacy_parent[4] = { 'S', 'B', 'A', '0' };
 
         fw_copy_mem(mSsdt.Aml, mSsdtAmlTemplate, sizeof(mSsdt.Aml));
+        if (zx6000_profile &&
+            !fw_acpi_ssdt_reparent_legacy_devices(
+                mSsdt.Aml, sizeof(mSsdt.Aml), zx_legacy_parent)) {
+            return 0;
+        }
         for (i = 0; i < FW_MAX_CPUS; i++) {
             acpi_ssdt_cpu_names(i, processor_name, enabled_name);
             (void)acpi_ssdt_set_named_byte(
@@ -16590,7 +17018,7 @@ static void *load_pe_image(uint8_t *image_base, UINTN image_size,
     return (VOID *)(UINTN)(image_base_addr + entry_rva);
 }
 
-/* --- ATA PIO Block I/O driver --------------------------------------------- */
+/* --- ATA/ATAPI Block I/O driver ------------------------------------------- */
 
 typedef struct {
     UINT8  unit;         /* 0=master, 1=slave on the primary channel */
@@ -16598,7 +17026,8 @@ typedef struct {
     UINT8  media_present;
     UINT8  is_atapi;     /* 0=ATA disk, 1=ATAPI CD-ROM */
     UINT8  lba48;
-    UINT8  reserved[3];
+    UINT8  dma_enabled;
+    UINT8  reserved[2];
     UINT64 last_lba;
 } IDE_DEVICE;
 
@@ -16679,8 +17108,12 @@ static BOOLEAN mIdeControllerLocationValid;
 #define ATA_CMD_IDE_WRITE_DMA_EXT 0x35
 #define ATA_CMD_FLUSH_CACHE       0xE7
 #define ATA_CMD_IDE_FLUSH_EXT     0xEA
+#define ATA_CMD_SET_FEATURES      0xEF
 #define ATA_CMD_PACKET            0xA0
 #define ATA_CMD_IDENTIFY_PACKET   0xA1
+
+#define ATA_FEATURE_SET_TRANSFER_MODE 0x03U
+#define ATA_TRANSFER_MODE_UDMA        0x40U
 
 #define ATA_IDE_IDENTIFY_LBA48    (1U << 10)
 
@@ -16701,8 +17134,15 @@ static BOOLEAN mIdeControllerLocationValid;
 #define IDE_BMDMA_STATUS_ACTIVE 0x01U
 #define IDE_BMDMA_STATUS_ERROR  0x02U
 #define IDE_BMDMA_STATUS_INT    0x04U
+#define IDE_BMDMA_STATUS_DMA0   0x20U
+#define IDE_BMDMA_STATUS_DMA1   0x40U
+#define IDE_BMDMA_STATUS_DMA_MASK \
+    (IDE_BMDMA_STATUS_DMA0 | IDE_BMDMA_STATUS_DMA1)
 #define IDE_BMDMA_PRD_EOT       0x80000000U
 #define IDE_BMDMA_PRD_MAX       8U
+
+#define I2000_IDE_SDMACTL       0x48U
+#define I2000_IDE_SDMATIM       0x4aU
 
 typedef struct {
     UINT32 BaseAddress;
@@ -16871,6 +17311,9 @@ static BOOLEAN ide_configure_i2000(const FW_IDE_POLICY *Policy)
 {
     UINT32 vendor_device;
     UINT32 class_revision;
+    UINT32 bmdma_bar;
+    UINT64 bmdma_base;
+    UINT16 command;
 
     if (Policy == NULL) {
         return 0;
@@ -16886,19 +17329,39 @@ static BOOLEAN ide_configure_i2000(const FW_IDE_POLICY *Policy)
         return 0;
     }
 
-    /*
-     * The i2000 I/O device uses fixed command and control ports.  Its BARs
-     * and command register are immutable.
-     */
     gIde.data_base = Policy->CommandPort;
     gIde.ctrl_base = Policy->ControlPort;
     gIde.bmdma_base = 0;
     gIde.has_bmdma = 0;
+    command = (UINT16)pci_config_read_value(
+        Policy->Segment, Policy->Bus, Policy->Device, Policy->Function,
+        PCI_CFG_COMMAND_OFFSET, 2);
+    command |= PCI_CFG_COMMAND_IO_SPACE;
+    if (fw_handoff_ide_dma_enabled()) {
+        bmdma_bar = (UINT32)pci_config_read_value(
+            Policy->Segment, Policy->Bus, Policy->Device, Policy->Function,
+            PCI_IDE_BAR4_OFFSET, 4);
+        if (!ide_io_bar_address(bmdma_bar, &bmdma_base) ||
+            bmdma_base != IA64_I2000_PROFILE_IDE_BMDMA_PORT ||
+            bmdma_base + IA64_I2000_PROFILE_IDE_BMDMA_SIZE > PCI_IO_SIZE) {
+            return 0;
+        }
+        gIde.bmdma_base = bmdma_base;
+        gIde.has_bmdma = 1;
+        command |= PCI_CFG_COMMAND_BUS_MASTER;
+    }
+    pci_config_write_value(
+        Policy->Segment, Policy->Bus, Policy->Device, Policy->Function,
+        PCI_CFG_COMMAND_OFFSET, 2, command);
 
     uart_puts("IDE controller:       i2000 fixed primary data=0x");
     uart_put_hex64(fw_platform_legacy_io_port(gIde.data_base));
     uart_puts(" ctrl=0x");
     uart_put_hex64(fw_platform_legacy_io_port(gIde.ctrl_base));
+    if (gIde.has_bmdma) {
+        uart_puts(" bmdma=0x");
+        uart_put_hex64(fw_platform_legacy_io_port(gIde.bmdma_base));
+    }
     uart_puts("\r\n");
     return 1;
 }
@@ -17095,6 +17558,108 @@ static BOOLEAN ata_identify_capacity(IDE_DEVICE *dev,
     return dev->media_present != 0;
 }
 
+static BOOLEAN ata_pio_wait_not_busy(VOID);
+
+static void ide_bmdma_set_dma_capable(const IDE_DEVICE *dev)
+{
+    UINT8 status;
+    UINT8 capable;
+
+    if (dev == NULL || !gIde.has_bmdma) {
+        return;
+    }
+
+    capable = dev->unit != 0 ? IDE_BMDMA_STATUS_DMA1 :
+                               IDE_BMDMA_STATUS_DMA0;
+    status = ata_pio_read8(gIde.bmdma_base + IDE_BMDMA_STATUS_OFF);
+    ata_pio_write8(gIde.bmdma_base + IDE_BMDMA_STATUS_OFF,
+                   (status & IDE_BMDMA_STATUS_DMA_MASK) | capable |
+                   IDE_BMDMA_STATUS_ERROR | IDE_BMDMA_STATUS_INT);
+}
+
+static BOOLEAN ata_set_transfer_mode(IDE_DEVICE *dev, UINT8 mode)
+{
+    if (dev == NULL || !ata_pio_wait_not_busy()) {
+        return 0;
+    }
+
+    ide_select_device(ide_packet_drive_select(dev));
+    ata_pio_write8(gIde.data_base + IDE_ERR_OFF,
+                   ATA_FEATURE_SET_TRANSFER_MODE);
+    ata_pio_write8(gIde.data_base + IDE_NSEC_OFF, mode);
+    ata_pio_write8(gIde.data_base + IDE_LBALO_OFF, 0);
+    ata_pio_write8(gIde.data_base + IDE_LBAMID_OFF, 0);
+    ata_pio_write8(gIde.data_base + IDE_LBAHI_OFF, 0);
+    ata_pio_write8(gIde.data_base + IDE_CMD_OFF, ATA_CMD_SET_FEATURES);
+    return ata_pio_wait_not_busy();
+}
+
+static BOOLEAN ide_i2000_configure_udma(const FW_IDE_POLICY *policy,
+                                         IDE_DEVICE *dev,
+                                         const UINT16 *identify)
+{
+    UINT16 verify[256];
+    UINT16 timing;
+    UINT16 new_timing;
+    UINT8 control;
+    UINT8 new_control;
+    UINT8 mode;
+    UINT8 shift;
+    UINT8 enable;
+    UINT8 identify_command;
+
+    if (policy == NULL || dev == NULL || identify == NULL ||
+        !gIde.has_bmdma ||
+        !fw_ide_i2000_select_udma(identify, &mode)) {
+        return 0;
+    }
+
+    shift = dev->unit != 0 ? 2U : 0U;
+    enable = 1U << dev->unit;
+    control = (UINT8)pci_config_read_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMACTL, 1);
+    timing = (UINT16)pci_config_read_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMATIM, 2);
+    new_control = control | enable;
+    new_timing = (timing & ~(3U << shift)) | ((UINT16)mode << shift);
+
+    pci_config_write_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMACTL, 1, control & ~enable);
+    pci_config_write_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMATIM, 2, new_timing);
+    pci_config_write_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMACTL, 1, new_control);
+
+    if (!ata_set_transfer_mode(dev, ATA_TRANSFER_MODE_UDMA | mode)) {
+        goto fail;
+    }
+    identify_command = dev->is_atapi ? ATA_CMD_IDENTIFY_PACKET :
+                                       ATA_CMD_IDENTIFY;
+    if (!ata_pio_identify(dev, identify_command, verify) ||
+        (verify[FW_ATA_IDENTIFY_UDMA_WORD] & (1U << (8U + mode))) == 0) {
+        (void)ata_set_transfer_mode(dev, 0);
+        goto fail;
+    }
+
+    dev->dma_enabled = 1;
+    ide_bmdma_set_dma_capable(dev);
+    return 1;
+
+fail:
+    pci_config_write_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMACTL, 1, control);
+    pci_config_write_value(
+        policy->Segment, policy->Bus, policy->Device, policy->Function,
+        I2000_IDE_SDMATIM, 2, timing);
+    return 0;
+}
+
 static BOOLEAN atapi_refresh_media(IDE_DEVICE *Dev);
 
 static void ide_probe_primary_devices(void)
@@ -17111,6 +17676,7 @@ static void ide_probe_primary_devices(void)
             mIdeDevices[i].media_present = 0;
             mIdeDevices[i].is_atapi = 0;
             mIdeDevices[i].lba48 = 0;
+            mIdeDevices[i].dma_enabled = 0;
             mIdeDevices[i].last_lba = 0;
         }
         return;
@@ -17124,6 +17690,7 @@ static void ide_probe_primary_devices(void)
         dev->media_present = 0;
         dev->is_atapi = 0;
         dev->lba48 = 0;
+        dev->dma_enabled = 0;
         dev->last_lba = 0;
 
         if (i2000_ide != NULL &&
@@ -17134,6 +17701,11 @@ static void ide_probe_primary_devices(void)
         if (ata_pio_identify(dev, ATA_CMD_IDENTIFY_PACKET, identify)) {
             dev->present = 1;
             dev->is_atapi = 1;
+            if (i2000_ide != NULL) {
+                (void)ide_i2000_configure_udma(i2000_ide, dev, identify);
+            } else {
+                dev->dma_enabled = gIde.has_bmdma;
+            }
             (void)atapi_refresh_media(dev);
             uart_puts("IDE device:           ATAPI ");
             uart_puts(ide_unit_name(dev));
@@ -17145,6 +17717,11 @@ static void ide_probe_primary_devices(void)
         if (ata_pio_identify(dev, ATA_CMD_IDENTIFY, identify)) {
             dev->present = 1;
             dev->is_atapi = 0;
+            if (i2000_ide != NULL) {
+                (void)ide_i2000_configure_udma(i2000_ide, dev, identify);
+            } else {
+                dev->dma_enabled = gIde.has_bmdma;
+            }
             (void)ata_identify_capacity(dev, identify);
             if (mHardDiskIdeDevice == NULL) {
                 mHardDiskIdeDevice = dev;
@@ -17284,6 +17861,7 @@ static BOOLEAN ata_dma_read_sectors(IDE_DEVICE *dev, UINT8 *buf, UINT64 lba,
     UINT32 prd_addr;
 
     if (dev == NULL || !dev->present || dev->is_atapi || !gIde.has_bmdma ||
+        !dev->dma_enabled ||
         count == 0 || count > 255 ||
         !ata_lba_range_valid(dev, lba, count)) {
         return 0;
@@ -17333,6 +17911,7 @@ static BOOLEAN ata_dma_write_sectors(IDE_DEVICE *dev, const UINT8 *buf,
     UINT32 prd_addr;
 
     if (dev == NULL || !dev->present || dev->is_atapi || !gIde.has_bmdma ||
+        !dev->dma_enabled ||
         count == 0 || count > 255 ||
         !ata_lba_range_valid(dev, lba, count)) {
         return 0;
@@ -17721,8 +18300,12 @@ static BOOLEAN ide_bmdma_prepare_prdt(const VOID *Buffer, UINT32 ByteCount,
 
 static void ide_bmdma_stop(void)
 {
+    UINT8 status;
+
     ata_pio_write8(gIde.bmdma_base + IDE_BMDMA_CMD_OFF, 0);
+    status = ata_pio_read8(gIde.bmdma_base + IDE_BMDMA_STATUS_OFF);
     ata_pio_write8(gIde.bmdma_base + IDE_BMDMA_STATUS_OFF,
+                   (status & IDE_BMDMA_STATUS_DMA_MASK) |
                    IDE_BMDMA_STATUS_ERROR | IDE_BMDMA_STATUS_INT);
 }
 
@@ -17766,7 +18349,8 @@ static BOOLEAN atapi_dma_read_sectors(IDE_DEVICE *dev, UINT8 *buf, UINT32 lba,
     UINT32 done = 0;
     UINT32 prd_addr;
 
-    if (dev == NULL || !dev->present || !dev->is_atapi || !gIde.has_bmdma) {
+    if (dev == NULL || !dev->present || !dev->is_atapi || !gIde.has_bmdma ||
+        !dev->dma_enabled) {
         return 0;
     }
 
@@ -17936,6 +18520,13 @@ typedef struct {
 
 #define MPT_LSI53C1030_VENDOR_DEVICE_ID 0x00301000U
 #define MPT_LSI53C1030_PRODUCT_ID       0x0104U
+#define MPT_LSISAS1068_VENDOR_DEVICE_ID 0x00541000U
+#define MPT_LSISAS1068_PRODUCT_ID       0x2102U
+#define MPT_LSI53C1030_PORT_COUNT       1U
+#define MPT_LSI53C1030_MAX_DEVICES      SCSI_DEVICE_MAX
+#define MPT_LSISAS1068_PORT_COUNT       8U
+#define MPT_LSISAS1068_MAX_DEVICES      8U
+#define MPT_MAX_BUSES                   1U
 #define MPT_MMIO_SIZE                   0x4000U
 #define MPT_DOORBELL                    0x00U
 #define MPT_HOST_INTERRUPT_STATUS       0x30U
@@ -17962,6 +18553,7 @@ typedef struct {
 #define MPT_IOCSTATUS_SCSI_UNDERRUN     0x0045U
 #define MPT_IOCSTATUS_MASK              0x7fffU
 #define MPT_PORTTYPE_SCSI               0x01U
+#define MPT_PORTTYPE_SAS                0x30U
 #define MPT_PORT_PROTOCOL_INITIATOR      0x0008U
 #define MPT_WHOINIT_SYSTEM_BIOS         0x01U
 #define MPT_SCSI_CONTROL_WRITE           0x01000000U
@@ -18207,6 +18799,12 @@ typedef enum {
     ScsiControllerIsp12160,
 } SCSI_CONTROLLER_KIND;
 
+typedef enum {
+    MptVariantNone,
+    MptVariantLsi53C1030,
+    MptVariantLsiSas1068,
+} FW_MPT_VARIANT;
+
 typedef struct {
     PCI_DEVICE_LOCATION Location;
     EFI_PHYSICAL_ADDRESS AllocationBase;
@@ -18242,7 +18840,11 @@ typedef struct {
     UINTN RootIndex;
     UINT64 MmioBase;
     UINT32 NextContext;
+    FW_MPT_VARIANT Variant;
+    UINT8 NumberOfPorts;
     UINT8 MaxDevices;
+    UINT8 MaxBuses;
+    UINT8 PortType;
     BOOLEAN Configured;
     BOOLEAN Active;
     BOOLEAN CommandActive;
@@ -18278,6 +18880,8 @@ FW_STATIC_ASSERT(sizeof(MPT_TASK_REQUEST) == 52U,
 FW_STATIC_ASSERT(sizeof(MPT_TASK_REPLY) == 24U,
                  mpt_task_reply_size);
 FW_STATIC_ASSERT(MPT_DMA_TOTAL_BYTES == 0x11000U, mpt_dma_total_size);
+FW_STATIC_ASSERT(MPT_LSISAS1068_MAX_DEVICES <= SCSI_DEVICE_MAX,
+                 mpt_sas1068_device_array_capacity);
 FW_STATIC_ASSERT(LSI_DMA_TOTAL_BYTES == 0x11000U, lsi_dma_total_size);
 FW_STATIC_ASSERT(LSI_DMA_PAGES == 17U, lsi_dma_page_count);
 
@@ -19016,6 +19620,46 @@ typedef enum {
     MptDataToDevice,
 } MPT_DATA_DIRECTION;
 
+typedef struct {
+    UINT16 ProductId;
+    UINT8 NumberOfPorts;
+    UINT8 MaxDevices;
+    UINT8 MaxBuses;
+    UINT8 PortType;
+} MPT_VARIANT_INFO;
+
+static BOOLEAN mpt_variant_info(FW_MPT_VARIANT Variant,
+                                MPT_VARIANT_INFO *Info)
+{
+    if (Info == NULL) {
+        return 0;
+    }
+    switch (Variant) {
+    case MptVariantLsi53C1030:
+        Info->ProductId = MPT_LSI53C1030_PRODUCT_ID;
+        Info->NumberOfPorts = MPT_LSI53C1030_PORT_COUNT;
+        Info->MaxDevices = MPT_LSI53C1030_MAX_DEVICES;
+        Info->MaxBuses = MPT_MAX_BUSES;
+        Info->PortType = MPT_PORTTYPE_SCSI;
+        return 1;
+    case MptVariantLsiSas1068:
+        Info->ProductId = MPT_LSISAS1068_PRODUCT_ID;
+        Info->NumberOfPorts = MPT_LSISAS1068_PORT_COUNT;
+        Info->MaxDevices = MPT_LSISAS1068_MAX_DEVICES;
+        Info->MaxBuses = MPT_MAX_BUSES;
+        Info->PortType = MPT_PORTTYPE_SAS;
+        return 1;
+    default:
+        return 0;
+    }
+}
+
+static BOOLEAN mpt_target_is_reserved(UINT8 Target)
+{
+    return mMpt.Variant == MptVariantLsi53C1030 &&
+           Target == SCSI_HOST_ID;
+}
+
 static volatile UINT32 *mpt_reg(UINT32 Offset)
 {
     return (volatile UINT32 *)(UINTN)(mMpt.MmioBase + Offset);
@@ -19151,8 +19795,12 @@ static BOOLEAN mpt_reset_ioc(VOID)
 static BOOLEAN mpt_get_ioc_facts(MPT_IOC_FACTS_REPLY *Facts)
 {
     MPT_IOC_FACTS_REQUEST request;
+    MPT_VARIANT_INFO info;
     UINT32 context = mpt_next_context();
 
+    if (Facts == NULL || !mpt_variant_info(mMpt.Variant, &info)) {
+        return 0;
+    }
     fw_set_mem(&request, sizeof(request), 0);
     request.Function = MPT_FUNCTION_IOC_FACTS;
     request.MsgContext = context;
@@ -19162,20 +19810,29 @@ static BOOLEAN mpt_get_ioc_facts(MPT_IOC_FACTS_REPLY *Facts)
     }
     return Facts->Function == MPT_FUNCTION_IOC_FACTS &&
         Facts->MsgContext == context &&
+        Facts->MsgLength >= sizeof(*Facts) / sizeof(UINT32) &&
         (Facts->IOCStatus & MPT_IOCSTATUS_MASK) == MPT_IOCSTATUS_SUCCESS &&
-        Facts->ProductID == MPT_LSI53C1030_PRODUCT_ID &&
-        Facts->NumberOfPorts == 1 && Facts->MaxDevices == SCSI_DEVICE_MAX &&
-        Facts->MaxBuses == 1;
+        Facts->ProductID == info.ProductId &&
+        Facts->NumberOfPorts == info.NumberOfPorts &&
+        Facts->MaxDevices == info.MaxDevices &&
+        Facts->MaxDevices <= SCSI_DEVICE_MAX &&
+        Facts->MaxBuses == info.MaxBuses;
 }
 
-static BOOLEAN mpt_get_port_facts(MPT_PORT_FACTS_REPLY *Facts)
+static BOOLEAN mpt_get_port_facts(UINT8 PortNumber,
+                                  MPT_PORT_FACTS_REPLY *Facts)
 {
     MPT_PORT_REQUEST request;
+    MPT_VARIANT_INFO info;
     UINT32 context = mpt_next_context();
 
+    if (Facts == NULL || !mpt_variant_info(mMpt.Variant, &info) ||
+        PortNumber >= info.NumberOfPorts) {
+        return 0;
+    }
     fw_set_mem(&request, sizeof(request), 0);
     request.Function = MPT_FUNCTION_PORT_FACTS;
-    request.PortNumber = 0;
+    request.PortNumber = PortNumber;
     request.MsgContext = context;
     if (!mpt_doorbell_message(&request, sizeof(request), Facts,
                               sizeof(*Facts))) {
@@ -19183,11 +19840,14 @@ static BOOLEAN mpt_get_port_facts(MPT_PORT_FACTS_REPLY *Facts)
     }
     return Facts->Function == MPT_FUNCTION_PORT_FACTS &&
         Facts->MsgContext == context &&
+        Facts->MsgLength >= sizeof(*Facts) / sizeof(UINT32) &&
         (Facts->IOCStatus & MPT_IOCSTATUS_MASK) == MPT_IOCSTATUS_SUCCESS &&
-        Facts->PortNumber == 0 && Facts->PortType == MPT_PORTTYPE_SCSI &&
-        Facts->MaxDevices == SCSI_DEVICE_MAX &&
-        Facts->PortScsiId == SCSI_HOST_ID &&
-        Facts->ProtocolFlags == MPT_PORT_PROTOCOL_INITIATOR;
+        Facts->PortNumber == PortNumber && Facts->PortType == info.PortType &&
+        Facts->MaxDevices == info.MaxDevices &&
+        (Facts->ProtocolFlags & MPT_PORT_PROTOCOL_INITIATOR) != 0 &&
+        (mMpt.Variant != MptVariantLsi53C1030 ||
+         (Facts->PortScsiId == SCSI_HOST_ID &&
+          Facts->ProtocolFlags == MPT_PORT_PROTOCOL_INITIATOR));
 }
 
 static BOOLEAN mpt_ioc_init(VOID)
@@ -19199,8 +19859,8 @@ static BOOLEAN mpt_ioc_init(VOID)
     fw_set_mem(&request, sizeof(request), 0);
     request.WhoInit = MPT_WHOINIT_SYSTEM_BIOS;
     request.Function = MPT_FUNCTION_IOC_INIT;
-    request.MaxDevices = SCSI_DEVICE_MAX;
-    request.MaxBuses = 1;
+    request.MaxDevices = mMpt.MaxDevices;
+    request.MaxBuses = mMpt.MaxBuses;
     request.MsgContext = context;
     request.ReplyFrameSize = MPT_REPLY_FRAME_BYTES;
     request.HostMfaHighAddr = (UINT32)(mMpt.AllocationBase >> 32);
@@ -19217,7 +19877,7 @@ static BOOLEAN mpt_ioc_init(VOID)
                              MPT_COMMAND_TIMEOUT_100NS);
 }
 
-static BOOLEAN mpt_enable_port(VOID)
+static BOOLEAN mpt_enable_port(UINT8 PortNumber)
 {
     MPT_PORT_REQUEST request;
     MPT_DEFAULT_REPLY reply;
@@ -19225,7 +19885,7 @@ static BOOLEAN mpt_enable_port(VOID)
 
     fw_set_mem(&request, sizeof(request), 0);
     request.Function = MPT_FUNCTION_PORT_ENABLE;
-    request.PortNumber = 0;
+    request.PortNumber = PortNumber;
     request.MsgContext = context;
     return mpt_doorbell_message(&request, sizeof(request), &reply,
                                 sizeof(reply)) &&
@@ -19236,6 +19896,7 @@ static BOOLEAN mpt_activate_transport(VOID)
 {
     MPT_IOC_FACTS_REPLY ioc_facts;
     MPT_PORT_FACTS_REPLY port_facts;
+    UINT8 port;
 
     if (!mMpt.Configured || mMpt.CommandActive) {
         return 0;
@@ -19245,12 +19906,26 @@ static BOOLEAN mpt_activate_transport(VOID)
         return 0;
     }
     fw_set_mem(mpt_dma(0), MPT_DMA_TOTAL_BYTES, 0);
-    if (!mpt_get_ioc_facts(&ioc_facts) ||
-        !mpt_get_port_facts(&port_facts) || !mpt_ioc_init() ||
-        !mpt_enable_port()) {
+    if (!mpt_get_ioc_facts(&ioc_facts)) {
         return 0;
     }
-    mMpt.MaxDevices = (UINT8)port_facts.MaxDevices;
+    for (port = 0; port < ioc_facts.NumberOfPorts; port++) {
+        if (!mpt_get_port_facts(port, &port_facts)) {
+            return 0;
+        }
+    }
+    mMpt.NumberOfPorts = ioc_facts.NumberOfPorts;
+    mMpt.MaxDevices = ioc_facts.MaxDevices;
+    mMpt.MaxBuses = ioc_facts.MaxBuses;
+    mMpt.PortType = port_facts.PortType;
+    if (!mpt_ioc_init()) {
+        return 0;
+    }
+    for (port = 0; port < mMpt.NumberOfPorts; port++) {
+        if (!mpt_enable_port(port)) {
+            return 0;
+        }
+    }
     mpt_write32(MPT_REPLY_FIFO, mpt_dma_address(MPT_REQUEST_FRAME_BYTES));
     mMpt.Active = 1;
     return 1;
@@ -19346,7 +20021,7 @@ static BOOLEAN mpt_scsi_command_prepared(SCSI_DEVICE *Dev, UINTN CdbLen,
     BOOLEAN response_present;
 
     if (Dev == NULL || !Dev->present || Dev->target >= mMpt.MaxDevices ||
-        Dev->target == SCSI_HOST_ID || !mMpt.Active ||
+        mpt_target_is_reserved(Dev->target) || !mMpt.Active ||
         CdbLen == 0 || CdbLen > sizeof(request->Cdb) ||
         !mpt_cdb_direction(mScsiCdb, CdbLen, &direction) ||
         ((direction == MptDataNone) != (DataLen == 0)) ||
@@ -19411,7 +20086,7 @@ static BOOLEAN mpt_reset_scsi_target(UINT8 Target)
     BOOLEAN response_present;
 
     if (!mMpt.Active || Target >= mMpt.MaxDevices ||
-        Target == SCSI_HOST_ID) {
+        mpt_target_is_reserved(Target)) {
         return 0;
     }
     fw_set_mem(request, MPT_REQUEST_FRAME_BYTES, 0);
@@ -19432,16 +20107,19 @@ static BOOLEAN mpt_reset_scsi_target(UINT8 Target)
          reply->ResponseCode == MPT_TASK_SUCCEEDED);
 }
 
-static BOOLEAN mpt_find_controller(PCI_DEVICE_LOCATION *Location)
+static BOOLEAN mpt_find_controller(PCI_DEVICE_LOCATION *Location,
+                                   FW_MPT_VARIANT *Variant)
 {
     UINT16 bus;
     UINT8 device;
     UINT8 function;
     UINT8 function_count;
 
-    if (Location == NULL || !fw_zx6000_profile_enabled()) {
+    if (Location == NULL || Variant == NULL ||
+        !fw_zx6000_profile_enabled()) {
         return 0;
     }
+    *Variant = MptVariantNone;
     for (bus = 0; bus < PCI_MAX_BUSES; bus++) {
         for (device = 0; device < PCI_MAX_DEVICES; device++) {
             function_count = 1;
@@ -19462,7 +20140,8 @@ static BOOLEAN mpt_find_controller(PCI_DEVICE_LOCATION *Location)
                      PCI_HEADER_TYPE_MULTI_FUNC) != 0) {
                     function_count = PCI_MAX_FUNCTIONS;
                 }
-                if (id == MPT_LSI53C1030_VENDOR_DEVICE_ID &&
+                if ((id == MPT_LSI53C1030_VENDOR_DEVICE_ID ||
+                     id == MPT_LSISAS1068_VENDOR_DEVICE_ID) &&
                     ((UINT32)pci_config_read_value(
                          0, (UINT8)bus, device, function,
                          PCI_CLASS_REVISION_OFFSET, 4) & 0xffff0000U) ==
@@ -19470,6 +20149,8 @@ static BOOLEAN mpt_find_controller(PCI_DEVICE_LOCATION *Location)
                     Location->Bus = (UINT8)bus;
                     Location->Device = device;
                     Location->Function = function;
+                    *Variant = id == MPT_LSI53C1030_VENDOR_DEVICE_ID ?
+                        MptVariantLsi53C1030 : MptVariantLsiSas1068;
                     return 1;
                 }
             }
@@ -19483,6 +20164,7 @@ static BOOLEAN mpt_controller_resources(
 {
     const IA64PlatformPciRoot *root;
     UINT32 bar;
+    UINT32 bar_high = 0;
     UINT64 child_base;
 
     if (Location == NULL || MmioBase == NULL || RootIndex == NULL) {
@@ -19499,10 +20181,17 @@ static BOOLEAN mpt_controller_resources(
     bar = (UINT32)pci_config_read_value(
         0, Location->Bus, Location->Device, Location->Function,
         PCI_LSI_BAR1_OFFSET, 4);
-    if (bar == 0 || bar == 0xffffffffU || (bar & 7U) != 0) {
+    if (bar == 0 || bar == 0xffffffffU || (bar & 1U) != 0 ||
+        (bar & 0x6U) == 0x2U || (bar & 0x6U) == 0x6U) {
         return 0;
     }
-    child_base = bar & ~(UINT64)0x0fU;
+    if ((bar & 0x6U) == 0x4U) {
+        bar_high = (UINT32)pci_config_read_value(
+            0, Location->Bus, Location->Device, Location->Function,
+            PCI_LSI_BAR1_OFFSET + 4U, 4);
+    }
+    child_base = ((UINT64)bar_high << 32) |
+        (bar & ~(UINT64)0x0fU);
     if (child_base < root->Mmio32Base ||
         child_base - root->Mmio32Base > root->Mmio32Size - MPT_MMIO_SIZE ||
         !fw_platform_translate_range(child_base, MPT_MMIO_SIZE,
@@ -19549,6 +20238,7 @@ static BOOLEAN mpt_allocate_dma(const IA64PlatformPciRoot *Root)
 static BOOLEAN mpt_init_controller(VOID)
 {
     PCI_DEVICE_LOCATION location;
+    FW_MPT_VARIANT variant;
     UINT64 mmio_base;
     UINTN root_index;
     UINT16 command;
@@ -19558,7 +20248,7 @@ static BOOLEAN mpt_init_controller(VOID)
         return mMpt.Active;
     }
     if (mScsiController != ScsiControllerNone ||
-        !mpt_find_controller(&location) ||
+        !mpt_find_controller(&location, &variant) ||
         !mpt_controller_resources(&location, &mmio_base, &root_index)) {
         return 0;
     }
@@ -19567,6 +20257,7 @@ static BOOLEAN mpt_init_controller(VOID)
     mMpt.Location = location;
     mMpt.RootIndex = root_index;
     mMpt.MmioBase = mmio_base;
+    mMpt.Variant = variant;
     mMpt.NextContext = 0x10300000U;
     if (!mpt_allocate_dma(&mPlatformProfile.PciRoot[root_index])) {
         fw_set_mem(&mMpt, sizeof(mMpt), 0);
@@ -19594,7 +20285,9 @@ static BOOLEAN mpt_init_controller(VOID)
         goto fail;
     }
     mScsiController = ScsiControllerLsi53C1030;
-    uart_puts("SCSI controller:      LSI53C1030 MPT mmio=0x");
+    uart_puts(mMpt.Variant == MptVariantLsiSas1068 ?
+        "SCSI controller:      LSI SAS1068 MPT mmio=0x" :
+        "SCSI controller:      LSI53C1030 MPT mmio=0x");
     uart_put_hex64(mMpt.MmioBase);
     uart_puts("\r\n");
     return 1;
@@ -20328,7 +21021,7 @@ static void scsi_probe_devices(void)
         if (!mpt_init_controller()) {
             return;
         }
-        target_count = SCSI_DEVICE_MAX;
+        target_count = mMpt.MaxDevices;
     } else {
         if (!lsi_init_controller()) {
             return;
@@ -20345,7 +21038,9 @@ static void scsi_probe_devices(void)
         UINT8 *inquiry = mScsiBounce;
         UINT8 type;
 
-        if (target == SCSI_HOST_ID) {
+        if (target == SCSI_HOST_ID &&
+            (mScsiController != ScsiControllerLsi53C1030 ||
+             mpt_target_is_reserved((UINT8)target))) {
             continue;
         }
 
@@ -22487,9 +23182,10 @@ typedef struct {
     FW_DEVICE_PATH_NODE End;
 } __attribute__((packed)) FW_PCI_ROOT_BRIDGE_DEVICE_PATH;
 
-/* EFI_ACPI_HID_DEVICE_PATH HID encodings for the two PCI root identities. */
+/* EFI_ACPI_HID_DEVICE_PATH HID encodings for the PCI root identities. */
 #define FW_ACPI_PATH_HID_PNP0A03 0x0A0341D0U
 #define FW_ACPI_PATH_HID_HWP0002 0x000222F0U
+#define FW_ACPI_PATH_HID_HWP0003 0x000322F0U
 
 typedef struct {
     FW_DEVICE_PATH_NODE Header;
@@ -22505,6 +23201,27 @@ typedef struct {
 typedef struct {
     UINT8 Bytes[FW_PCI_ROOT_EXPANDED_DEVICE_PATH_MAX];
 } FW_PCI_ROOT_EXPANDED_DEVICE_PATH;
+
+#define FW_GRAPHICS_EXPANDED_DEVICE_PATH_MAX \
+    (FW_PCI_ROOT_EXPANDED_DEVICE_PATH_MAX + \
+     sizeof(FW_PCI_DEVICE_PATH_NODE))
+
+typedef union {
+    FW_GRAPHICS_DEVICE_PATH Simple;
+    UINT8 Bytes[FW_GRAPHICS_EXPANDED_DEVICE_PATH_MAX];
+} FW_GRAPHICS_DEVICE_PATH_STORAGE;
+
+typedef struct {
+    UINT8 Bytes[FW_GRAPHICS_EXPANDED_DEVICE_PATH_MAX];
+    UINTN Size;
+} FW_PLATFORM_PCI_DEVICE_PATH;
+
+#define FW_PLATFORM_DEVICE_PATH_MAX 128U
+
+typedef struct {
+    UINT8 Bytes[FW_PLATFORM_DEVICE_PATH_MAX];
+    UINTN Size;
+} FW_PLATFORM_DEVICE_PATH;
 
 typedef struct {
     FW_ACPI_HID_DEVICE_PATH_NODE Acpi;
@@ -22545,18 +23262,129 @@ static FW_DEVICE_PATH_NODE mEndDevicePath = {
     .Length = 4,
 };
 
-static UINT32 fw_platform_pci_root_path_hid(VOID)
+static UINT32 fw_platform_pci_root_path_hid(UINTN RootIndex)
 {
-    return mPlatformProfile.Present &&
-           mPlatformProfile.Descriptor.PlatformId ==
-               IA64_PLATFORM_ID_HP_ZX6000 ?
-        FW_ACPI_PATH_HID_HWP0002 : FW_ACPI_PATH_HID_PNP0A03;
+    if (mPlatformProfile.Present &&
+        ia64_platform_is_hp_zx(mPlatformProfile.Descriptor.PlatformId)) {
+        if (RootIndex < mPlatformProfile.PciRootCount &&
+            (mPlatformProfile.PciRoot[RootIndex].Flags &
+             IA64_PLATFORM_PCI_ROOT_FLAG_AGP) != 0) {
+            return FW_ACPI_PATH_HID_HWP0003;
+        }
+        return FW_ACPI_PATH_HID_HWP0002;
+    }
+    return FW_ACPI_PATH_HID_PNP0A03;
 }
 
 static UINT32 fw_platform_pci_root_path_uid(UINTN RootIndex)
 {
     return fw_zx6000_profile_enabled() ?
-        fw_acpi_zx6000_root_uid(RootIndex) : (UINT32)RootIndex;
+        fw_acpi_hp_root_uid(&mPlatformProfile.PciRoot[RootIndex],
+                            RootIndex, mPlatformProfile.PciRootCount) :
+        (UINT32)RootIndex;
+}
+
+static UINTN fw_platform_pci_root_path_node_build(
+    UINTN RootIndex, UINT8 *Buffer, UINTN Capacity)
+{
+    UINT32 hid;
+    UINT32 uid;
+
+    if (RootIndex >= mPlatformProfile.PciRootCount || Buffer == NULL) {
+        return 0;
+    }
+    hid = fw_platform_pci_root_path_hid(RootIndex);
+    uid = fw_platform_pci_root_path_uid(RootIndex);
+
+    if (ia64_platform_is_hp_zx(
+            mPlatformProfile.Descriptor.PlatformId)) {
+        FW_ACPI_EXPANDED_HID_DEVICE_PATH_NODE *node;
+        UINTN size = sizeof(*node) + 3U;
+
+        if (size > Capacity) {
+            return 0;
+        }
+        node = (FW_ACPI_EXPANDED_HID_DEVICE_PATH_NODE *)(VOID *)Buffer;
+        fw_set_mem(node, size, 0);
+        node->Header.Type = 0x02;
+        node->Header.SubType = 0x02;
+        node->Header.Length = size;
+        node->Hid = hid;
+        node->Uid = uid;
+        node->Cid = FW_ACPI_PATH_HID_PNP0A03;
+        return size;
+    } else {
+        FW_ACPI_HID_DEVICE_PATH_NODE *node;
+
+        if (sizeof(*node) > Capacity) {
+            return 0;
+        }
+        node = (FW_ACPI_HID_DEVICE_PATH_NODE *)(VOID *)Buffer;
+        fw_set_mem(node, sizeof(*node), 0);
+        node->Header.Type = 0x02;
+        node->Header.SubType = 0x01;
+        node->Header.Length = sizeof(*node);
+        node->Hid = hid;
+        node->Uid = uid;
+        return sizeof(*node);
+    }
+}
+
+static UINTN fw_platform_pci_device_path_build(
+    UINTN RootIndex, UINT8 Device, UINT8 Function,
+    UINT8 *Buffer, UINTN Capacity)
+{
+    FW_PCI_DEVICE_PATH_NODE *pci;
+    FW_DEVICE_PATH_NODE *end;
+    UINTN node_size;
+
+    if (Capacity < sizeof(*pci) + sizeof(*end)) {
+        return 0;
+    }
+    node_size = fw_platform_pci_root_path_node_build(
+        RootIndex, Buffer, Capacity);
+    if (node_size == 0 ||
+        node_size > Capacity - sizeof(*pci) - sizeof(*end)) {
+        return 0;
+    }
+    pci = (FW_PCI_DEVICE_PATH_NODE *)(VOID *)(Buffer + node_size);
+    pci->Header.Type = 0x01;
+    pci->Header.SubType = 0x01;
+    pci->Header.Length = sizeof(*pci);
+    pci->Device = Device;
+    pci->Function = Function;
+    end = (FW_DEVICE_PATH_NODE *)(VOID *)(pci + 1);
+    end->Type = 0x7f;
+    end->SubType = 0xff;
+    end->Length = sizeof(*end);
+    return node_size + sizeof(*pci) + sizeof(*end);
+}
+
+static BOOLEAN fw_platform_device_path_build(
+    UINTN RootIndex, const VOID *SimplePath, UINTN SimplePathSize,
+    FW_PLATFORM_DEVICE_PATH *Published)
+{
+    UINTN root_size;
+    UINTN tail_size;
+
+    if (SimplePath == NULL || Published == NULL ||
+        SimplePathSize < sizeof(FW_ACPI_HID_DEVICE_PATH_NODE)) {
+        return 0;
+    }
+    fw_set_mem(Published, sizeof(*Published), 0);
+    root_size = fw_platform_pci_root_path_node_build(
+        RootIndex, Published->Bytes, sizeof(Published->Bytes));
+    tail_size = SimplePathSize - sizeof(FW_ACPI_HID_DEVICE_PATH_NODE);
+    if (root_size == 0 ||
+        tail_size > sizeof(Published->Bytes) - root_size) {
+        return 0;
+    }
+    fw_copy_mem(Published->Bytes + root_size,
+                (const UINT8 *)SimplePath +
+                    sizeof(FW_ACPI_HID_DEVICE_PATH_NODE),
+                tail_size);
+    Published->Size = root_size + tail_size;
+    return 1;
 }
 
 static FW_PCI_ROOT_BRIDGE_DEVICE_PATH mPciRootBridgeDevicePath = {
@@ -22760,31 +23588,34 @@ static FW_SATA_BLOCK_DEVICE_PATH mSataBlockDevicePath = {
 
 #undef FW_SATA_RAW_BLOCK_DEVICE_PATH_INIT
 
-static FW_GRAPHICS_DEVICE_PATH mGraphicsDevicePath = {
-    .Acpi = {
-        .Header = {
-            .Type = 0x02,
-            .SubType = 0x01,
-            .Length = sizeof(FW_ACPI_HID_DEVICE_PATH_NODE),
+static FW_GRAPHICS_DEVICE_PATH_STORAGE mGraphicsDevicePath = {
+    .Simple = {
+        .Acpi = {
+            .Header = {
+                .Type = 0x02,
+                .SubType = 0x01,
+                .Length = sizeof(FW_ACPI_HID_DEVICE_PATH_NODE),
+            },
+            .Hid = 0x0A0341D0,
+            .Uid = 0,
         },
-        .Hid = 0x0A0341D0,
-        .Uid = 0,
-    },
-    .Pci = {
-        .Header = {
-            .Type = 0x01,
-            .SubType = 0x01,
-            .Length = sizeof(FW_PCI_DEVICE_PATH_NODE),
+        .Pci = {
+            .Header = {
+                .Type = 0x01,
+                .SubType = 0x01,
+                .Length = sizeof(FW_PCI_DEVICE_PATH_NODE),
+            },
+            .Function = 0,
+            .Device = 5,
         },
-        .Function = 0,
-        .Device = 5,
-    },
-    .End = {
-        .Type = 0x7f,
-        .SubType = 0xff,
-        .Length = 4,
+        .End = {
+            .Type = 0x7f,
+            .SubType = 0xff,
+            .Length = 4,
+        },
     },
 };
+static UINTN mGraphicsDevicePathSize = sizeof(FW_GRAPHICS_DEVICE_PATH);
 
 static FW_CONSOLE_OUTPUT_DEVICE_PATH mConsoleOutputDevicePath = {
     .Graphics = {
@@ -22920,13 +23751,14 @@ static FW_OPTICAL_SETUP_LOADER_DEVICE_PATH mOpticalSetupLoaderDevicePath = {
 };
 
 static void fw_storage_pci_location(const FW_STORAGE_DEVICE *Device,
-                                    UINT32 *RootUid, UINT8 *PciDevice,
-                                    UINT8 *PciFunction)
+                                    UINTN *RootIndex, UINT32 *RootUid,
+                                    UINT8 *PciDevice, UINT8 *PciFunction)
 {
     const FW_IDE_POLICY *i2000_ide = fw_i2000_ide_policy();
     const FW_PCI_IO_DEVICE *lsi = &mPciIoDevices[4];
     UINTN i;
 
+    *RootIndex = 0;
     *RootUid = 0;
     *PciFunction = 0;
     if (Device != NULL && Device->Kind == FW_STORAGE_IDE) {
@@ -22943,6 +23775,7 @@ static void fw_storage_pci_location(const FW_STORAGE_DEVICE *Device,
                 if (root->Segment == 0 &&
                     mIdeControllerLocation.Bus >= root->Bus &&
                     mIdeControllerLocation.Bus <= root->BusEnd) {
+                    *RootIndex = i;
                     *RootUid = fw_platform_pci_root_path_uid(i);
                     break;
                 }
@@ -22960,6 +23793,7 @@ static void fw_storage_pci_location(const FW_STORAGE_DEVICE *Device,
     }
     if (Device != NULL && Device->Kind == FW_STORAGE_SCSI &&
         mScsiController == ScsiControllerLsi53C1030) {
+        *RootIndex = mMpt.RootIndex;
         *RootUid = fw_platform_pci_root_path_uid(mMpt.RootIndex);
         *PciDevice = mMpt.Location.Device;
         *PciFunction = mMpt.Location.Function;
@@ -22973,6 +23807,7 @@ static void fw_storage_pci_location(const FW_STORAGE_DEVICE *Device,
             if (root->Segment == ISP12160_QEMU_I2000_SEGMENT &&
                 root->Bus <= ISP12160_QEMU_I2000_BUS &&
                 ISP12160_QEMU_I2000_BUS <= root->BusEnd) {
+                *RootIndex = i;
                 *RootUid = fw_platform_pci_root_path_uid(i);
                 break;
             }
@@ -22984,6 +23819,7 @@ static void fw_storage_pci_location(const FW_STORAGE_DEVICE *Device,
     if (Device != NULL && Device->Kind == FW_STORAGE_SCSI &&
         mScsiController == ScsiControllerLsi53C895A &&
         mPciLsiHandle != NULL) {
+        *RootIndex = lsi->RootIndex;
         *RootUid = fw_platform_pci_root_path_uid(lsi->RootIndex);
         *PciDevice = lsi->Device;
         *PciFunction = lsi->Function;
@@ -23078,50 +23914,137 @@ static FW_BOOT_FULL_DEVICE_PATH mBootFullDevicePath = {
     },
 };
 
+static FW_PLATFORM_DEVICE_PATH mPublishedBlockDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedRawBlockDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedDiskBlockDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedSataBootDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedSataBlockDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedSataDiskDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedSataRawDevicePath;
+static FW_PLATFORM_DEVICE_PATH mPublishedOpticalSetupDevicePath;
+static VOID *mBlockDevicePathProtocol = &mBlockDevicePath;
+static VOID *mRawBlockDevicePathProtocol = &mRawBlockDevicePath;
+static VOID *mDiskBlockDevicePathProtocol = &mDiskBlockDevicePath;
+static VOID *mSataBootDevicePathProtocol = &mSataBootDevicePath;
+static VOID *mSataBlockDevicePathProtocol = &mSataBlockDevicePath;
+static VOID *mSataDiskDevicePathProtocol = &mSataDiskDevicePath;
+static VOID *mSataRawDevicePathProtocol = &mSataRawDevicePath;
+static VOID *mOpticalSetupDevicePathProtocol =
+    &mOpticalSetupLoaderDevicePath;
+static UINTN mOpticalSetupDevicePathSize =
+    sizeof(mOpticalSetupLoaderDevicePath);
+
+static BOOLEAN fw_publish_storage_device_paths(VOID)
+{
+    UINTN boot_root;
+    UINTN disk_root;
+    UINTN raw_root;
+    UINT32 root_uid;
+    UINT8 pci_device;
+    UINT8 pci_function;
+
+    if (!mPlatformProfile.Present ||
+        !ia64_platform_is_hp_zx(
+            mPlatformProfile.Descriptor.PlatformId)) {
+        return 1;
+    }
+    fw_storage_pci_location(&mBootStorageDevice, &boot_root, &root_uid,
+                            &pci_device, &pci_function);
+    fw_storage_pci_location(&mDiskStorageDevice, &disk_root, &root_uid,
+                            &pci_device, &pci_function);
+    fw_storage_pci_location(&mRawStorageDevice, &raw_root, &root_uid,
+                            &pci_device, &pci_function);
+
+#define FW_PUBLISH_PATH(Root, Source, Published, Protocol) \
+    do { \
+        if (!fw_platform_device_path_build( \
+                (Root), &(Source), sizeof(Source), &(Published))) { \
+            return 0; \
+        } \
+        (Protocol) = (Published).Bytes; \
+    } while (0)
+
+    FW_PUBLISH_PATH(boot_root, mBlockDevicePath,
+                    mPublishedBlockDevicePath,
+                    mBlockDevicePathProtocol);
+    FW_PUBLISH_PATH(raw_root, mRawBlockDevicePath,
+                    mPublishedRawBlockDevicePath,
+                    mRawBlockDevicePathProtocol);
+    FW_PUBLISH_PATH(disk_root, mDiskBlockDevicePath,
+                    mPublishedDiskBlockDevicePath,
+                    mDiskBlockDevicePathProtocol);
+    FW_PUBLISH_PATH(boot_root, mSataBootDevicePath,
+                    mPublishedSataBootDevicePath,
+                    mSataBootDevicePathProtocol);
+    FW_PUBLISH_PATH(boot_root, mSataBlockDevicePath,
+                    mPublishedSataBlockDevicePath,
+                    mSataBlockDevicePathProtocol);
+    FW_PUBLISH_PATH(disk_root, mSataDiskDevicePath,
+                    mPublishedSataDiskDevicePath,
+                    mSataDiskDevicePathProtocol);
+    FW_PUBLISH_PATH(raw_root, mSataRawDevicePath,
+                    mPublishedSataRawDevicePath,
+                    mSataRawDevicePathProtocol);
+    FW_PUBLISH_PATH(boot_root, mOpticalSetupLoaderDevicePath,
+                    mPublishedOpticalSetupDevicePath,
+                    mOpticalSetupDevicePathProtocol);
+    mOpticalSetupDevicePathSize = mPublishedOpticalSetupDevicePath.Size;
+
+#undef FW_PUBLISH_PATH
+    return 1;
+}
+
 static void fw_update_storage_device_paths(VOID)
 {
-    UINT32 root_hid = fw_platform_pci_root_path_hid();
+    UINTN boot_root_index;
     UINT32 boot_root_uid;
     UINT8 boot_pci;
     UINT8 boot_function;
+    UINTN disk_root_index;
     UINT32 disk_root_uid;
     UINT8 disk_pci;
     UINT8 disk_function;
+    UINTN raw_root_index;
     UINT32 raw_root_uid;
     UINT8 raw_pci;
     UINT8 raw_function;
 
-    fw_storage_pci_location(&mBootStorageDevice, &boot_root_uid, &boot_pci,
-                            &boot_function);
-    fw_storage_pci_location(&mDiskStorageDevice, &disk_root_uid, &disk_pci,
-                            &disk_function);
-    fw_storage_pci_location(&mRawStorageDevice, &raw_root_uid, &raw_pci,
-                            &raw_function);
+    fw_storage_pci_location(&mBootStorageDevice, &boot_root_index,
+                            &boot_root_uid, &boot_pci, &boot_function);
+    fw_storage_pci_location(&mDiskStorageDevice, &disk_root_index,
+                            &disk_root_uid, &disk_pci, &disk_function);
+    fw_storage_pci_location(&mRawStorageDevice, &raw_root_index,
+                            &raw_root_uid, &raw_pci, &raw_function);
 
-    mBlockDevicePath.Acpi.Hid = root_hid;
+    mBlockDevicePath.Acpi.Hid =
+        fw_platform_pci_root_path_hid(boot_root_index);
     mBlockDevicePath.Acpi.Uid = boot_root_uid;
     mBlockDevicePath.Pci.Device = boot_pci;
     mBlockDevicePath.Pci.Function = boot_function;
     fw_set_storage_path_node(&mBlockDevicePath.Atapi, &mBootStorageDevice);
-    mRawBlockDevicePath.Acpi.Hid = root_hid;
+    mRawBlockDevicePath.Acpi.Hid =
+        fw_platform_pci_root_path_hid(raw_root_index);
     mRawBlockDevicePath.Acpi.Uid = raw_root_uid;
     mRawBlockDevicePath.Pci.Device = raw_pci;
     mRawBlockDevicePath.Pci.Function = raw_function;
     fw_set_storage_path_node(&mRawBlockDevicePath.Atapi, &mRawStorageDevice);
-    mBootFullDevicePath.Acpi.Hid = root_hid;
+    mBootFullDevicePath.Acpi.Hid =
+        fw_platform_pci_root_path_hid(boot_root_index);
     mBootFullDevicePath.Acpi.Uid = boot_root_uid;
     mBootFullDevicePath.Pci.Device = boot_pci;
     mBootFullDevicePath.Pci.Function = boot_function;
     fw_set_storage_path_node(&mBootFullDevicePath.Atapi, &mBootStorageDevice);
 
-    mOpticalSetupLoaderDevicePath.Acpi.Hid = root_hid;
+    mOpticalSetupLoaderDevicePath.Acpi.Hid =
+        fw_platform_pci_root_path_hid(boot_root_index);
     mOpticalSetupLoaderDevicePath.Acpi.Uid = boot_root_uid;
     mOpticalSetupLoaderDevicePath.Pci.Device = boot_pci;
     mOpticalSetupLoaderDevicePath.Pci.Function = boot_function;
     fw_set_storage_path_node(&mOpticalSetupLoaderDevicePath.Atapi,
                              &mBootStorageDevice);
 
-    mDiskBlockDevicePath.Acpi.Hid = root_hid;
+    mDiskBlockDevicePath.Acpi.Hid =
+        fw_platform_pci_root_path_hid(disk_root_index);
     mDiskBlockDevicePath.Acpi.Uid = disk_root_uid;
     mDiskBlockDevicePath.Pci.Device = disk_pci;
     mDiskBlockDevicePath.Pci.Function = disk_function;
@@ -28134,7 +29057,7 @@ static FW_FIRMWARE_VARIABLE mFirmwareVariables[] = {
         "ConOut", mEfiGlobalVariableGuid,
         EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
             EFI_VARIABLE_RUNTIME_ACCESS,
-        &mGraphicsDevicePath, sizeof(mGraphicsDevicePath), NULL,
+        &mGraphicsDevicePath, sizeof(FW_GRAPHICS_DEVICE_PATH), NULL,
     },
     {
         "ConOutDev", mEfiGlobalVariableGuid,
@@ -28145,12 +29068,12 @@ static FW_FIRMWARE_VARIABLE mFirmwareVariables[] = {
         "ErrOut", mEfiGlobalVariableGuid,
         EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
             EFI_VARIABLE_RUNTIME_ACCESS,
-        &mGraphicsDevicePath, sizeof(mGraphicsDevicePath), NULL,
+        &mGraphicsDevicePath, sizeof(FW_GRAPHICS_DEVICE_PATH), NULL,
     },
     {
         "ErrOutDev", mEfiGlobalVariableGuid,
         EFI_VARIABLE_BOOTSERVICE_ACCESS | EFI_VARIABLE_RUNTIME_ACCESS,
-        &mGraphicsDevicePath, sizeof(mGraphicsDevicePath), NULL,
+        &mGraphicsDevicePath, sizeof(FW_GRAPHICS_DEVICE_PATH), NULL,
     },
     {
         "Lang", mEfiGlobalVariableGuid,
@@ -28193,16 +29116,22 @@ static void efi_apply_platform_variable_profile(void)
     if (fw_graphics_present()) {
         var = &mFirmwareVariables[FW_VARIABLE_CON_OUT];
         var->data = &mGraphicsDevicePath;
-        var->data_size = sizeof(mGraphicsDevicePath);
+        var->data_size = mGraphicsDevicePathSize;
         var = &mFirmwareVariables[FW_VARIABLE_CON_OUT_DEV];
-        var->data = &mConsoleOutputDevicePath;
-        var->data_size = sizeof(mConsoleOutputDevicePath);
+        if (ia64_platform_is_hp_zx(
+                mPlatformProfile.Descriptor.PlatformId)) {
+            var->data = &mGraphicsDevicePath;
+            var->data_size = mGraphicsDevicePathSize;
+        } else {
+            var->data = &mConsoleOutputDevicePath;
+            var->data_size = sizeof(mConsoleOutputDevicePath);
+        }
         var = &mFirmwareVariables[FW_VARIABLE_ERR_OUT];
         var->data = &mGraphicsDevicePath;
-        var->data_size = sizeof(mGraphicsDevicePath);
+        var->data_size = mGraphicsDevicePathSize;
         var = &mFirmwareVariables[FW_VARIABLE_ERR_OUT_DEV];
         var->data = &mGraphicsDevicePath;
-        var->data_size = sizeof(mGraphicsDevicePath);
+        var->data_size = mGraphicsDevicePathSize;
         return;
     }
 
@@ -28591,6 +29520,7 @@ static const FW_PCI_ROOT_BRIDGE_RESOURCES mPciRootBridgeResources = {
 #define EFI_PCI_ATTRIBUTE_MEMORY_CACHED      0x0800ULL
 #define EFI_PCI_ATTRIBUTE_MEMORY_DISABLE     0x1000ULL
 #define EFI_PCI_ATTRIBUTE_DUAL_ADDRESS_CYCLE 0x8000ULL
+#define EFI_PCI_ATTRIBUTE_VGA_IO_16          0x40000ULL
 
 #define PCI_COMMAND_OFFSET                   0x04U
 #define PCI_COMMAND_IO_SPACE                 0x0001U
@@ -28603,13 +29533,18 @@ static const FW_PCI_ROOT_BRIDGE_RESOURCES mPciRootBridgeResources = {
      EFI_PCI_ATTRIBUTE_MEMORY | \
      EFI_PCI_ATTRIBUTE_BUS_MASTER)
 
-#define FW_PCI_ROOT_BRIDGE_ATTRIBUTES \
+#define FW_PCI_ROOT_BRIDGE_BASE_ATTRIBUTES \
     (EFI_PCI_ATTRIBUTE_ISA_MOTHERBOARD_IO | \
      EFI_PCI_ATTRIBUTE_ISA_IO | \
-     EFI_PCI_ATTRIBUTE_VGA_MEMORY | \
-     EFI_PCI_ATTRIBUTE_VGA_IO | \
      EFI_PCI_ATTRIBUTE_IDE_PRIMARY_IO | \
      EFI_PCI_ATTRIBUTE_IDE_SECONDARY_IO)
+
+#define FW_PCI_ROOT_BRIDGE_VGA_ATTRIBUTES \
+    (EFI_PCI_ATTRIBUTE_VGA_MEMORY | EFI_PCI_ATTRIBUTE_VGA_IO_16)
+
+#define FW_PCI_ROOT_BRIDGE_ATTRIBUTES \
+    (FW_PCI_ROOT_BRIDGE_BASE_ATTRIBUTES | \
+     FW_PCI_ROOT_BRIDGE_VGA_ATTRIBUTES)
 
 #define FW_PCI_IDE_ATTRIBUTES \
     (EFI_PCI_ATTRIBUTE_IO | \
@@ -28638,7 +29573,146 @@ static const FW_PCI_ROOT_BRIDGE_RESOURCES mPciRootBridgeResources = {
      EFI_PCI_ATTRIBUTE_MEMORY | \
      EFI_PCI_ATTRIBUTE_BUS_MASTER | \
      EFI_PCI_ATTRIBUTE_VGA_MEMORY | \
-     EFI_PCI_ATTRIBUTE_VGA_IO)
+     EFI_PCI_ATTRIBUTE_VGA_IO_16)
+
+static BOOLEAN pci_platform_has_legacy_vga_root(VOID)
+{
+    UINTN i;
+
+    if (!mPlatformProfile.Present) {
+        return 0;
+    }
+    for (i = 0; i < mPlatformProfile.PciRootCount; i++) {
+        if ((mPlatformProfile.PciRoot[i].Flags &
+             IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) != 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static BOOLEAN pci_root_owns_legacy_vga(const FW_PCI_ROOT_CONTEXT *Context)
+{
+    return Context != NULL &&
+        (Context->Root.Flags &
+         IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) != 0;
+}
+
+static UINT64 pci_root_supported_attributes(
+    const IA64PlatformPciRoot *Root)
+{
+    return (Root->Flags & IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) != 0 ?
+        FW_PCI_ROOT_BRIDGE_VGA_ATTRIBUTES : 0;
+}
+
+typedef struct {
+    UINT64 Base;
+    UINT64 Size;
+} FW_PCI_LEGACY_IO_RANGE;
+
+static const FW_PCI_LEGACY_IO_RANGE mPciLegacyVgaIoRanges[] = {
+    { VBE_LEGACY_IO_BASE, VBE_LEGACY_IO_SIZE },
+    { VGA_LEGACY_IO_BASE, VGA_LEGACY_IO_SIZE },
+};
+
+static BOOLEAN pci_legacy_vga_io_contains(UINT64 Address, UINTN Size,
+                                          UINTN Count, BOOLEAN Fifo)
+{
+    UINTN i;
+
+    for (i = 0; i < FW_ARRAY_SIZE(mPciLegacyVgaIoRanges); i++) {
+        if (fw_pci_aperture_contains(mPciLegacyVgaIoRanges[i].Base,
+                                     mPciLegacyVgaIoRanges[i].Size,
+                                     Address, Size, Count, Fifo)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static BOOLEAN pci_legacy_vga_memory_contains(UINT64 Address, UINTN Size,
+                                              UINTN Count, BOOLEAN Fifo)
+{
+    return fw_pci_aperture_contains(VGA_LEGACY_FB_BASE,
+                                    VGA_LEGACY_MEMORY_SIZE,
+                                    Address, Size, Count, Fifo);
+}
+
+static BOOLEAN pci_access_overlaps_aperture(
+    UINT64 Address, UINTN Size, UINTN Count, BOOLEAN Fifo,
+    UINT64 Base, UINT64 Length)
+{
+    UINT64 access_count = Fifo && Count != 0 ? 1U : (UINT64)Count;
+    UINT64 span;
+
+    if (access_count == 0) {
+        return 0;
+    }
+    if (Size == 0 || access_count > ~0ULL / Size) {
+        return 1;
+    }
+    span = access_count * Size;
+    if (Address > ~0ULL - (span - 1U)) {
+        return 1;
+    }
+    return Address < Base + Length && Base <= Address + span - 1U;
+}
+
+static BOOLEAN pci_root_io_aperture_contains(
+    const FW_PCI_ROOT_CONTEXT *Context, UINT64 Address, UINTN Size,
+    UINTN Count, BOOLEAN Fifo)
+{
+    UINTN i;
+
+    if (pci_legacy_vga_io_contains(Address, Size, Count, Fifo)) {
+        return pci_root_owns_legacy_vga(Context);
+    }
+    if (!fw_pci_aperture_contains(Context->Root.IoBase,
+                                  Context->Root.IoSize,
+                                  Address, Size, Count, Fifo)) {
+        return 0;
+    }
+    if (!pci_platform_has_legacy_vga_root()) {
+        return 1;
+    }
+    for (i = 0; i < FW_ARRAY_SIZE(mPciLegacyVgaIoRanges); i++) {
+        if (pci_access_overlaps_aperture(
+                Address, Size, Count, Fifo,
+                mPciLegacyVgaIoRanges[i].Base,
+                mPciLegacyVgaIoRanges[i].Size)) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static BOOLEAN pci_root_memory_translation(
+    const FW_PCI_ROOT_CONTEXT *Context, UINT64 Address, UINTN Size,
+    UINTN Count, BOOLEAN Fifo, UINT64 *Translation)
+{
+    if (pci_legacy_vga_memory_contains(Address, Size, Count, Fifo)) {
+        if (!pci_root_owns_legacy_vga(Context)) {
+            return 0;
+        }
+        *Translation = 0;
+        return 1;
+    }
+    if (fw_pci_aperture_contains(Context->Root.Mmio32Base,
+                                 Context->Root.Mmio32Size,
+                                 Address, Size, Count, Fifo)) {
+        *Translation = Context->Root.Mmio32TranslationOffset;
+    } else if (fw_pci_aperture_contains(Context->Root.Mmio64Base,
+                                        Context->Root.Mmio64Size,
+                                        Address, Size, Count, Fifo)) {
+        *Translation = Context->Root.Mmio64TranslationOffset;
+    } else {
+        return 0;
+    }
+    return !pci_platform_has_legacy_vga_root() ||
+        !pci_access_overlaps_aperture(
+            Address, Size, Count, Fifo, VGA_LEGACY_FB_BASE,
+            VGA_LEGACY_MEMORY_SIZE);
+}
 
 static BOOLEAN pci_width_valid(EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL_WIDTH Width)
 {
@@ -28805,22 +29879,14 @@ static EFI_STATUS pci_root_context_transfer(
         return EFI_SUCCESS;
     }
     if (IsIo) {
-        if (!fw_pci_aperture_contains(Context->Root.IoBase,
-                                      Context->Root.IoSize,
-                                      Address, size, Count, fifo)) {
+        if (!pci_root_io_aperture_contains(Context, Address, size,
+                                           Count, fifo)) {
             return EFI_INVALID_PARAMETER;
         }
         cpu_address = pci_io_cpu_addr(Address);
     } else {
-        if (fw_pci_aperture_contains(Context->Root.Mmio32Base,
-                                     Context->Root.Mmio32Size,
-                                     Address, size, Count, fifo)) {
-            translation = Context->Root.Mmio32TranslationOffset;
-        } else if (fw_pci_aperture_contains(Context->Root.Mmio64Base,
-                                            Context->Root.Mmio64Size,
-                                            Address, size, Count, fifo)) {
-            translation = Context->Root.Mmio64TranslationOffset;
-        } else {
+        if (!pci_root_memory_translation(Context, Address, size, Count,
+                                         fifo, &translation)) {
             return EFI_INVALID_PARAMETER;
         }
         if (!fw_platform_translate_range(Address, span, translation,
@@ -29262,26 +30328,10 @@ static EFI_STATUS pci_root_copy_mem(EFI_PCI_ROOT_BRIDGE_IO_PROTOCOL *This,
         return EFI_SUCCESS;
     }
     if (context != NULL) {
-        if (fw_pci_aperture_contains(context->Root.Mmio32Base,
-                                     context->Root.Mmio32Size,
-                                     SrcAddress, size, Count, 0)) {
-            src_translation = context->Root.Mmio32TranslationOffset;
-        } else if (fw_pci_aperture_contains(context->Root.Mmio64Base,
-                                            context->Root.Mmio64Size,
-                                            SrcAddress, size, Count, 0)) {
-            src_translation = context->Root.Mmio64TranslationOffset;
-        } else {
-            return EFI_INVALID_PARAMETER;
-        }
-        if (fw_pci_aperture_contains(context->Root.Mmio32Base,
-                                     context->Root.Mmio32Size,
-                                     DestAddress, size, Count, 0)) {
-            dst_translation = context->Root.Mmio32TranslationOffset;
-        } else if (fw_pci_aperture_contains(context->Root.Mmio64Base,
-                                            context->Root.Mmio64Size,
-                                            DestAddress, size, Count, 0)) {
-            dst_translation = context->Root.Mmio64TranslationOffset;
-        } else {
+        if (!pci_root_memory_translation(
+                context, SrcAddress, size, Count, 0, &src_translation) ||
+            !pci_root_memory_translation(
+                context, DestAddress, size, Count, 0, &dst_translation)) {
             return EFI_INVALID_PARAMETER;
         }
         if (!fw_platform_translate_range(SrcAddress, bytes,
@@ -29829,24 +30879,96 @@ static VOID pci_resource_list_end(ACPI_QWORD_ADDRESS_DESCRIPTOR *Next)
     end->Checksum = 0;
 }
 
-static BOOLEAN pci_root_configuration_build(FW_PCI_ROOT_CONTEXT *Context)
+static BOOLEAN pci_root_configuration_add(
+    FW_PCI_ROOT_CONTEXT *Context, UINTN *Count, UINT8 ResourceType,
+    UINT64 Granularity, UINT64 Minimum, UINT64 Maximum,
+    UINT64 Translation, UINT64 Length, UINT8 TypeSpecificFlags)
 {
     ACPI_QWORD_ADDRESS_DESCRIPTOR *descriptor;
+
+    if (*Count >= FW_ARRAY_SIZE(Context->Configuration.Address)) {
+        return 0;
+    }
+    descriptor = &Context->Configuration.Address[(*Count)++];
+    pci_address_descriptor_init(
+        descriptor, ResourceType, Granularity, Minimum, Maximum,
+        Translation, Length, TypeSpecificFlags);
+    return 1;
+}
+
+static BOOLEAN pci_root_configuration_add_io(
+    FW_PCI_ROOT_CONTEXT *Context, UINTN *Count, UINT64 Base, UINT64 Length)
+{
+    return Length == 0 || pci_root_configuration_add(
+        Context, Count, 1, 0, Base, Base + Length - 1U,
+        0, Length, 0);
+}
+
+static BOOLEAN pci_root_configuration_add_native_io(
+    FW_PCI_ROOT_CONTEXT *Context, UINTN *Count)
+{
+    UINT64 base = Context->Root.IoBase;
+    UINT64 cursor = base;
+    UINT64 end = base + Context->Root.IoSize;
+    UINTN i;
+
+    if (Context->Root.IoSize == 0) {
+        return 1;
+    }
+    if (!pci_platform_has_legacy_vga_root()) {
+        return pci_root_configuration_add_io(
+            Context, Count, base, Context->Root.IoSize);
+    }
+    for (i = 0; i < FW_ARRAY_SIZE(mPciLegacyVgaIoRanges); i++) {
+        UINT64 legacy_base = mPciLegacyVgaIoRanges[i].Base;
+        UINT64 legacy_end = legacy_base + mPciLegacyVgaIoRanges[i].Size;
+
+        if (cursor < end && cursor < legacy_base) {
+            UINT64 fragment_end = end < legacy_base ? end : legacy_base;
+
+            if (!pci_root_configuration_add_io(
+                    Context, Count, cursor, fragment_end - cursor)) {
+                return 0;
+            }
+            cursor = fragment_end;
+        }
+        if (cursor < end && cursor < legacy_end && end > legacy_base) {
+            cursor = end < legacy_end ? end : legacy_end;
+        }
+    }
+    return cursor >= end || pci_root_configuration_add_io(
+        Context, Count, cursor, end - cursor);
+}
+
+static BOOLEAN pci_root_configuration_build(FW_PCI_ROOT_CONTEXT *Context)
+{
     UINT64 cpu_base;
     UINTN count = 0;
 
     fw_set_mem(&Context->Configuration, sizeof(Context->Configuration), 0);
-    descriptor = &Context->Configuration.Address[count++];
-    pci_address_descriptor_init(
-        descriptor, 2, 0, Context->BusBase,
-        Context->BusBase + Context->BusLength - 1U, 0,
-        Context->BusLength, 0);
-    if (Context->Root.IoSize != 0) {
-        descriptor = &Context->Configuration.Address[count++];
-        pci_address_descriptor_init(
-            descriptor, 1, 0, Context->Root.IoBase,
-            Context->Root.IoBase + Context->Root.IoSize - 1U,
-            0, Context->Root.IoSize, 0);
+    if (!pci_root_configuration_add(
+            Context, &count, 2, 0, Context->BusBase,
+            Context->BusBase + Context->BusLength - 1U, 0,
+            Context->BusLength, 0) ||
+        !pci_root_configuration_add_native_io(Context, &count)) {
+        return 0;
+    }
+    if (pci_root_owns_legacy_vga(Context)) {
+        UINTN i;
+
+        for (i = 0; i < FW_ARRAY_SIZE(mPciLegacyVgaIoRanges); i++) {
+            if (!pci_root_configuration_add_io(
+                    Context, &count, mPciLegacyVgaIoRanges[i].Base,
+                    mPciLegacyVgaIoRanges[i].Size)) {
+                return 0;
+            }
+        }
+        if (!pci_root_configuration_add(
+                Context, &count, 0, 32, VGA_LEGACY_FB_BASE,
+                VGA_LEGACY_FB_BASE + VGA_LEGACY_MEMORY_SIZE - 1U,
+                0, VGA_LEGACY_MEMORY_SIZE, 0)) {
+            return 0;
+        }
     }
     if (Context->Root.Mmio32Size != 0) {
         if (!fw_platform_translate_range(
@@ -29854,12 +30976,13 @@ static BOOLEAN pci_root_configuration_build(FW_PCI_ROOT_CONTEXT *Context)
                 Context->Root.Mmio32TranslationOffset, &cpu_base)) {
             return 0;
         }
-        descriptor = &Context->Configuration.Address[count++];
-        pci_address_descriptor_init(
-            descriptor, 0, 32, cpu_base,
-            cpu_base + Context->Root.Mmio32Size - 1U,
-            0 - Context->Root.Mmio32TranslationOffset,
-            Context->Root.Mmio32Size, 0);
+        if (!pci_root_configuration_add(
+                Context, &count, 0, 32, cpu_base,
+                cpu_base + Context->Root.Mmio32Size - 1U,
+                0 - Context->Root.Mmio32TranslationOffset,
+                Context->Root.Mmio32Size, 0)) {
+            return 0;
+        }
     }
     if (Context->Root.Mmio64Size != 0) {
         if (!fw_platform_translate_range(
@@ -29867,12 +30990,13 @@ static BOOLEAN pci_root_configuration_build(FW_PCI_ROOT_CONTEXT *Context)
                 Context->Root.Mmio64TranslationOffset, &cpu_base)) {
             return 0;
         }
-        descriptor = &Context->Configuration.Address[count++];
-        pci_address_descriptor_init(
-            descriptor, 0, 64, cpu_base,
-            cpu_base + Context->Root.Mmio64Size - 1U,
-            0 - Context->Root.Mmio64TranslationOffset,
-            Context->Root.Mmio64Size, 0);
+        if (!pci_root_configuration_add(
+                Context, &count, 0, 64, cpu_base,
+                cpu_base + Context->Root.Mmio64Size - 1U,
+                0 - Context->Root.Mmio64TranslationOffset,
+                Context->Root.Mmio64Size, 0)) {
+            return 0;
+        }
     }
     pci_resource_list_end(&Context->Configuration.Address[count]);
     Context->ConfigurationCount = count;
@@ -30396,23 +31520,26 @@ static EFI_STATUS pci_host_preprocess_controller(
 static BOOLEAN pci_root_device_path_build(
     FW_PCI_ROOT_CONTEXT *Context)
 {
-    FW_PCI_ROOT_BRIDGE_DEVICE_PATH *path;
+    FW_DEVICE_PATH_NODE *end;
+    UINTN node_size;
 
     if (Context->Index >= mPlatformProfile.PciRootCount) {
         return 0;
     }
     fw_set_mem(&Context->DevicePath, sizeof(Context->DevicePath), 0);
-    path = (FW_PCI_ROOT_BRIDGE_DEVICE_PATH *)(VOID *)
-        Context->DevicePath.Bytes;
-    path->Acpi.Header.Type = 0x02;
-    path->Acpi.Header.SubType = 0x01;
-    path->Acpi.Header.Length = sizeof(path->Acpi);
-    path->Acpi.Hid = fw_platform_pci_root_path_hid();
-    path->Acpi.Uid = fw_platform_pci_root_path_uid(Context->Index);
-    path->End.Type = 0x7f;
-    path->End.SubType = 0xff;
-    path->End.Length = sizeof(path->End);
-    return sizeof(*path) <= sizeof(Context->DevicePath);
+    node_size = fw_platform_pci_root_path_node_build(
+        Context->Index, Context->DevicePath.Bytes,
+        sizeof(Context->DevicePath.Bytes));
+    if (node_size == 0 ||
+        node_size > sizeof(Context->DevicePath.Bytes) - sizeof(*end)) {
+        return 0;
+    }
+    end = (FW_DEVICE_PATH_NODE *)(VOID *)(
+        Context->DevicePath.Bytes + node_size);
+    end->Type = 0x7f;
+    end->SubType = 0xff;
+    end->Length = sizeof(*end);
+    return 1;
 }
 
 static VOID pci_platform_protocols_rollback(VOID)
@@ -30472,6 +31599,8 @@ static BOOLEAN pci_platform_dma_roots_init(VOID)
         context->Io = mPciRootBridgeIoProto;
         context->Io.ParentHandle = NULL;
         context->Io.SegmentNumber = root->Segment;
+        context->Supports = pci_root_supported_attributes(root);
+        context->Attributes = context->Supports;
     }
     mPciDmaRootCount = mPlatformProfile.PciRootCount;
     return 1;
@@ -30520,6 +31649,8 @@ static BOOLEAN pci_platform_protocols_install(VOID)
         context->Io = mPciRootBridgeIoProto;
         context->Io.ParentHandle = NULL;
         context->Io.SegmentNumber = context->Root.Segment;
+        context->Supports = pci_root_supported_attributes(&context->Root);
+        context->Attributes = context->Supports;
         if (!pci_root_device_path_build(context) ||
             !pci_root_configuration_build(context)) {
             pci_platform_protocols_rollback();
@@ -30563,6 +31694,8 @@ static EFI_PCI_IO_PROTOCOL mPciOhciIoProto;
 static EFI_PCI_IO_PROTOCOL mPciUhciIoProto;
 static EFI_PCI_IO_PROTOCOL mPciLsiIoProto;
 static EFI_PCI_IO_PROTOCOL mPciVgaIoProto;
+static FW_PLATFORM_PCI_DEVICE_PATH
+    mPlatformPciDevicePath[FW_PCI_IO_DEVICE_COUNT];
 
 static FW_PCI_IO_DEVICE mPciIoDevices[FW_PCI_IO_DEVICE_COUNT] = {
     {
@@ -30690,26 +31823,80 @@ static BOOLEAN fw_platform_pci_mmio_bar(
     return 1;
 }
 
-static void fw_platform_pci_path_location(
-    FW_PCI_CONTROLLER_DEVICE_PATH *Path, UINTN RootIndex,
-    UINT8 Device, UINT8 Function)
+static BOOLEAN fw_platform_pci_io_bar(
+    FW_PLATFORM_PCI_LOCATION location, UINT8 bar_index, UINT64 length,
+    UINT32 *raw_bar, UINT32 *port_base)
 {
-    Path->Acpi.Hid = fw_platform_pci_root_path_hid();
+    const IA64PlatformPciRoot *root;
+    UINT32 raw;
+    UINT32 base;
+
+    if (raw_bar == NULL || port_base == NULL ||
+        location.RootIndex >= mPlatformProfile.PciRootCount || length == 0) {
+        return 0;
+    }
+    root = &mPlatformProfile.PciRoot[location.RootIndex];
+    raw = (UINT32)pci_config_read_value(
+        location.Segment, location.Bus, location.Device,
+        location.Function, PCI_BAR_OFFSET(bar_index), 4);
+    base = raw & ~3U;
+    if (raw == 0xffffffffU || (raw & 1U) == 0 ||
+        base < root->IoBase || length > root->IoSize ||
+        base - root->IoBase > root->IoSize - length) {
+        return 0;
+    }
+    *raw_bar = raw;
+    *port_base = base;
+    return 1;
+}
+
+static BOOLEAN fw_platform_pci_path_location(
+    FW_PCI_IO_DEVICE *PciDevice, FW_PCI_CONTROLLER_DEVICE_PATH *Path,
+    UINTN PathIndex, UINTN RootIndex, UINT8 Device, UINT8 Function)
+{
+    FW_PLATFORM_PCI_DEVICE_PATH *published;
+
+    if (PciDevice == NULL || Path == NULL ||
+        PathIndex >= FW_ARRAY_SIZE(mPlatformPciDevicePath)) {
+        return 0;
+    }
+    Path->Acpi.Hid = fw_platform_pci_root_path_hid(RootIndex);
     Path->Acpi.Uid = fw_platform_pci_root_path_uid(RootIndex);
     Path->Pci.Device = Device;
     Path->Pci.Function = Function;
+    published = &mPlatformPciDevicePath[PathIndex];
+    fw_set_mem(published, sizeof(*published), 0);
+    published->Size = fw_platform_pci_device_path_build(
+        RootIndex, Device, Function, published->Bytes,
+        sizeof(published->Bytes));
+    if (published->Size == 0) {
+        return 0;
+    }
+    PciDevice->DevicePath = published->Bytes;
+    return 1;
 }
 
-static void fw_platform_graphics_path_location(UINTN RootIndex,
-                                               UINT8 Device,
-                                               UINT8 Function)
+static BOOLEAN fw_platform_graphics_path_location(UINTN RootIndex,
+                                                  UINT8 Device,
+                                                  UINT8 Function)
 {
-    mGraphicsDevicePath.Acpi.Hid = fw_platform_pci_root_path_hid();
-    mGraphicsDevicePath.Acpi.Uid = fw_platform_pci_root_path_uid(RootIndex);
-    mGraphicsDevicePath.Pci.Device = Device;
-    mGraphicsDevicePath.Pci.Function = Function;
-    mConsoleOutputDevicePath.Graphics = mGraphicsDevicePath;
-    mConsoleOutputDevicePath.Graphics.End.SubType = 0x01;
+    fw_set_mem(mGraphicsDevicePath.Bytes,
+               sizeof(mGraphicsDevicePath.Bytes), 0);
+    mGraphicsDevicePathSize = fw_platform_pci_device_path_build(
+        RootIndex, Device, Function, mGraphicsDevicePath.Bytes,
+        sizeof(mGraphicsDevicePath.Bytes));
+    if (mGraphicsDevicePathSize == 0) {
+        return 0;
+    }
+
+    if (((FW_DEVICE_PATH_NODE *)(VOID *)
+         mGraphicsDevicePath.Bytes)->SubType == 0x01) {
+        fw_copy_mem(&mConsoleOutputDevicePath.Graphics,
+                    mGraphicsDevicePath.Bytes,
+                    sizeof(mConsoleOutputDevicePath.Graphics));
+        mConsoleOutputDevicePath.Graphics.End.SubType = 0x01;
+    }
+    return 1;
 }
 
 static void fw_platform_pci_device_location(
@@ -30743,9 +31930,11 @@ static BOOLEAN fw_platform_graphics_init(UINT32 ExpectedId,
     graphics->ExpectedBarLength = ApertureSize;
     mGraphicsFramebufferBase = cpu_base;
     mGraphicsFramebufferApertureSize = ApertureSize;
-    fw_platform_graphics_path_location(location.RootIndex,
-                                       location.Device,
-                                       location.Function);
+    if (!fw_platform_graphics_path_location(location.RootIndex,
+                                            location.Device,
+                                            location.Function)) {
+        return 0;
+    }
     mGraphicsHandle = FW_HANDLE_GRAPHICS;
     return 1;
 }
@@ -30766,12 +31955,45 @@ static BOOLEAN fw_platform_ohci_init(UINT32 ExpectedId, UINT64 MmioSize)
     ohci->ExpectedId = ExpectedId;
     ohci->ExpectedBarValue = raw_bar;
     ohci->ExpectedBarLength = MmioSize;
-    fw_platform_pci_path_location(&mPciOhciDevicePath,
-                                  location.RootIndex,
-                                  location.Device,
-                                  location.Function);
+    if (!fw_platform_pci_path_location(
+            ohci, &mPciOhciDevicePath, 2, location.RootIndex,
+            location.Device, location.Function)) {
+        return 0;
+    }
     mUsbOhciMmioBase = cpu_base;
     mPciOhciHandle = FW_HANDLE_PCI_OHCI;
+    return 1;
+}
+
+static BOOLEAN fw_platform_uhci_init(VOID)
+{
+    FW_PLATFORM_PCI_LOCATION location;
+    const IA64PlatformPciRoot *root;
+    UINT32 raw_bar;
+    UINT32 port_base;
+    FW_PCI_IO_DEVICE *uhci = &mPciIoDevices[3];
+
+    if (!fw_platform_pci_find(PCI_82468GX_UHCI_ID, 0x0c0300U,
+                              &location) ||
+        location.Bus != 0 || location.Device != 3 || location.Function != 2 ||
+        !fw_platform_pci_io_bar(location, 4, PCI_82468GX_UHCI_IO_SIZE,
+                                &raw_bar, &port_base)) {
+        return 0;
+    }
+    root = &mPlatformProfile.PciRoot[location.RootIndex];
+    fw_platform_pci_device_location(uhci, &location);
+    uhci->ExpectedId = PCI_82468GX_UHCI_ID;
+    uhci->ExpectedBarValue = raw_bar;
+    uhci->ExpectedBarLength = PCI_82468GX_UHCI_IO_SIZE;
+    if (!fw_platform_pci_path_location(
+            uhci, &mPciUhciDevicePath, 3, location.RootIndex,
+            location.Device, location.Function)) {
+        return 0;
+    }
+    mUsbUhciIoBase = port_base;
+    mUsbUhciDmaBase = root->DmaBase;
+    mUsbUhciDmaSize = root->DmaSize;
+    mPciUhciHandle = FW_HANDLE_PCI_UHCI;
     return 1;
 }
 
@@ -30791,10 +32013,11 @@ static BOOLEAN fw_platform_lsi_init(VOID)
     fw_platform_pci_device_location(lsi, &location);
     lsi->ExpectedBarValue = raw_bar;
     lsi->ExpectedBarLength = LSI_MMIO_SIZE;
-    fw_platform_pci_path_location(&mPciLsiDevicePath,
-                                  location.RootIndex,
-                                  location.Device,
-                                  location.Function);
+    if (!fw_platform_pci_path_location(
+            lsi, &mPciLsiDevicePath, 4, location.RootIndex,
+            location.Device, location.Function)) {
+        return 0;
+    }
     mPciLsiHandle = FW_HANDLE_PCI_LSI;
     return 1;
 }
@@ -30855,10 +32078,16 @@ static void fw_platform_pci_devices_init(void)
                 PCI_VGA_NVIDIA_QUADRO2_ID, 1,
                 PCI_VGA_NVIDIA_QUADRO2_FB_SIZE);
         }
+        (void)fw_platform_uhci_init();
         (void)fw_platform_lsi_init();
-    } else if (mPlatformProfile.Descriptor.PlatformId ==
-                   IA64_PLATFORM_ID_HP_ZX6000) {
-        (void)fw_platform_graphics_init(PCI_VGA_ATI_RV100_ID, 0,
+    } else if (ia64_platform_is_hp_zx(
+                   mPlatformProfile.Descriptor.PlatformId)) {
+        UINT32 graphics_id =
+            mPlatformProfile.Descriptor.PlatformId ==
+                IA64_PLATFORM_ID_HP_RX2660 ?
+            PCI_VGA_ATI_ES1000_ID : PCI_VGA_ATI_RV100_ID;
+
+        (void)fw_platform_graphics_init(graphics_id, 0,
                                         PCI_VGA_ATI_RV100_FB_SIZE);
         (void)fw_platform_ohci_init(PCI_NEC_OHCI_ID,
                                     PCI_NEC_OHCI_MMIO_SIZE);
@@ -31127,25 +32356,24 @@ static BOOLEAN pci_io_platform_aperture_contains(
                                                  UINTN Count, BOOLEAN Fifo)
 {
     const IA64PlatformPciRoot *root = fw_pci_io_device_root(Dev);
-    BOOLEAN vga_legacy_io = Dev != NULL &&
-        Dev->Protocol == &mPciVgaIoProto && IsIo &&
-        (fw_pci_aperture_contains(VGA_LEGACY_IO_BASE,
-                                  VGA_LEGACY_IO_SIZE,
-                                  Address, Size, Count, Fifo) ||
-         fw_pci_aperture_contains(VBE_LEGACY_IO_BASE,
-                                  VBE_LEGACY_IO_SIZE,
-                                  Address, Size, Count, Fifo));
+    FW_PCI_ROOT_CONTEXT context;
+    UINT64 translation;
 
     if (root != NULL) {
-        if (IsIo) {
-            return vga_legacy_io ||
-                fw_pci_aperture_contains(root->IoBase, root->IoSize,
-                                         Address, Size, Count, Fifo);
+        fw_set_mem(&context, sizeof(context), 0);
+        context.Root = *root;
+        if (IsIo && Dev->Protocol == &mPciVgaIoProto &&
+            (root->Flags & IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) != 0 &&
+            fw_pci_aperture_contains(
+                VBE_LEGACY_IO_BASE, VBE_LEGACY_IO_SIZE,
+                Address, Size, Count, Fifo)) {
+            return 1;
         }
-        return fw_pci_aperture_contains(root->Mmio32Base, root->Mmio32Size,
-                                        Address, Size, Count, Fifo) ||
-               fw_pci_aperture_contains(root->Mmio64Base, root->Mmio64Size,
-                                        Address, Size, Count, Fifo);
+        return IsIo ?
+            pci_root_io_aperture_contains(
+                &context, Address, Size, Count, Fifo) :
+            pci_root_memory_translation(
+                &context, Address, Size, Count, Fifo, &translation);
     }
     return IsIo ?
         fw_pci_aperture_contains(0, PCI_IO_SIZE, Address, Size, Count, Fifo) :
@@ -31275,7 +32503,7 @@ static EFI_STATUS pci_io_transfer(BOOLEAN IsWrite, BOOLEAN IsIo,
     UINTN size;
     BOOLEAN fifo;
     BOOLEAN fill;
-    BOOLEAN vga_legacy_io;
+    BOOLEAN vbe_legacy_io;
     EFI_STATUS st;
     FW_PCI_ROOT_CONTEXT context;
 
@@ -31311,15 +32539,12 @@ static EFI_STATUS pci_io_transfer(BOOLEAN IsWrite, BOOLEAN IsIo,
     if (st != EFI_SUCCESS) {
         return st;
     }
-    vga_legacy_io = BarIndex == EFI_PCI_IO_PASS_THROUGH_BAR && IsIo &&
+    vbe_legacy_io = BarIndex == EFI_PCI_IO_PASS_THROUGH_BAR && IsIo &&
         dev->Protocol == &mPciVgaIoProto &&
-        (fw_pci_aperture_contains(VGA_LEGACY_IO_BASE,
-                                  VGA_LEGACY_IO_SIZE,
-                                  address, size, Count, fifo) ||
-         fw_pci_aperture_contains(VBE_LEGACY_IO_BASE,
-                                  VBE_LEGACY_IO_SIZE,
-                                  address, size, Count, fifo));
-    if (vga_legacy_io) {
+        fw_pci_aperture_contains(VBE_LEGACY_IO_BASE,
+                                 VBE_LEGACY_IO_SIZE,
+                                 address, size, Count, fifo);
+    if (vbe_legacy_io) {
         return pci_root_transfer(IsWrite, IsIo, Width, address, Count, Buffer);
     }
     if (pci_io_root_context_init(dev, &context)) {
@@ -31369,7 +32594,7 @@ static EFI_STATUS pci_io_poll(BOOLEAN IsIo, EFI_PCI_IO_PROTOCOL *This,
     const FW_PCI_IO_DEVICE *dev;
     UINT64 address;
     UINTN size;
-    BOOLEAN vga_legacy_io;
+    BOOLEAN vbe_legacy_io;
     EFI_STATUS st;
     FW_PCI_ROOT_CONTEXT context;
 
@@ -31399,15 +32624,12 @@ static EFI_STATUS pci_io_poll(BOOLEAN IsIo, EFI_PCI_IO_PROTOCOL *This,
     if (st != EFI_SUCCESS) {
         return st;
     }
-    vga_legacy_io = BarIndex == EFI_PCI_IO_PASS_THROUGH_BAR && IsIo &&
+    vbe_legacy_io = BarIndex == EFI_PCI_IO_PASS_THROUGH_BAR && IsIo &&
         dev->Protocol == &mPciVgaIoProto &&
-        (fw_pci_aperture_contains(VGA_LEGACY_IO_BASE,
-                                  VGA_LEGACY_IO_SIZE,
-                                  address, size, 1, 0) ||
-         fw_pci_aperture_contains(VBE_LEGACY_IO_BASE,
-                                  VBE_LEGACY_IO_SIZE,
-                                  address, size, 1, 0));
-    return pci_poll_address(!vga_legacy_io &&
+        fw_pci_aperture_contains(VBE_LEGACY_IO_BASE,
+                                 VBE_LEGACY_IO_SIZE,
+                                 address, size, 1, 0);
+    return pci_poll_address(!vbe_legacy_io &&
                             pci_io_root_context_init(dev, &context) ?
                             &context : NULL, IsIo, Width, address,
                             Mask, Value, Delay, Result);
@@ -31610,25 +32832,45 @@ static EFI_STATUS pci_io_get_location(EFI_PCI_IO_PROTOCOL *This,
     return EFI_SUCCESS;
 }
 
+static UINT64 pci_io_supported_attributes(const FW_PCI_IO_DEVICE *Dev)
+{
+    const IA64PlatformPciRoot *root;
+    UINT64 attributes = Dev->Attributes;
+    UINT64 vga_attributes = EFI_PCI_ATTRIBUTE_VGA_MEMORY |
+        EFI_PCI_ATTRIBUTE_VGA_IO | EFI_PCI_ATTRIBUTE_VGA_IO_16;
+
+    if (!mPlatformProfile.Present ||
+        (attributes & vga_attributes) == 0) {
+        return attributes;
+    }
+    root = fw_pci_io_device_root(Dev);
+    if (root == NULL ||
+        (root->Flags & IA64_PLATFORM_PCI_ROOT_FLAG_VGA_LEGACY) == 0) {
+        attributes &= ~vga_attributes;
+    }
+    return attributes;
+}
+
 static UINT64 pci_io_current_attributes(const FW_PCI_IO_DEVICE *Dev)
 {
     UINT16 command;
+    UINT64 supported = pci_io_supported_attributes(Dev);
     UINT64 attrs;
 
     command = (UINT16)pci_config_read_value(Dev->Segment, Dev->Bus,
                                             Dev->Device, Dev->Function,
                                             PCI_COMMAND_OFFSET, 2);
-    attrs = Dev->Attributes & ~FW_PCI_COMMAND_ATTRIBUTES;
+    attrs = supported & ~FW_PCI_COMMAND_ATTRIBUTES;
     if ((command & PCI_COMMAND_IO_SPACE) != 0 &&
-        (Dev->Attributes & EFI_PCI_ATTRIBUTE_IO) != 0) {
+        (supported & EFI_PCI_ATTRIBUTE_IO) != 0) {
         attrs |= EFI_PCI_ATTRIBUTE_IO;
     }
     if ((command & PCI_COMMAND_MEMORY_SPACE) != 0 &&
-        (Dev->Attributes & EFI_PCI_ATTRIBUTE_MEMORY) != 0) {
+        (supported & EFI_PCI_ATTRIBUTE_MEMORY) != 0) {
         attrs |= EFI_PCI_ATTRIBUTE_MEMORY;
     }
     if ((command & PCI_COMMAND_BUS_MASTER) != 0 &&
-        (Dev->Attributes & EFI_PCI_ATTRIBUTE_BUS_MASTER) != 0) {
+        (supported & EFI_PCI_ATTRIBUTE_BUS_MASTER) != 0) {
         attrs |= EFI_PCI_ATTRIBUTE_BUS_MASTER;
     }
     return attrs;
@@ -31673,16 +32915,18 @@ static EFI_STATUS pci_io_attributes(EFI_PCI_IO_PROTOCOL *This,
 {
     const FW_PCI_IO_DEVICE *dev = fw_pci_io_device_from_protocol(This);
     UINT64 current;
+    UINT64 supported;
 
     if (dev == NULL) {
         return EFI_INVALID_PARAMETER;
     }
+    supported = pci_io_supported_attributes(dev);
     switch (Operation) {
     case EfiPciIoAttributeOperationSupported:
         if (Result == NULL) {
             return EFI_INVALID_PARAMETER;
         }
-        *Result = dev->Attributes;
+        *Result = supported;
         return EFI_SUCCESS;
     case EfiPciIoAttributeOperationGet:
         if (Result == NULL) {
@@ -31693,7 +32937,7 @@ static EFI_STATUS pci_io_attributes(EFI_PCI_IO_PROTOCOL *This,
     case EfiPciIoAttributeOperationSet:
     case EfiPciIoAttributeOperationEnable:
     case EfiPciIoAttributeOperationDisable:
-        if ((Attributes & ~dev->Attributes) != 0) {
+        if ((Attributes & ~supported) != 0) {
             return EFI_UNSUPPORTED;
         }
         current = pci_io_current_attributes(dev);
@@ -32113,8 +33357,8 @@ static BOOLEAN handle_supports_protocol(EFI_HANDLE Handle, void *Protocol,
         guid_matches(Protocol, mDevicePathProtocolGuid)) {
         if (Interface != NULL) {
             *Interface = mRawStorageDevice.Kind == FW_STORAGE_AHCI ?
-                (VOID *)&mSataRawDevicePath :
-                (VOID *)&mRawBlockDevicePath;
+                mSataRawDevicePathProtocol :
+                mRawBlockDevicePathProtocol;
         }
         return 1;
     }
@@ -32149,15 +33393,15 @@ static BOOLEAN handle_supports_protocol(EFI_HANDLE Handle, void *Protocol,
         if (Interface != NULL) {
             if (mBootStorageDevice.Kind == FW_STORAGE_AHCI) {
                 *Interface = mBootImageMapped ?
-                    (VOID *)&mSataBlockDevicePath :
-                    (VOID *)&mSataBootDevicePath;
+                    mSataBlockDevicePathProtocol :
+                    mSataBootDevicePathProtocol;
             } else {
                 *Interface = mBootImageMapped ?
-                    (VOID *)&mBlockDevicePath :
+                    mBlockDevicePathProtocol :
                     (storage_same_device(&mBootStorageDevice,
                                          &mDiskStorageDevice) ?
-                     (VOID *)&mDiskBlockDevicePath :
-                     (VOID *)&mRawBlockDevicePath);
+                     mDiskBlockDevicePathProtocol :
+                     mRawBlockDevicePathProtocol);
             }
         }
         return 1;
@@ -32183,8 +33427,8 @@ static BOOLEAN handle_supports_protocol(EFI_HANDLE Handle, void *Protocol,
         guid_matches(Protocol, mDevicePathProtocolGuid)) {
         if (Interface != NULL) {
             *Interface = mDiskStorageDevice.Kind == FW_STORAGE_AHCI ?
-                (VOID *)&mSataDiskDevicePath :
-                (VOID *)&mDiskBlockDevicePath;
+                mSataDiskDevicePathProtocol :
+                mDiskBlockDevicePathProtocol;
         }
         return 1;
     }
@@ -33296,10 +34540,16 @@ rs_convert_firmware_variables(void)
     UINTN reads[FW_FIRMWARE_VARIABLE_COUNT];
     UINTN read_descriptors[FW_FIRMWARE_VARIABLE_COUNT];
     UINTN runtime_variables = (UINTN)mRuntimeFirmwareVariables;
+    UINTN optical_setup_device_path =
+        (UINTN)mOpticalSetupDevicePathProtocol;
     UINTN i;
     EFI_STATUS st;
 
     st = rs_convert_required_uintn(&runtime_variables);
+    if (st != EFI_SUCCESS) {
+        return st;
+    }
+    st = rs_convert_required_uintn(&optical_setup_device_path);
     if (st != EFI_SUCCESS) {
         return st;
     }
@@ -33354,6 +34604,8 @@ rs_convert_firmware_variables(void)
     }
     mRuntimeFirmwareVariables =
         (FW_FIRMWARE_VARIABLE *)runtime_variables;
+    mOpticalSetupDevicePathProtocol =
+        (VOID *)optical_setup_device_path;
     return EFI_SUCCESS;
 }
 
@@ -33777,15 +35029,22 @@ static BOOLEAN rs_find_nvram_variable(CHAR16 *VariableName, void *VendorGuid,
 static EFI_STATUS rs_get_boot0000_variable(UINT32 *Attributes,
                                            UINTN *DataSize, VOID *Data)
 {
-    FW_EFI_BOOT_OPTION option;
+    UINT8 buffer[__builtin_offsetof(FW_EFI_BOOT_OPTION, FilePath) +
+                 FW_PLATFORM_DEVICE_PATH_MAX];
+    FW_EFI_BOOT_OPTION *option = (FW_EFI_BOOT_OPTION *)(VOID *)buffer;
+    UINTN option_size = __builtin_offsetof(FW_EFI_BOOT_OPTION, FilePath) +
+        mOpticalSetupDevicePathSize;
 
-    fw_set_mem(&option, sizeof(option), 0);
-    option.Attributes = 0x00000001U;
-    option.FilePathListLength = sizeof(option.FilePath);
-    fw_copy_mem(option.Description, mDefaultBootDescription,
-                sizeof(option.Description));
-    fw_copy_mem(&option.FilePath, &mOpticalSetupLoaderDevicePath,
-                sizeof(option.FilePath));
+    if (mOpticalSetupDevicePathSize > FW_PLATFORM_DEVICE_PATH_MAX) {
+        return EFI_DEVICE_ERROR;
+    }
+    fw_set_mem(buffer, option_size, 0);
+    option->Attributes = 0x00000001U;
+    option->FilePathListLength = (UINT16)mOpticalSetupDevicePathSize;
+    fw_copy_mem(option->Description, mDefaultBootDescription,
+                sizeof(option->Description));
+    fw_copy_mem(&option->FilePath, mOpticalSetupDevicePathProtocol,
+                mOpticalSetupDevicePathSize);
 
     /*
      * The default optical entry launches \EFI\BOOT\BOOTIA64.EFI without
@@ -33794,7 +35053,7 @@ static EFI_STATUS rs_get_boot0000_variable(UINT32 *Attributes,
     return rs_copy_variable(
         EFI_VARIABLE_NON_VOLATILE | EFI_VARIABLE_BOOTSERVICE_ACCESS |
             EFI_VARIABLE_RUNTIME_ACCESS,
-        &option, sizeof(FW_EFI_BOOT_OPTION),
+        option, option_size,
         Attributes, DataSize, Data);
 }
 
@@ -35096,8 +36355,11 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
     storage_set_none(&mDiskStorageDevice);
     storage_set_none(&mRawStorageDevice);
     if (fw_i2000_profile_enabled() &&
+        mBootIdeDevice != NULL && mBootIdeDevice->present &&
+        mBootIdeDevice->media_present && mBootIdeDevice->is_atapi) {
+        storage_set_ide(&mBootStorageDevice, mBootIdeDevice);
+    } else if (fw_i2000_profile_enabled() &&
         mDiskScsiDevice != NULL && mDiskScsiDevice->media_present) {
-        /* The i2000 profile selects the writable SCSI disk first. */
         storage_set_scsi(&mBootStorageDevice, mDiskScsiDevice);
     } else if (mBootScsiDevice != NULL &&
                mBootScsiDevice->media_present) {
@@ -35179,6 +36441,12 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
         mOpticalSetupLoaderDevicePath.Cdrom.PartitionSize =
             cdrom_partition_blocks;
         uart_puts("Block I/O: El Torito FAT image mapped\r\n");
+    }
+    if (!fw_publish_storage_device_paths()) {
+        uart_puts("Block I/O: device path construction failed\r\n");
+        for (;;) {
+            fw_pal_halt_light();
+        }
     }
     mBlockIoMedia.MediaId = 1;
     mBlockIoMedia.RemovableMedia = storage_removable(&mBootStorageDevice);
@@ -35393,7 +36661,9 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
             if (mScsiController == ScsiControllerIsp12160) {
                 uart_puts(", ISP12160 polling)\r\n");
             } else if (mScsiController == ScsiControllerLsi53C1030) {
-                uart_puts(", LSI53C1030 Fusion-MPT polling)\r\n");
+                uart_puts(mMpt.Variant == MptVariantLsiSas1068 ?
+                    ", LSI SAS1068 Fusion-MPT polling)\r\n" :
+                    ", LSI53C1030 Fusion-MPT polling)\r\n");
             } else {
                 uart_puts(", LSI53C895A)\r\n");
             }
@@ -35424,7 +36694,10 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
         uart_puts("LocateHandle:         enabled "
                   "(i2000 ISP12160/IDE Block I/O)\r\n");
     } else if (mScsiController == ScsiControllerLsi53C1030) {
-        uart_puts("LocateHandle:         enabled "
+        uart_puts(mMpt.Variant == MptVariantLsiSas1068 ?
+                  "LocateHandle:         enabled "
+                  "(rx2660 LSI SAS1068 Block I/O)\r\n" :
+                  "LocateHandle:         enabled "
                   "(zx6000 LSI53C1030 Block I/O)\r\n");
     } else if (fw_i2000_ide_policy() != NULL) {
         uart_puts("LocateHandle:         enabled (i2000 IDE Block I/O)\r\n");
@@ -35474,15 +36747,18 @@ void firmware_main(UINT64 gp, UINT64 stack_top, UINT64 boot_b0)
         uart_puts("BOOT path:            SCSI/SATA/ATA Block I/O + FAT resolver\r\n");
     } else if (fw_i2000_profile_enabled() &&
                mScsiController == ScsiControllerLsi53C895A) {
-        uart_puts("BOOT path:            i2000 LSI53C895A disk first, "
-                  "IDE optical retained + FAT resolver\r\n");
+        uart_puts("BOOT path:            i2000 LSI53C895A disk + "
+                  "IDE optical + FAT resolver\r\n");
     } else if (mScsiController == ScsiControllerIsp12160) {
-        uart_puts("BOOT path:            i2000 ISP12160 disk first, "
-                  "IDE optical retained + FAT resolver\r\n");
+        uart_puts("BOOT path:            i2000 ISP12160 disk + "
+                  "IDE optical + FAT resolver\r\n");
     } else if (fw_i2000_ide_policy() != NULL) {
         uart_puts("BOOT path:            i2000 primary-master PIO IDE + FAT resolver\r\n");
     } else if (fw_zx6000_profile_enabled()) {
-        uart_puts("BOOT path:            zx6000 LSI53C1030 disk, "
+        uart_puts(mMpt.Variant == MptVariantLsiSas1068 ?
+                  "BOOT path:            rx2660 LSI SAS1068 disk, "
+                  "FAT resolver\r\n" :
+                  "BOOT path:            zx6000 LSI53C1030 disk, "
                   "CMD649 optical + FAT resolver\r\n");
     } else {
         uart_puts("BOOT path:            no boot controller\r\n");

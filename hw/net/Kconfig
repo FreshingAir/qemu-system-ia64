@@ -16,6 +16,11 @@ config EEPRO100_PCI
     depends on PCI
     select NMC93XX_EEPROM
 
+config BCM5704_PCI
+    bool
+    default y if PCI_DEVICES
+    depends on PCI
+
 config PCNET_PCI
     bool
     default y if PCI_DEVICES

@@ -2,6 +2,7 @@
 
 DefinitionBlock ("", "SSDT", 2, "QEMU  ", "IA64SSDT", 0x00000001)
 {
+    // PCI0 is replaced with SBA0 for HP zx machines.
     External (\_SB.PCI0, DeviceObj)
 
     Scope (\_SB)

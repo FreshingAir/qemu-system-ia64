@@ -1,7 +1,7 @@
 /*
  * ISP12160 IOCB parser tests
  *
- * The entries exercise valid and rejected A64 IOCB byte layouts.
+ * The entries exercise valid and rejected IOCB byte layouts.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
@@ -33,6 +33,13 @@ static void set_segment(uint8_t *entry, size_t offset,
 {
     stq_le_p(entry + offset, address);
     stl_le_p(entry + offset + 8, length);
+}
+
+static void set_segment_32(uint8_t *entry, size_t offset,
+                           uint32_t address, uint32_t length)
+{
+    stl_le_p(entry + offset, address);
+    stl_le_p(entry + offset + 4, length);
 }
 
 static void build_seven_segments(
@@ -98,6 +105,11 @@ static void test_no_data(void)
     Error *err = NULL;
 
     build_no_data(entries);
+    memset(entries[0] + ISP12160_IOCB_A64_CDB_OFFSET + 6, 0xa5,
+           ISP12160_IOCB_CDB_BYTES - 6);
+    memset(entries[0] + ISP12160_IOCB_A64_RESERVED1_OFFSET, 0x5a,
+           ISP12160_IOCB_A64_RESERVED1_BYTES);
+    set_segment(entries[0], 40, 0x1000, 0x100);
     g_assert_true(isp12160_iocb_parse_a64(
         entries[0], 1, &command, &untouched, 1, &err));
     g_assert_null(err);
@@ -115,6 +127,37 @@ static void test_no_data(void)
     g_assert_cmpuint(command.transfer_length, ==, 0);
     g_assert_cmphex(untouched.address, ==, UINT64_MAX);
     g_assert_cmphex(untouched.length, ==, UINT32_MAX);
+}
+
+static void test_data_unknown(void)
+{
+    uint8_t entries[TEST_ENTRIES][ISP12160_IOCB_ENTRY_BYTES];
+    ISP12160IOCBCommand command;
+    ISP12160IOCBSegment segments[TEST_SEGMENTS];
+    Error *err = NULL;
+
+    build_no_data(entries);
+    stw_le_p(entries[0] + ISP12160_IOCB_A64_CONTROL_FLAGS_OFFSET,
+             ISP12160_IOCB_CONTROL_DATA_UNKNOWN);
+    g_assert_true(isp12160_iocb_parse_a64(
+        entries[0], 1, &command, NULL, 0, &err));
+    g_assert_null(err);
+    g_assert_cmpuint(command.direction, ==,
+                     ISP12160_IOCB_DIRECTION_UNKNOWN);
+    g_assert_cmpuint(command.segment_count, ==, 0);
+    g_assert_cmpuint(command.transfer_length, ==, 0);
+
+    build_seven_segments(entries);
+    stw_le_p(entries[0] + ISP12160_IOCB_A64_CONTROL_FLAGS_OFFSET,
+             ISP12160_IOCB_CONTROL_DATA_UNKNOWN);
+    g_assert_true(isp12160_iocb_parse_a64(
+        entries[0], TEST_ENTRIES, &command, segments,
+        G_N_ELEMENTS(segments), &err));
+    g_assert_null(err);
+    g_assert_cmpuint(command.direction, ==,
+                     ISP12160_IOCB_DIRECTION_UNKNOWN);
+    g_assert_cmpuint(command.segment_count, ==, TEST_SEGMENTS);
+    g_assert_cmphex(command.transfer_length, ==, 0x1c00);
 }
 
 static void test_continuation(void)
@@ -146,6 +189,61 @@ static void test_continuation(void)
     g_assert_cmphex(segments[6].length, ==, 0x700);
 }
 
+static void test_32bit_continuation(void)
+{
+    uint8_t entries[TEST_ENTRIES][ISP12160_IOCB_ENTRY_BYTES] = { 0 };
+    ISP12160IOCBCommand command;
+    ISP12160IOCBSegment segments[5];
+    Error *err = NULL;
+    unsigned int i;
+
+    entries[0][0] = ISP12160_IOCB_COMMAND_TYPE;
+    entries[0][1] = 2;
+    stl_le_p(entries[0] + 4, 0x87654321);
+    entries[0][8] = 6;
+    entries[0][9] = 0x80 | 14;
+    stw_le_p(entries[0] + 10, 10);
+    stw_le_p(entries[0] + 12,
+             ISP12160_IOCB_CONTROL_SIMPLE_TAG |
+             ISP12160_IOCB_CONTROL_DATA_TO_DEVICE);
+    stw_le_p(entries[0] + 16, 15);
+    stw_le_p(entries[0] + 18, G_N_ELEMENTS(segments));
+    entries[0][20] = 0x2a;
+    for (i = 0; i < ISP12160_IOCB_COMMAND_SEGMENTS; i++) {
+        set_segment_32(entries[0], ISP12160_IOCB_SEGMENT0_OFFSET +
+                       i * ISP12160_IOCB_SEGMENT_STRIDE,
+                       0x10000000 + i * 0x1000, (i + 1) * 0x100);
+    }
+    entries[1][0] = ISP12160_IOCB_CONTINUE_TYPE;
+    entries[1][1] = 1;
+    set_segment_32(entries[1], ISP12160_IOCB_CONTINUE_SEGMENT0_OFFSET,
+                   0x20000000, 0x500);
+
+    g_assert_true(isp12160_iocb_parse_32(
+        entries[0], TEST_ENTRIES, &command, segments,
+        G_N_ELEMENTS(segments), &err));
+    g_assert_null(err);
+    g_assert_cmphex(command.handle, ==, 0x87654321);
+    g_assert_cmpuint(command.channel, ==, 1);
+    g_assert_cmpuint(command.target, ==, 14);
+    g_assert_cmpuint(command.lun, ==, 6);
+    g_assert_cmpuint(command.direction, ==,
+                     ISP12160_IOCB_DIRECTION_TO_DEVICE);
+    g_assert_cmpuint(command.segment_count, ==, G_N_ELEMENTS(segments));
+    g_assert_cmphex(command.transfer_length, ==, 0xf00);
+    g_assert_cmphex(segments[0].address, ==, 0x10000000);
+    g_assert_cmphex(segments[4].address, ==, 0x20000000);
+    g_assert_cmphex(segments[4].length, ==, 0x500);
+
+    set_segment_32(entries[1], ISP12160_IOCB_CONTINUE_SEGMENT0_OFFSET,
+                   0xffffff00, 0x200);
+    g_assert_false(isp12160_iocb_parse_32(
+        entries[0], TEST_ENTRIES, &command, segments,
+        G_N_ELEMENTS(segments), &err));
+    g_assert_nonnull(err);
+    error_free(err);
+}
+
 static void test_header_and_shape_rejected(void)
 {
     uint8_t entries[TEST_ENTRIES][ISP12160_IOCB_ENTRY_BYTES];
@@ -171,17 +269,7 @@ static void test_header_and_shape_rejected(void)
     assert_rejected(entries, 1, TEST_SEGMENTS);
 
     build_no_data(entries);
-    entries[0][26] = 1;
-    assert_rejected(entries, 1, TEST_SEGMENTS);
-
-    build_no_data(entries);
-    stw_le_p(entries[0] + 12, 1);
-    assert_rejected(entries, 1, TEST_SEGMENTS);
-
-    build_no_data(entries);
-    stw_le_p(entries[0] + 12,
-             ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE |
-             ISP12160_IOCB_CONTROL_DATA_TO_DEVICE);
+    stw_le_p(entries[0] + 12, 1U << 7);
     assert_rejected(entries, 1, TEST_SEGMENTS);
 
     build_no_data(entries);
@@ -224,10 +312,6 @@ static void test_segments_rejected(void)
     build_no_data(entries);
     stw_le_p(entries[0] + 12,
              ISP12160_IOCB_CONTROL_DATA_FROM_DEVICE);
-    assert_rejected(entries, 1, TEST_SEGMENTS);
-
-    build_no_data(entries);
-    set_segment(entries[0], 40, 0x1000, 0x100);
     assert_rejected(entries, 1, TEST_SEGMENTS);
 }
 
@@ -328,7 +412,10 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     g_test_add_func("/isp12160-iocb/no-data", test_no_data);
+    g_test_add_func("/isp12160-iocb/data-unknown", test_data_unknown);
     g_test_add_func("/isp12160-iocb/continuation", test_continuation);
+    g_test_add_func("/isp12160-iocb/32bit-continuation",
+                    test_32bit_continuation);
     g_test_add_func("/isp12160-iocb/header-shape-rejected",
                     test_header_and_shape_rejected);
     g_test_add_func("/isp12160-iocb/segments-rejected",

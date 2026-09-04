@@ -978,7 +978,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             ia64_gen_qemu_st_i128(
                 ctx, pair, ia64_gr_src(op->base), ctx->memory.mmu_idx,
                 ia64_data_memop(ctx, MO_UO));
-            ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 16);
         }
         break;
     case IA64_OP_ST1:
@@ -1021,7 +1020,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         ia64_gen_memory_release(insn);
         ia64_gen_qemu_st_i64(ctx, value, plan.address, ctx->memory.mmu_idx,
                              plan.memop);
-        ia64_gen_invalidate_alat_store(ctx, plan.address, plan.size);
         if (spill) {
             gen_helper_st_spill_unat(tcg_env, tcg_constant_i32(op->source),
                                      plan.address);
@@ -1057,7 +1055,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
                              ctx->memory.mmu_idx,
                              ia64_data_memop(ctx, MO_LEUQ));
-        ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 8);
         if (insn->imm_base_update && op->base != 0) {
             tcg_gen_addi_i64(cpu_gr[op->base], cpu_gr[op->base], op->immediate);
             ia64_gen_note_stacked_gr_write(insn, op->base);
@@ -1077,7 +1074,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
                              ctx->memory.mmu_idx,
                              ia64_data_memop(ctx, MO_LEUL));
-        ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 4);
         if (insn->imm_base_update && op->base != 0) {
             tcg_gen_addi_i64(cpu_gr[op->base], cpu_gr[op->base], op->immediate);
             ia64_gen_note_stacked_gr_write(insn, op->base);
@@ -1091,7 +1087,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             IA64_ALIGNMENT_FP_FILL_SPILL, IA64_ISR_W);
         gen_helper_stf_spill(tcg_env, ia64_gr_src(op->base),
                              tcg_constant_i32(op->source));
-        ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 16);
         if (insn->imm_base_update && op->base != 0) {
             tcg_gen_addi_i64(cpu_gr[op->base], cpu_gr[op->base], op->immediate);
             ia64_gen_note_stacked_gr_write(insn, op->base);
@@ -1111,7 +1106,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
         ia64_gen_qemu_st_i64(ctx, value, ia64_gr_src(op->base),
                              ctx->memory.mmu_idx,
                              ia64_data_memop(ctx, MO_LEUQ));
-        ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 8);
         if (insn->imm_base_update && op->base != 0) {
             tcg_gen_addi_i64(cpu_gr[op->base], cpu_gr[op->base], op->immediate);
             ia64_gen_note_stacked_gr_write(insn, op->base);
@@ -1127,7 +1121,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             IA64_ISR_W);
         gen_helper_stfe(tcg_env, ia64_gr_src(op->base),
                         tcg_constant_i32(op->source));
-        ia64_gen_invalidate_alat_store(ctx, ia64_gr_src(op->base), 10);
         if (insn->imm_base_update && op->base != 0) {
             tcg_gen_addi_i64(cpu_gr[op->base], cpu_gr[op->base], op->immediate);
             ia64_gen_note_stacked_gr_write(insn, op->base);
@@ -1152,7 +1145,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
                                  value, ctx->memory.mmu_idx, plan.memop);
         ia64_gen_memory_acquire(insn);
         ia64_gen_gr_nat_clear(insn, op->destination);
-        ia64_gen_invalidate_alat_store(ctx, plan.address, plan.size);
         break;
     }
     case IA64_OP_CMPXCHG1:
@@ -1232,7 +1224,6 @@ IA64GenResult ia64_gen_memory(DisasContext *ctx,
             ctx->memory.mmu_idx, plan.memop);
         ia64_gen_memory_acquire(insn);
         ia64_gen_gr_nat_clear(insn, op->destination);
-        ia64_gen_invalidate_alat_store(ctx, plan.address, plan.size);
         break;
     }
     case IA64_OP_CHK_S:

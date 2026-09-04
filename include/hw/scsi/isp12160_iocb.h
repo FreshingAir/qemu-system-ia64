@@ -14,6 +14,7 @@ typedef enum ISP12160IOCBDirection {
     ISP12160_IOCB_DIRECTION_NONE,
     ISP12160_IOCB_DIRECTION_FROM_DEVICE,
     ISP12160_IOCB_DIRECTION_TO_DEVICE,
+    ISP12160_IOCB_DIRECTION_UNKNOWN,
 } ISP12160IOCBDirection;
 
 typedef struct ISP12160IOCBSegment {
@@ -48,12 +49,12 @@ typedef struct ISP12160IOCBStatus {
     uint8_t sense[ISP12160_IOCB_SENSE_BYTES];
 } ISP12160IOCBStatus;
 
-/*
- * Parse one complete A64 command chain from consecutive
- * 64-byte request-ring entries.  The function performs no DMA and leaves both
- * outputs unchanged on failure.  Bidirectional transfers and nonzero unused
- * fields are rejected by this bounded parser.
- */
+/* Parse a command chain without changing outputs on failure. */
+bool isp12160_iocb_parse_32(const uint8_t *entries, size_t entry_count,
+                            ISP12160IOCBCommand *command,
+                            ISP12160IOCBSegment *segments,
+                            size_t segment_capacity, Error **errp);
+
 bool isp12160_iocb_parse_a64(const uint8_t *entries, size_t entry_count,
                              ISP12160IOCBCommand *command,
                              ISP12160IOCBSegment *segments,
